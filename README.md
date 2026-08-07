@@ -56,7 +56,7 @@ Extensions work normally. Search and install from the VS Code marketplace.
 
 ### Network Notes
 
-- In China, AMCode uses **Tsinghua mirror** for main packages — faster than the default Termux repo.
+- AMCode **auto-tests multiple mirrors** (Tsinghua, USTC, Official) and picks the fastest one for you.
 - TUR packages (code-server itself) are downloaded from `tur.kcubeterm.com`. A VPN/proxy may be needed in some regions.
 - Once installed, no network is needed. Everything runs locally.
 
@@ -159,7 +159,7 @@ VS Code 扩展市场正常使用，直接搜索安装即可。
 
 ### 网络说明
 
-- 国内用户：AMCode 使用**清华大学 TUNA 镜像**下载主仓库包，速度快。
+- AMCode 会**自动测速多个镜像**（清华、中科大、官方），选择最快的使用。
 - code-server 本体从 TUR（`tur.kcubeterm.com`）下载，部分地区可能需要代理。
 - 安装完成后完全离线运行，不需网络。
 
