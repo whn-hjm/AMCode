@@ -39,3 +39,4 @@ Thumbs.db
 /app/release/
 /app/debug/
 bootstrap-*.zip
+app/amcode-release.jks

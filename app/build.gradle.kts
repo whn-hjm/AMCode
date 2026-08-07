@@ -20,8 +20,22 @@ android {
         vectorDrawables.useSupportLibrary = true
     }
 
+    lint {
+        disable += "ExpiredTargetSdkVersion"
+    }
+
+    signingConfigs {
+        create("release") {
+            storeFile = file("amcode-release.jks")
+            storePassword = "amcode123"
+            keyAlias = "amcode"
+            keyPassword = "amcode123"
+        }
+    }
+
     buildTypes {
         release {
+            signingConfig = signingConfigs.getByName("release")
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(
