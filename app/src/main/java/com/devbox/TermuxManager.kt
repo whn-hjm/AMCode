@@ -172,10 +172,26 @@ object TermuxManager {
             emitOutput("[5/6] Testing mirrors + configuring apt...\n")
             setupAptSources()
 
-            // Step 6: Install packages via apt
+            // Step 6: Install packages — retry until successful
             emitOutput("[6/6] Installing packages (nodejs, code-server)...\n")
-            _setupState.value = SetupProgress(State.INSTALLING_PACKAGES, "Installing nodejs and code-server...", 30)
-            installPackages()
+            var ok = false
+            for (attempt in 0..2) {
+                _setupState.value = SetupProgress(State.INSTALLING_PACKAGES,
+                    if (attempt > 0) "Installing packages (attempt ${attempt+1}/3)..." else "Installing packages...",
+                    30 + attempt * 10)
+                ok = installPackages()
+                if (ok) break
+                if (attempt < 2) {
+                    emitOutput("[retry] Download interrupted, retrying in 3s...\n")
+                    Thread.sleep(3000)
+                }
+            }
+
+            if (!ok) {
+                emitOutput("[FAILED] Could not install packages after 3 attempts.\n")
+                _setupState.value = SetupProgress(State.FAILED, "Installation failed. Check network.", 0)
+                return@withContext Result.failure(RuntimeException("Package installation failed"))
+            }
 
             _setupState.value = SetupProgress(State.READY, "Environment ready", 100)
             Log.i(TAG, "Termux environment initialized successfully")

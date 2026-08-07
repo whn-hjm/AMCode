@@ -128,17 +128,7 @@ class CodeServerService : Service() {
                     throw envResult.exceptionOrNull()!!
                 }
 
-                // Verify packages, retry silently if needed
-                if (!TermuxManager.isNodeInstalled() || !CodeServerLauncher.isInstalled()) {
-                    Log.w(TAG, "Packages missing, retrying...")
-                    _serviceStatus.value = ServiceStatus(
-                        ServiceState.SETTING_UP_ENV, "Finishing installation...", 85
-                    )
-                    TermuxManager.installPackages()
-                    if (!TermuxManager.isNodeInstalled() && !CodeServerLauncher.isInstalled()) {
-                        throw RuntimeException("Package installation failed. Please restart the app.")
-                    }
-                }
+                // Packages are verified by initialize() — no separate retry needed
 
                 // Launch a collector for code-server status
                 val serverCollector = launch {
