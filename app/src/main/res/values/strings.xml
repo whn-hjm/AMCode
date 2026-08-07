@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">AMCode</string>
+    <string name="logo">{ } AMCode</string>
+    <string name="initializing">Initializing development environment…</string>
+    <string name="vscode_ready">VS Code is ready — launching…</string>
+    <string name="error_occurred">An error occurred</string>
+    <string name="service_notification_title">VS Code Server</string>
+    <string name="service_notification_text">VS Code is running in the background</string>
+</resources>

@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<full-backup-content>
+    <!-- Don't back up the Termux environment or code-server (too large) -->
+    <exclude domain="root" path="files/usr" />
+    <exclude domain="root" path="files/code-server" />
+    <exclude domain="root" path="files/.code-server-data" />
+    <exclude domain="root" path="files/.code-server-extensions" />
+</full-backup-content>
