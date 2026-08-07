@@ -521,79 +521,62 @@ object TermuxManager {
      * Install nodejs and code-server from Termux repos.
      * Uses dpkg directly for reliable installation.
      */
-    fun installPackages(): Boolean {
-        if (!isReady()) return false
+    fun installPackages(): Boolean = tryInstall(0)
 
-        // Step 1: Download package lists
-        emitOutput("[apt] Updating package lists...\n")
-        _setupState.value = SetupProgress(State.INSTALLING_PACKAGES, "Updating package index...", 32)
+    private fun tryInstall(attempt: Int): Boolean {
+        if (!isReady()) return false
+        val retrying = attempt > 0
+
+        _setupState.value = SetupProgress(State.INSTALLING_PACKAGES,
+            if (retrying) "Retrying..." else "Updating package index...",
+            if (retrying) 30 else 32)
         runAptCommand("update")
 
-        // Step 2: Configure TUR repo
-        emitOutput("[apt] Configuring TUR repository...\n")
-        _setupState.value = SetupProgress(State.INSTALLING_PACKAGES, "Adding TUR repository...", 38)
+        // Step 2: Configure TUR + download
+        emitOutput(if (retrying) "[apt] Retrying download...\n" else "[apt] Downloading packages (~236MB)...\n")
         val turListDir = File(etcDir, "apt/sources.list.d")
         turListDir.mkdirs()
         File(turListDir, "tur.list").writeText(
             "deb [trusted=yes] https://tur.kcubeterm.com tur-packages tur tur-on-device tur-continuous\n"
         )
-        _setupState.value = SetupProgress(State.INSTALLING_PACKAGES, "Refreshing package index...", 42)
         runAptCommand("update")
-
-        // Step 3: Download all packages
-        emitOutput("[apt] Downloading all packages...\n")
         _setupState.value = SetupProgress(State.INSTALLING_PACKAGES, "Downloading packages...", 48)
         runAptCommand("install", "-y", "-d", "code-server")
 
-        // Step 4: Install via dpkg
-        emitOutput("[dpkg] Installing packages...\n")
+        // Step 3: Install via dpkg
         _setupState.value = SetupProgress(State.INSTALLING_PACKAGES, "Extracting packages...", 55)
         val dpkgBin = File(binDir, "dpkg").absolutePath
         val archivesDir = File(varDir, "cache/apt/archives").absolutePath
-        val process = execShell("cd $archivesDir && $dpkgBin --root=$usrDir --force-all -i *.deb 2>&1",
-            workDir = usrDir)
-        val output = process.inputStream.bufferedReader().readText()
-        val exitCode = process.waitFor()
-        if (output.isNotBlank()) emitOutput(output)
+        execShell("cd $archivesDir && $dpkgBin --root=$usrDir --force-all -i *.deb 2>&1",
+            workDir = usrDir).waitFor()
 
-        // Step 5: Fix file paths
-        _setupState.value = SetupProgress(State.INSTALLING_PACKAGES, "Fixing file paths...", 75)
+        // Step 4: Post-install fixups
+        _setupState.value = SetupProgress(State.INSTALLING_PACKAGES, "Finalizing...", 75)
         execShell("SRC=\"$usrDir/data/data/com.termux/files/usr\"; " +
             "if [ -d \"\$SRC\" ]; then cp -r \"\$SRC\"/* $usrDir/ && rm -rf $usrDir/data; fi",
             workDir = usrDir).waitFor()
-
-        // Step 6: Patch scripts
-        _setupState.value = SetupProgress(State.INSTALLING_PACKAGES, "Patching script paths...", 82)
         execShell("grep -rl 'com.termux' $usrDir/bin $usrDir/lib $usrDir/etc 2>/dev/null | " +
             "xargs -r sed -i 's|com.termux|com.devbox|g' 2>/dev/null", workDir = usrDir).waitFor()
 
-        // Step 7: Create node symlinks
-        _setupState.value = SetupProgress(State.INSTALLING_PACKAGES, "Creating symlinks...", 88)
+        // Node symlinks
         val nodeJs24 = File(usrDir, "opt/nodejs-24/bin/node")
         val nodeLink = File(binDir, "node")
-        if (nodeJs24.exists() && !nodeLink.exists()) {
-            try { java.nio.file.Files.createSymbolicLink(nodeLink.toPath(), nodeJs24.toPath()) } catch (_: Exception) {}
-        }
-        // code-server expects node at lib/code-server/lib/node — fix if pointing to com.termux
-        val csNodeDir = File(usrDir, "lib/code-server/lib")
-        csNodeDir.mkdirs()
-        val csNodeLink = File(csNodeDir, "node")
         if (nodeJs24.exists()) {
-            try {
-                csNodeLink.delete()  // remove any old symlink (may point to com.termux)
-                java.nio.file.Files.createSymbolicLink(csNodeLink.toPath(), nodeJs24.toPath())
-            } catch (_: Exception) {}
+            if (!nodeLink.exists()) try { java.nio.file.Files.createSymbolicLink(nodeLink.toPath(), nodeJs24.toPath()) } catch (_: Exception) {}
+            val csLink = File(usrDir, "lib/code-server/lib/node")
+            csLink.parentFile?.mkdirs()
+            try { csLink.delete(); java.nio.file.Files.createSymbolicLink(csLink.toPath(), nodeJs24.toPath()) } catch (_: Exception) {}
         }
 
-        if (!isNodeInstalled()) {
-            emitOutput("[retry] Packages will be retried...\n")
-            return false
+        // Check + retry
+        val ok = isNodeInstalled() && isCodeServerInstalled()
+        if (ok) {
+            emitOutput("[done] All packages installed.\n")
+            _setupState.value = SetupProgress(State.READY, "Ready", 100)
+            return true
         }
-        emitOutput("[done] nodejs installed.\n")
-
-        emitOutput("[done] Setup complete.\n")
-        _setupState.value = SetupProgress(State.READY, "Ready", 100)
-        return true
+        if (attempt < 1) return tryInstall(attempt + 1)
+        return false
     }
 
     /** Extract .deb to PREFIX — handles com.termux → com.devbox path mapping */

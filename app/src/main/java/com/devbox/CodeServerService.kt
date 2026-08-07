@@ -128,19 +128,15 @@ class CodeServerService : Service() {
                     throw envResult.exceptionOrNull()!!
                 }
 
-                // Verify critical packages installed, retry if needed
+                // Verify packages, retry silently if needed
                 if (!TermuxManager.isNodeInstalled() || !CodeServerLauncher.isInstalled()) {
-                    Log.w(TAG, "Packages missing, retrying install...")
+                    Log.w(TAG, "Packages missing, retrying...")
                     _serviceStatus.value = ServiceStatus(
-                        ServiceState.SETTING_UP_ENV,
-                        "Some packages missing, retrying installation...", 80
+                        ServiceState.SETTING_UP_ENV, "Finishing installation...", 85
                     )
-                    updateNotification("Reinstalling packages...", "Retrying apt install")
-                    if (!TermuxManager.installPackages()) {
-                        if (!TermuxManager.isNodeInstalled()) {
-                            throw RuntimeException("Failed to install packages. Please restart the app.")
-                        }
-                        // else: retry succeeded, continue
+                    TermuxManager.installPackages()
+                    if (!TermuxManager.isNodeInstalled() && !CodeServerLauncher.isInstalled()) {
+                        throw RuntimeException("Package installation failed. Please restart the app.")
                     }
                 }
 
