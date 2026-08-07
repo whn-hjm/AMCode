@@ -647,12 +647,20 @@ object TermuxManager {
         val aptPath = File(binDir, "apt").absolutePath
         val process = execCommand(aptPath, aptArgs, homeDir, env)
 
-        // Stream output line by line to terminal
+        // Stream output, filtering known-benign seccomp/GPG warnings
         val reader = process.inputStream.bufferedReader()
         var line: String?
+        val skipPatterns = listOf(
+            "Bad system call", "pre-installation script", "post-installation script",
+            "dependency problems, but configuring anyway",
+            "Errors were encountered while processing:",
+            "W: GPG error:", "Couldn't execute", "apt-key",
+            "W: Failed to fetch", "The following signatures couldn't be verified",
+            "installed tur-repo package", "new nodejs package"
+        )
         while (reader.readLine().also { line = it } != null) {
             val text = line!!
-            if (text.isNotBlank()) {
+            if (text.isNotBlank() && !skipPatterns.any { text.contains(it) }) {
                 emitOutput("  $text\n")
             }
         }
