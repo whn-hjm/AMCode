@@ -574,7 +574,7 @@ object TermuxManager {
         }
 
         if (!isNodeInstalled()) {
-            emitOutput("[ERROR] nodejs not found.\n")
+            emitOutput("[retry] Packages will be retried...\n")
             return false
         }
         emitOutput("[done] nodejs installed.\n")

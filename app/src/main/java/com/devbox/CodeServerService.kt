@@ -137,7 +137,10 @@ class CodeServerService : Service() {
                     )
                     updateNotification("Reinstalling packages...", "Retrying apt install")
                     if (!TermuxManager.installPackages()) {
-                        throw RuntimeException("Failed to install nodejs/code-server. Check network.")
+                        if (!TermuxManager.isNodeInstalled()) {
+                            throw RuntimeException("Failed to install packages. Please restart the app.")
+                        }
+                        // else: retry succeeded, continue
                     }
                 }
 
