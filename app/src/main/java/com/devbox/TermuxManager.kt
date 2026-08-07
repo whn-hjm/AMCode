@@ -164,13 +164,13 @@ object TermuxManager {
             emitOutput("[3/6] Patching binary paths (com.termux -> com.devbox)...\n")
             patchBinaries()
 
-            // Step 5: Set up apt + symlinks
-            _setupState.value = SetupProgress(State.PATCHING, "Configuring package manager...", 25)
-            emitOutput("[4/6] Configuring apt sources...\n")
-            setupAptSources()
-            _setupState.value = SetupProgress(State.PATCHING, "Creating symlinks...", 28)
-            emitOutput("[5/6] Creating symlinks...\n")
+            // Step 5: Create symlinks first (needed by curl for mirror test)
+            _setupState.value = SetupProgress(State.PATCHING, "Creating symlinks...", 25)
+            emitOutput("[4/6] Creating symlinks...\n")
             createSymlinks()
+            _setupState.value = SetupProgress(State.PATCHING, "Testing apt mirrors...", 28)
+            emitOutput("[5/6] Testing mirrors + configuring apt...\n")
+            setupAptSources()
 
             // Step 6: Install packages via apt
             emitOutput("[6/6] Installing packages (nodejs, code-server)...\n")
@@ -429,22 +429,34 @@ object TermuxManager {
 
     private fun setupAptSources() {
         // Termux package repository sources
+        // Test mirrors and pick the fastest
+        val mirrors = listOf(
+            "Tsinghua" to "https://mirrors.tuna.tsinghua.edu.cn/termux/apt/termux-main",
+            "USTC" to "https://mirrors.ustc.edu.cn/termux/apt/termux-main",
+            "Official" to "https://packages.termux.dev/apt/termux-main"
+        )
+        var bestMirror = mirrors.first()
+        var bestTime = Long.MAX_VALUE
+        val curlBin = File(binDir, "curl").absolutePath
+
+        for ((name, url) in mirrors) {
+            try {
+                val start = System.currentTimeMillis()
+                val proc = execShell("$curlBin -sI --connect-timeout 5 --max-time 10 $url/dists/stable/Release 2>/dev/null | head -1", workDir = usrDir)
+                proc.waitFor()
+                val elapsed = System.currentTimeMillis() - start
+                if (proc.exitValue() == 0 && elapsed < bestTime) {
+                    bestTime = elapsed
+                    bestMirror = name to url
+                }
+            } catch (_: Exception) { }
+        }
+
         val sourcesList = File(aptDir, "sources.list")
         sourcesList.writeText(
-            """
-            # Tsinghua Termux mirror — main packages + tur-repo
-            deb [trusted=yes] https://mirrors.tuna.tsinghua.edu.cn/termux/apt/termux-main stable main
-            """.trimIndent()
+            "deb [trusted=yes] ${bestMirror.second} stable main\n"
         )
-
-        // Configure dpkg to use correct root and architecture
-        val dpkgCfg = File(etcDir, "apt/apt.conf.d/99-dpkg")
-        dpkgCfg.writeText(
-            """
-            DPkg::Options {"--root=${usrDir.absolutePath}";"--force-depends";}
-            """.trimIndent()
-        )
-        emitOutput("[setup] apt source: mirrors.tuna.tsinghua.edu.cn\n")
+        emitOutput("[setup] apt mirror: ${bestMirror.first} (${bestTime}ms)\n")
 
         // apt configuration for Termux environment
         val aptConfDir = File(etcDir, "apt/apt.conf.d")
