@@ -245,6 +245,16 @@ class MainActivity : AppCompatActivity() {
                     webViewReady = true
                     loadingOverlay.postDelayed({ loadingOverlay.visibility = View.GONE }, 300)
                     Log.i(TAG, "WebView page loaded: $url")
+                    // Inject mobile touch fix: prevent 300ms tap delay
+                    view?.evaluateJavascript("""
+                        (function(){
+                            if(window.__amc_touch) return;
+                            window.__amc_touch=true;
+                            var s=document.createElement('style');
+                            s.textContent='body,input,textarea,select,button{ touch-action: manipulation; }';
+                            document.head.appendChild(s);
+                        })();
+                    """.trimIndent(), null)
                 }
             }
 

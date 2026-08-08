@@ -559,6 +559,8 @@ object TermuxManager {
         )
         runAptCommand("update")
         _setupState.value = SetupProgress(State.INSTALLING_PACKAGES, "Downloading packages...", 48)
+        // Install GPG keyring first so pkg update works in terminal
+        runAptCommand("install", "-y", "-d", "termux-keyring")
         runAptCommand("install", "-y", "-d", "code-server")
 
         // Step 3: Install via dpkg
