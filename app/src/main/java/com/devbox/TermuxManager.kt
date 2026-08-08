@@ -574,11 +574,6 @@ object TermuxManager {
         execShell("grep -rl 'com.termux' $usrDir/bin $usrDir/lib $usrDir/etc 2>/dev/null | " +
             "xargs -r sed -i 's|com.termux|com.devbox|g' 2>/dev/null", workDir = usrDir).waitFor()
 
-        // Extension fix: pretend Linux so non-Web extensions work (e.g. language packs)
-        File(binDir, "android-as-linux.js").writeText(
-            "Object.defineProperty(process,'platform',{get:function(){return'linux'}})\n"
-        )
-
         // Node symlinks
         val nodeJs24 = File(usrDir, "opt/nodejs-24/bin/node")
         val nodeLink = File(binDir, "node")
