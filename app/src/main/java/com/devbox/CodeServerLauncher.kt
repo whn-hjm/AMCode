@@ -77,6 +77,11 @@ object CodeServerLauncher {
             env["SHELL"] = TermuxManager.getShell()
             env["CS_DISABLE_TELEMETRY"] = "true"
             env["CS_DISABLE_UPDATE_CHECK"] = "true"
+            // Pretend Linux so non-Web extensions (e.g. Chinese language pack) work
+            val platformPatch = File(TermuxManager.usrDir, "bin/android-as-linux.js")
+            if (platformPatch.exists()) {
+                env["NODE_OPTIONS"] = "--require ${platformPatch.absolutePath}"
+            }
 
             val userDataDir = File(App.instance.filesDir, ".code-server-data").absolutePath
             val extDir = File(App.instance.filesDir, ".code-server-extensions").absolutePath
