@@ -1,3 +1,0 @@
-D:/Code/code-server/vsboxed/app/.cxx/Debug/2f673b4w/x86_64/CMakeFiles/platform_fix.dir
-D:/Code/code-server/vsboxed/app/.cxx/Debug/2f673b4w/x86_64/CMakeFiles/edit_cache.dir
-D:/Code/code-server/vsboxed/app/.cxx/Debug/2f673b4w/x86_64/CMakeFiles/rebuild_cache.dir

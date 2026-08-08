@@ -41,3 +41,4 @@ Thumbs.db
 bootstrap-*.zip
 app/amcode-release.jks
 DEVELOPMENT.md
+.cxx/
