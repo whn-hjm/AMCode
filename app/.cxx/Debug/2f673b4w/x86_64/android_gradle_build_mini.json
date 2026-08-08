@@ -1,0 +1,27 @@
+{
+  "buildFiles": [
+    "D:\\Code\\code-server\\vsboxed\\app\\src\\main\\cpp\\CMakeLists.txt"
+  ],
+  "cleanCommandsComponents": [
+    [
+      "D:\\Android\\Sdk\\cmake\\3.22.1\\bin\\ninja.exe",
+      "-C",
+      "D:\\Code\\code-server\\vsboxed\\app\\.cxx\\Debug\\2f673b4w\\x86_64",
+      "clean"
+    ]
+  ],
+  "buildTargetsCommandComponents": [
+    "D:\\Android\\Sdk\\cmake\\3.22.1\\bin\\ninja.exe",
+    "-C",
+    "D:\\Code\\code-server\\vsboxed\\app\\.cxx\\Debug\\2f673b4w\\x86_64",
+    "{LIST_OF_TARGETS_TO_BUILD}"
+  ],
+  "libraries": {
+    "platform_fix::@6890427a1f51a3e7e1df": {
+      "artifactName": "platform_fix",
+      "abi": "x86_64",
+      "output": "D:\\Code\\code-server\\vsboxed\\app\\build\\intermediates\\cxx\\Debug\\2f673b4w\\obj\\x86_64\\libplatform_fix.so",
+      "runtimeFiles": []
+    }
+  }
+}

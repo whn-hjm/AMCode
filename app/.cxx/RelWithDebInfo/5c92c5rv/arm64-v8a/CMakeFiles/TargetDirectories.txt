@@ -1,0 +1,3 @@
+D:/Code/code-server/vsboxed/app/.cxx/RelWithDebInfo/5c92c5rv/arm64-v8a/CMakeFiles/platform_fix.dir
+D:/Code/code-server/vsboxed/app/.cxx/RelWithDebInfo/5c92c5rv/arm64-v8a/CMakeFiles/edit_cache.dir
+D:/Code/code-server/vsboxed/app/.cxx/RelWithDebInfo/5c92c5rv/arm64-v8a/CMakeFiles/rebuild_cache.dir

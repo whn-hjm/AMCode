@@ -1,0 +1,18 @@
+                        -HD:\Code\code-server\vsboxed\app\src\main\cpp
+-DCMAKE_SYSTEM_NAME=Android
+-DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+-DCMAKE_SYSTEM_VERSION=26
+-DANDROID_PLATFORM=android-26
+-DANDROID_ABI=x86_64
+-DCMAKE_ANDROID_ARCH_ABI=x86_64
+-DANDROID_NDK=D:\Android\Sdk\ndk\26.1.10909125
+-DCMAKE_ANDROID_NDK=D:\Android\Sdk\ndk\26.1.10909125
+-DCMAKE_TOOLCHAIN_FILE=D:\Android\Sdk\ndk\26.1.10909125\build\cmake\android.toolchain.cmake
+-DCMAKE_MAKE_PROGRAM=D:\Android\Sdk\cmake\3.22.1\bin\ninja.exe
+-DCMAKE_LIBRARY_OUTPUT_DIRECTORY=D:\Code\code-server\vsboxed\app\build\intermediates\cxx\Debug\2f673b4w\obj\x86_64
+-DCMAKE_RUNTIME_OUTPUT_DIRECTORY=D:\Code\code-server\vsboxed\app\build\intermediates\cxx\Debug\2f673b4w\obj\x86_64
+-DCMAKE_BUILD_TYPE=Debug
+-BD:\Code\code-server\vsboxed\app\.cxx\Debug\2f673b4w\x86_64
+-GNinja
+                        Build command args: []
+                        Version: 2
