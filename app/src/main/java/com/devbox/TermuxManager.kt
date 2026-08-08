@@ -432,7 +432,9 @@ object TermuxManager {
         val textDirs = listOf(binDir, etcDir, File(binDir, "applets"))
         for (dir in textDirs) {
             if (!dir.exists()) continue
-            dir.walkTopDown().filter { it.isFile }.forEach { file ->
+            dir.walkTopDown()
+                .filter { it.isFile && !it.absolutePath.contains("/termux/") }
+                .forEach { file ->
                 try {
                     val content = file.readText()
                     if (oldTextPath in content) {
@@ -571,7 +573,10 @@ object TermuxManager {
         execShell("SRC=\"$usrDir/data/data/com.termux/files/usr\"; " +
             "if [ -d \"\$SRC\" ]; then cp -r \"\$SRC\"/* $usrDir/ && rm -rf $usrDir/data; fi",
             workDir = usrDir).waitFor()
-        execShell("grep -rl 'com.termux' $usrDir/bin $usrDir/lib $usrDir/etc 2>/dev/null | " +
+        execShell("grep -rl 'com.termux' $usrDir/bin $usrDir/lib 2>/dev/null | " +
+            "xargs -r sed -i 's|com.termux|com.devbox|g' 2>/dev/null", workDir = usrDir).waitFor()
+        // Also patch etc/ but exclude mirrors/ (pkg uses mirror URLs with 'termux' in domain)
+        execShell("grep -rl 'com.termux' $usrDir/etc 2>/dev/null | grep -v '/termux/' | " +
             "xargs -r sed -i 's|com.termux|com.devbox|g' 2>/dev/null", workDir = usrDir).waitFor()
 
         // Node symlinks
