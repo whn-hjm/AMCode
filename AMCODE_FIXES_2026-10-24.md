@@ -219,3 +219,69 @@ clang --version
 - Linux/glibc native 扩展仍然不可用；需要 proot/glibc 用户态或 VHEditor 式 patched code-server。
 - Workspace Trust、Git 未安装、API 26–29、孤儿进程、8 秒 setup 等仍在 backlog。
 - **当前默认 app-debug.apk 已重新 clean 构建回 68.74MB，不含 offline-debs**；189.75MB 的 bundle 样例保存在 `D:\amcode-offline-x86_64-debug.apk`（未 commit）。
+
+---
+
+## 7. 第三批修复（2026-10-24 深夜）
+
+### 7.1 默认内部 HOME + `/sdcard` 链接
+
+- 新安装默认 `HOME=/data/user/0/com.devbox/files/home`，不再首启请求 `MANAGE_EXTERNAL_STORAGE`。
+- `~/storage/shared -> /storage/emulated/0` 由 app 创建；`/sdcard/AMCode` 文件不搬、不删，仍可通过 Open Folder/Storage action 打开。
+- 现有 `home_mode=external` 升级后首启弹一次性迁移对话框（Switch internal / Keep external）；不自动移动文件。
+- 实测（5558 fresh offline）：`No persisted HOME; defaulting to internal storage`、`HOME set to internal storage`、`~/storage/shared` 链接存在；Explorer 显示 `home/storage`。
+- API 28 fresh：同样 internal，无权限弹窗；grant/deny 旧流程仍可用（C 已测）。
+
+### 7.2 Auth token
+
+- 每次 launch 生成 32 字节随机 token；只把 **SHA-256 hex** 写入 app-private `cache/run/code-server.yaml`（0600）；启动参数：
+  `--auth password --config .../code-server.yaml --bind-addr 127.0.0.1:<port>`。
+- launcher 自己做 `POST /login` 拿 `code-server-session` cookie，再用 `/mint-key` 校验 200；Activity 在首次导航前把 cookie 注入 `CookieManager`。
+- 实测（5558）：
+  - 未认证 `GET /` -> `302 Location: ./login`
+  - 未认证 `POST /mint-key` -> `401`
+  - 正确 cookie `POST /mint-key` -> `200`
+  - 正确 cookie `GET /` -> `302` 到 `?folder=...`（不是 login）
+  - WebView 日志 `Session cookie installed ... len=64`，页面无登录页。
+- 采用 SHA-256 `hashed-password` 而不是明文：4.143.1 对明文每个请求 argon2 ~130–160ms，SHA-256 约 3–6ms；pinned 版本支持该 legacy 路径。
+
+### 7.3 启动快路径 + offline dpkg
+
+- `files/.amcode-pkg-setup` marker：versionCode + setup asset hash + dpkg/termux-tools/keyring 版本 + pkg size/mtime；快检失败才 full repair。
+- 实测：
+  - 首次 fresh offline：`ensurePkgSetup full repair done in 21971ms ... marker written`（包含 19 包 postinst）。
+  - 第二次启动：`ensurePkgSetup fast path: marker valid ... in 122ms`。
+- offline dpkg 根因修复：不再 `--root` 双重拼 admin dir；改为 `dpkg --instdir=$PREFIX --unpack` + payload 搬移 + `dpkg --configure -a`。
+- 实测 fresh offline（5558/API28）：
+  `[dpkg] exit=0 (unpack=0 configure=0 audit=clean; 19 package(s))`；
+  `pkg install -y hello` exit 0，`dpkg --audit` 空，`dpkg-query -W code-server nodejs-24` 均为 installed。
+- API28 有 `py3compile ... Bad system call` 日志，但 dpkg exit=0/audit clean，code-server 正常启动；记残余。
+
+### 7.4 孤儿进程 + Trust
+
+- PID 文件 `files/run/code-server.pid`（pid/starttime/port/bin，0600）；启动前按 PID+cmdline 清理旧 code-server，Stop/划任务 SIGTERM→SIGKILL 进程树；`stopWithTask=true`。
+- 实测 force-stop/restart 后旧 PID 不再存在，新 code-server 正常绑定新动态端口。
+- 不传 `--disable-workspace-trust`；外部/共享目录显示 App 级警告 + VS Code Restricted Mode。internal 工作区首次也会显示 Restricted Mode banner，点 Trust 后扩展才启用（按“提示”而非自动信任）。
+- 通知新增 Storage action，可切换 internal / 授权共享存储。
+
+### 7.5 双 APK
+
+| 产物 | 大小 | 说明 |
+|---|---|---|
+| `D:\amcode-release-online.apk` | 64.52MB | 在线版，首次下载 code-server/node |
+| `D:\amcode-release-offline-arm64.apk` | 185.70MB | arm64 离线版，包含 code-server/node，首次只拉主镜像小依赖 |
+| `D:\amcode-debug-online.apk` | 68.78MB | debug 在线，已安装 5558 |
+| `D:\amcode-debug-offline-x86_64.apk` | 189.62MB | x86_64 debug，offline 测试用 |
+
+`app-release-offline-arm64.apk` 已确认含 `assets/offline-debs/aarch64/{code-server,nodejs-24,manifest}`；在线 release 不含 offline-debs。
+
+### 7.6 残余
+
+- internal 工作区首次仍显示 VS Code Restricted Mode banner，必须点 Trust 才启用用户扩展；这是按用户要求保留提示，不自动信任。
+- `~/storage/shared` 在 workspace 根下，watcher 可能跟随；后续可加 `files.watcherExclude`。
+- 现有旧安装的 code-server/node 不会自动补登记到新 dpkg DB；fresh/offline 安装已正确登记。
+- API28 `py3compile Bad system call`（dpkg exit=0/audit clean）；Python 字节码预编译可能不完整。
+- 无“切回 external”UI；现有 external 保留，新产品默认 internal；Storage action 提供 internal/授权入口。
+- versionCode 仍为 1；正式发版需 bump。release 版尚未 fresh 安装做 UI 回归（debug 已验证）。
+- SHA-256 hashed-password 是 code-server 4.143.1 legacy 路径；未来升级需重新验证 auth。
+- 默认在线 TUR 仍慢；离线版是正式双版本之一。

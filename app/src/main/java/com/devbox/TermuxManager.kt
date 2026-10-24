@@ -55,6 +55,21 @@ object TermuxManager {
      */
     private const val LIBCPP_HASH_SYMBOL = "_ZNSt6__ndk113__hash_memoryEPKvm"
 
+    /**
+     * Bump when the pkg-setup repair contract changes. The completion marker
+     * key includes this revision, so a code update re-runs the repair once.
+     */
+    private const val PKG_SETUP_REVISION = 2
+    private const val PKG_SETUP_MARKER_SCHEMA = 1
+    private const val PKG_SETUP_MARKER_FILE = ".amcode-pkg-setup"
+
+    /** Assets that must be copied and executed by the pkg-setup repair. */
+    private val PKG_SETUP_ASSETS = listOf(
+        "amcode-dpkg-wrapper.sh",
+        "amcode-pkg-setup.sh",
+        "tur.gpg"
+    )
+
     // Package name MUST be exactly 10 chars to match "com.termux" for binary patching
     const val PACKAGE_NAME = "com.devbox"
 
@@ -268,8 +283,9 @@ object TermuxManager {
                 return@withContext Result.failure(RuntimeException("Package installation failed: $detail"))
             }
 
-            // The initial install uses `dpkg --root` and moves the com.termux
-            // tree into place by hand. Migrate the resulting dpkg database
+            // The initial install unpacks under the package's com.termux
+            // prefix and moves the payload into place by hand. Repair the
+            // keyring/symlinks/wrapper and migrate the resulting dpkg database
             // paths so later `pkg install` runs see a consistent package DB.
             ensurePkgSetup(context)
             ensureLibCpp30()
@@ -639,14 +655,46 @@ object TermuxManager {
      *  - points apt's Dir::Bin::dpkg at a wrapper that rewrites Termux .deb
      *    prefixes to com.devbox before invoking the real dpkg,
      *  - switches the TUR source to signed once its key is available,
-     *  - migrates dpkg database paths left by the initial `dpkg --root`
-     *    bootstrap install from com.termux to com.devbox.
+     *  - migrates dpkg database paths left by the initial bootstrap install
+     *    from com.termux to com.devbox.
      *
      * The actual work lives in app/src/main/assets/amcode-pkg-setup.sh so it can
      * be tested in a real Termux prefix. This method only syncs the assets and
      * streams the script log to Logcat.
+     *
+     * The repair takes several seconds (the SYMLINKS.txt scan and the dpkg
+     * database walk dominate), so a healthy install is detected with a small
+     * completion marker instead. The marker key contains the APK versionCode,
+     * a hash of the three setup assets and the dpkg/termux-tools/termux-keyring
+     * versions; on top of that a handful of cheap file checks (keys, wrapper,
+     * pkg cache, .amcode-ready) must pass. Any mismatch/corruption logs
+     * "ensurePkgSetup full repair" and runs the script once.
      */
     private fun ensurePkgSetup(context: Context): Boolean {
+        val startedAt = System.currentTimeMillis()
+        val fingerprint = currentPkgSetupFingerprint(context)
+        var repairReason: String? = if (fingerprint == null) {
+            "cannot read pkg-setup assets"
+        } else {
+            describePkgSetupMarkerMismatch(fingerprint, readPkgSetupMarker())
+        }
+        if (fingerprint != null && repairReason == null) {
+            val unhealthy = pkgSetupHealthFailure(context, requireAmcodeReady = true)
+            if (unhealthy == null) {
+                Log.i(TAG, "ensurePkgSetup fast path: marker valid " +
+                    "(versionCode=${fingerprint.versionCode} " +
+                    "setup=${fingerprint.setupHash.take(12)} " +
+                    "dpkg=${fingerprint.dpkgVersion} " +
+                    "termux-tools=${fingerprint.termuxToolsVersion}) in " +
+                    "${System.currentTimeMillis() - startedAt}ms")
+                return true
+            }
+            repairReason = unhealthy
+        }
+        Log.i(TAG, "ensurePkgSetup full repair: $repairReason")
+        // Do not trust a marker while the repair is in progress or if it fails.
+        File(filesDir, PKG_SETUP_MARKER_FILE).delete()
+
         return try {
             val setupDir = File(usrDir, "libexec/amcode")
             setupDir.mkdirs()
@@ -693,9 +741,327 @@ object TermuxManager {
             }
             val exitCode = process.waitFor()
             Log.i(TAG, "ensurePkgSetup done: exit=$exitCode assets=$copied warnings=$warnings")
-            exitCode == 0
+            if (exitCode != 0) {
+                Log.w(TAG, "ensurePkgSetup full repair failed: exit=$exitCode; marker not written")
+                return false
+            }
+
+            // The bundled bootstrap pkg still has the Termux cache path while
+            // a pkg upgraded through the wrapper has the com.devbox form; the
+            // shell repair only handles the latter.
+            if (repairPkgCachePath()) {
+                Log.i(TAG, "ensurePkgSetup repaired the bin/pkg cache path")
+            }
+
+            // Also catch the slash-less md5sums entries the shell repair does
+            // not rewrite (it only matches "/data/data/com.termux").
+            val migrated = migrateDpkgPathsToDevbox()
+            Log.i(TAG, "ensurePkgSetup db paths migrated: files=$migrated")
+
+            val fresh = currentPkgSetupFingerprint(context)
+            val unhealthy = pkgSetupHealthFailure(context, requireAmcodeReady = false)
+            if (fresh == null || unhealthy != null) {
+                Log.w(TAG, "ensurePkgSetup full repair incomplete: " +
+                    (unhealthy ?: "cannot fingerprint setup assets") +
+                    "; marker not written")
+                false
+            } else {
+                writePkgSetupMarker(fresh)
+                Log.i(TAG, "ensurePkgSetup full repair done in " +
+                    "${System.currentTimeMillis() - startedAt}ms " +
+                    "(exit=$exitCode assets=$copied warnings=$warnings); marker written " +
+                    "(versionCode=${fresh.versionCode} " +
+                    "setup=${fresh.setupHash.take(12)} " +
+                    "dpkg=${fresh.dpkgVersion} " +
+                    "termux-tools=${fresh.termuxToolsVersion})")
+                true
+            }
         } catch (e: Exception) {
             Log.e(TAG, "ensurePkgSetup failed", e)
+            false
+        }
+    }
+
+    private data class PkgSetupFingerprint(
+        val revision: Int,
+        val versionCode: Long,
+        val setupHash: String,
+        val dpkgVersion: String,
+        val termuxToolsVersion: String,
+        val keyringVersion: String,
+        val pkgSize: Long,
+        val pkgMtime: Long
+    )
+
+    private fun currentPkgSetupFingerprint(context: Context): PkgSetupFingerprint? {
+        val setupHash = setupAssetsHash(context) ?: return null
+        val versions = installedPackageVersions()
+        val pkg = File(binDir, "pkg")
+        return PkgSetupFingerprint(
+            revision = PKG_SETUP_REVISION,
+            versionCode = appVersionCode(context),
+            setupHash = setupHash,
+            dpkgVersion = versions["dpkg"].orEmpty(),
+            termuxToolsVersion = versions["termux-tools"].orEmpty(),
+            keyringVersion = versions["termux-keyring"].orEmpty(),
+            pkgSize = pkg.length(),
+            pkgMtime = pkg.lastModified()
+        )
+    }
+
+    private fun appVersionCode(context: Context): Long {
+        return try {
+            @Suppress("DEPRECATION")
+            context.packageManager.getPackageInfo(context.packageName, 0).versionCode.toLong()
+        } catch (e: Exception) {
+            Log.w(TAG, "Cannot read APK versionCode: ${e.message}")
+            -1L
+        }
+    }
+
+    /** Stable SHA-256 over the three setup assets, including their names. */
+    private fun setupAssetsHash(context: Context): String? {
+        return try {
+            val digest = MessageDigest.getInstance("SHA-256")
+            for (assetName in PKG_SETUP_ASSETS) {
+                digest.update(assetName.toByteArray(Charsets.UTF_8))
+                digest.update(0.toByte())
+                context.assets.open(assetName).use { input ->
+                    val buffer = ByteArray(8192)
+                    var count: Int
+                    while (input.read(buffer).also { count = it } != -1) {
+                        digest.update(buffer, 0, count)
+                    }
+                }
+            }
+            digest.digest().joinToString("") { "%02x".format(it.toInt() and 0xff) }
+        } catch (e: Exception) {
+            Log.w(TAG, "Cannot hash pkg-setup assets: ${e.message}")
+            null
+        }
+    }
+
+    /**
+     * bin/pkg looks for its .deb cache under a hardcoded path. The bootstrap
+     * copy still has the Termux prefix, while an upgraded pkg (rewritten by
+     * the dpkg wrapper) has com.devbox/cache/apt; both must point at
+     * $PREFIX/var/cache/apt like apt does.
+     */
+    private fun repairPkgCachePath(): Boolean {
+        val pkg = File(binDir, "pkg")
+        if (!pkg.isFile) return false
+        return try {
+            val original = pkg.readText()
+            val fixed = original
+                .replace(
+                    "/data/data/com.termux/cache/apt",
+                    "/data/data/com.devbox/files/usr/var/cache/apt"
+                )
+                .replace(
+                    "/data/data/com.devbox/cache/apt",
+                    "/data/data/com.devbox/files/usr/var/cache/apt"
+                )
+            if (fixed == original) {
+                false
+            } else {
+                pkg.writeText(fixed)
+                true
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Cannot repair bin/pkg cache path: ${e.message}")
+            false
+        }
+    }
+
+    private fun readPkgSetupMarker(): PkgSetupFingerprint? {
+        val marker = File(filesDir, PKG_SETUP_MARKER_FILE)
+        if (!marker.isFile) return null
+        return try {
+            val json = JSONObject(marker.readText())
+            if (json.optInt("schema", 0) != PKG_SETUP_MARKER_SCHEMA) return null
+            PkgSetupFingerprint(
+                revision = json.optInt("revision", -1),
+                versionCode = json.optLong("versionCode", -1L),
+                setupHash = json.optString("setupHash"),
+                dpkgVersion = json.optString("dpkgVersion"),
+                termuxToolsVersion = json.optString("termuxToolsVersion"),
+                keyringVersion = json.optString("keyringVersion"),
+                pkgSize = json.optLong("pkgSize", -1L),
+                pkgMtime = json.optLong("pkgMtime", -1L)
+            )
+        } catch (e: Exception) {
+            Log.w(TAG, "Cannot read pkg-setup marker: ${e.message}")
+            null
+        }
+    }
+
+    private fun writePkgSetupMarker(fingerprint: PkgSetupFingerprint) {
+        val marker = File(filesDir, PKG_SETUP_MARKER_FILE)
+        val tmp = File(filesDir, "$PKG_SETUP_MARKER_FILE.tmp")
+        try {
+            val json = JSONObject()
+                .put("schema", PKG_SETUP_MARKER_SCHEMA)
+                .put("revision", fingerprint.revision)
+                .put("versionCode", fingerprint.versionCode)
+                .put("setupHash", fingerprint.setupHash)
+                .put("dpkgVersion", fingerprint.dpkgVersion)
+                .put("termuxToolsVersion", fingerprint.termuxToolsVersion)
+                .put("keyringVersion", fingerprint.keyringVersion)
+                .put("pkgSize", fingerprint.pkgSize)
+                .put("pkgMtime", fingerprint.pkgMtime)
+                .put("writtenAt", System.currentTimeMillis())
+            tmp.writeText(json.toString())
+            tmp.setReadable(true, true)
+            if (!tmp.renameTo(marker)) {
+                marker.delete()
+                if (!tmp.renameTo(marker)) {
+                    tmp.delete()
+                    Log.w(TAG, "Cannot install pkg-setup marker at $marker")
+                }
+            }
+        } catch (e: Exception) {
+            tmp.delete()
+            Log.w(TAG, "Cannot write pkg-setup marker: ${e.message}")
+        }
+    }
+
+    private fun describePkgSetupMarkerMismatch(
+        current: PkgSetupFingerprint,
+        marker: PkgSetupFingerprint?
+    ): String? {
+        if (marker == null) return "no completion marker"
+        if (marker.revision != current.revision) {
+            return "setup revision ${marker.revision} -> ${current.revision}"
+        }
+        if (marker.versionCode != current.versionCode) {
+            return "APK versionCode ${marker.versionCode} -> ${current.versionCode}"
+        }
+        if (marker.setupHash != current.setupHash) return "pkg-setup assets changed"
+        if (marker.dpkgVersion != current.dpkgVersion) {
+            return "dpkg ${marker.dpkgVersion} -> ${current.dpkgVersion}"
+        }
+        if (marker.termuxToolsVersion != current.termuxToolsVersion) {
+            return "termux-tools ${marker.termuxToolsVersion} -> ${current.termuxToolsVersion}"
+        }
+        if (marker.keyringVersion != current.keyringVersion) {
+            return "termux-keyring ${marker.keyringVersion} -> ${current.keyringVersion}"
+        }
+        if (marker.pkgSize != current.pkgSize) return "bin/pkg size changed"
+        if (marker.pkgMtime != current.pkgMtime) return "bin/pkg was modified"
+        return null
+    }
+
+    /** Returns version strings for the packages whose upgrades invalidate the marker. */
+    private fun installedPackageVersions(): Map<String, String> {
+        val wanted = setOf("dpkg", "termux-tools", "termux-keyring")
+        val versions = mutableMapOf<String, String>()
+        val status = File(varDir, "lib/dpkg/status")
+        if (!status.isFile) return versions
+        return try {
+            var pkg = ""
+            status.forEachLine { line ->
+                when {
+                    line.startsWith("Package: ") ->
+                        pkg = line.substringAfter("Package: ").trim()
+                    line.startsWith("Version: ") && pkg in wanted ->
+                        versions[pkg] = line.substringAfter("Version: ").trim()
+                }
+            }
+            versions
+        } catch (e: Exception) {
+            Log.w(TAG, "Cannot read dpkg package versions: ${e.message}")
+            versions
+        }
+    }
+
+    /**
+     * Cheap correctness checks for the fast path. Returns null when healthy,
+     * otherwise a human-readable reason for the full repair.
+     */
+    private fun pkgSetupHealthFailure(context: Context, requireAmcodeReady: Boolean): String? {
+        val wrapper = File(usrDir, "libexec/amcode/dpkg")
+        val setupScript = File(usrDir, "libexec/amcode/pkg-setup.sh")
+        val turKey = File(usrDir, "libexec/amcode/tur.gpg")
+        val aptConf = File(etcDir, "apt/apt.conf.d/99-amcode-dpkg")
+        val mainKey = File(etcDir, "apt/trusted.gpg.d/termux-autobuilds.gpg")
+        val turKeyring = File(etcDir, "apt/trusted.gpg.d/tur.gpg")
+        val status = File(varDir, "lib/dpkg/status")
+        val required = linkedMapOf(
+            "bash" to File(binDir, "bash"),
+            "apt" to File(binDir, "apt"),
+            "dpkg" to File(binDir, "dpkg"),
+            "dpkg-deb" to File(binDir, "dpkg-deb"),
+            "pkg" to File(binDir, "pkg"),
+            "libtermux-exec.so" to File(usrDir, "lib/libtermux-exec.so"),
+            "dpkg wrapper" to wrapper,
+            "pkg setup script" to setupScript,
+            "TUR key" to turKey,
+            "termux-autobuilds key" to mainKey,
+            "TUR keyring" to turKeyring,
+            "dpkg wrapper apt config" to aptConf,
+            "dpkg status" to status
+        )
+        for ((label, file) in required) {
+            if (!file.exists()) return "missing $label (${file.absolutePath})"
+        }
+        if (!wrapper.canExecute()) return "dpkg wrapper is not executable"
+        // Bootstrap applet symlinks used by the wrapper, apt and install
+        // scripts. The full repair recreates these from SYMLINKS.txt.
+        for (name in listOf(
+            "sh", "rm", "cp", "mv", "mkdir", "chmod", "stat", "readlink"
+        )) {
+            if (!File(binDir, name).exists()) return "missing bin/$name symlink"
+        }
+        if (mainKey.length() == 0L) return "termux-autobuilds key is empty"
+        if (turKeyring.length() == 0L) return "TUR keyring is empty"
+        if (status.length() == 0L) return "empty dpkg status"
+        if (!File(varDir, "cache/apt/archives").isDirectory) {
+            return "missing apt archive cache"
+        }
+        if (!File(varDir, "lib/dpkg/info").isDirectory) return "missing dpkg info directory"
+        if (requireAmcodeReady && !File(filesDir, ".amcode-ready").isFile) {
+            return "missing .amcode-ready completion marker"
+        }
+        return try {
+            val statusText = status.readText()
+            val pkgText = File(binDir, "pkg").readText()
+            val aptConfText = aptConf.readText()
+            when {
+                statusText.contains("/data/data/com.termux") ->
+                    "dpkg status still references /data/data/com.termux"
+                pkgText.contains("/data/data/com.devbox/cache/apt") ||
+                    pkgText.contains("/data/data/com.termux/cache/apt") ->
+                    "bin/pkg still uses the broken cache path"
+                !aptConfText.contains("Dir::Bin::dpkg") ||
+                    !aptConfText.contains(wrapper.absolutePath) ->
+                    "apt is not configured to use the dpkg wrapper"
+                !installedFileMatchesAsset(context, "amcode-dpkg-wrapper.sh", wrapper) ->
+                    "dpkg wrapper does not match the bundled asset"
+                !installedFileMatchesAsset(context, "amcode-pkg-setup.sh", setupScript) ->
+                    "pkg setup script does not match the bundled asset"
+                !installedFileMatchesAsset(context, "tur.gpg", turKey) ->
+                    "TUR key does not match the bundled asset"
+                !installedFileMatchesAsset(context, "tur.gpg", turKeyring) ->
+                    "installed TUR keyring does not match the bundled key"
+                else -> null
+            }
+        } catch (e: Exception) {
+            "cannot validate package-manager files: ${e.message}"
+        }
+    }
+
+    private fun installedFileMatchesAsset(
+        context: Context,
+        assetName: String,
+        installed: File
+    ): Boolean {
+        return try {
+            val assetBytes = context.assets.open(assetName).use { it.readBytes() }
+            val installedBytes = installed.readBytes()
+            val digest = MessageDigest.getInstance("SHA-256")
+            MessageDigest.isEqual(digest.digest(assetBytes), digest.digest(installedBytes))
+        } catch (e: Exception) {
+            Log.w(TAG, "Cannot compare $assetName with $installed: ${e.message}")
             false
         }
     }
@@ -1212,41 +1578,225 @@ object TermuxManager {
         return installDebFiles(debs)
     }
 
+    /**
+     * Install .deb files with dpkg.
+     *
+     * Termux .debs contain ./data/data/com.termux/files/usr/... payload paths,
+     * but this app cannot create /data/data/com.termux. The installer therefore
+     * unpacks under $PREFIX (the only writable root), moves the payload up and
+     * rewrites the database. Two dpkg details matter:
+     *
+     *  - `--root=$PREFIX` joins the root with dpkg's compiled-in ADMINDIR
+     *    (`$PREFIX/var/lib/dpkg`), producing the doubled
+     *    `$PREFIX/data/data/com.devbox/files/usr/var/lib/dpkg`. `--instdir`
+     *    changes only the install dir, so the real admin dir is used.
+     *  - `--unpack` leaves postinst scripts pending, which lets us move the
+     *    payload and rewrite the com.termux prefix before `--configure -a`
+     *    executes them from the real admin dir with a working shebang.
+     */
     private fun installDebFiles(debs: List<File>): Boolean {
         val dpkg = File(binDir, "dpkg").absolutePath
-        val args = mutableListOf("--root=${usrDir.absolutePath}", "--force-all", "--install")
-        args += debs.map { it.absolutePath }
         val env = mapOf("DEBIAN_FRONTEND" to "noninteractive")
-        val result = try {
-            consumeProcess(execCommand(dpkg, args, usrDir, env))
+
+        // $PREFIX/data is only ever the nested com.termux payload from an
+        // interrupted/previous run; it is not a real package path.
+        File(usrDir, "data").deleteRecursively()
+
+        // The bootstrap database records /data/data/com.termux/... while the
+        // bootstrap itself was extracted to the real com.devbox prefix. Fix
+        // those entries before unpacking upgrades so their preinst/prerm
+        // scripts also have a working shebang.
+        val preMigrated = migrateDpkgPathsToDevbox()
+        if (preMigrated > 0) {
+            Log.i(TAG, "dpkg db: pre-unpack migration updated $preMigrated file(s)")
+        }
+
+        val unpackArgs = mutableListOf(
+            "--instdir=${usrDir.absolutePath}",
+            "--force-all",
+            // Same reason as the wrapper: app UIDs cannot chroot, and the
+            // install/admin dir spellings differ (/data/user/0 vs /data/data).
+            "--force-script-chrootless",
+            "--unpack"
+        )
+        unpackArgs += debs.map { it.absolutePath }
+        emitOutput("[dpkg] unpacking ${debs.size} package(s)...\n")
+        val unpack = try {
+            consumeProcess(execCommand(dpkg, unpackArgs, usrDir, env))
         } catch (e: Exception) {
-            lastInstallError = "dpkg failed to start: ${e.message}"
+            lastInstallError = "dpkg --unpack failed to start: ${e.message}"
             emitOutput("[dpkg] ${lastInstallError}\n")
             return false
         }
-        if (result.exitCode != 0) {
-            val tail = result.lines.filter { it.isNotBlank() }.takeLast(6).joinToString("\n")
-            emitOutput("[dpkg] exit=${result.exitCode}; continuing to check installed files.\n")
-            if (tail.isNotBlank()) Log.w(TAG, "dpkg tail:\n$tail")
-            result.lines.firstOrNull {
-                it.contains("dependency problems") || it.contains("not installed") || it.contains("error")
-            }?.let { lastInstallError = it.trim() }
+        if (unpack.exitCode != 0) {
+            Log.w(TAG, "dpkg --unpack exit=${unpack.exitCode}:\n" +
+                unpack.lines.filter { it.isNotBlank() }.takeLast(8).joinToString("\n"))
         }
+
+        // Move $PREFIX/data/data/com.termux/files/usr/* up into $PREFIX and
+        // rewrite com.termux strings in the installed payload.
         applyPostInstallFixups()
+
+        // The unpacked .list/conffiles/info scripts still use the package's
+        // com.termux prefix. Rewrite them now so --configure finds the real
+        // files and the maintainer scripts have com.devbox shebangs.
+        val postMigrated = migrateDpkgPathsToDevbox()
+        Log.i(TAG, "dpkg db: post-unpack migration updated $postMigrated file(s)")
+
+        emitOutput("[dpkg] configuring packages (postinst)...\n")
+        val configure = try {
+            consumeProcess(
+                execCommand(
+                    dpkg,
+                    listOf("--force-all", "--force-script-chrootless", "--configure", "-a"),
+                    usrDir,
+                    env
+                )
+            )
+        } catch (e: Exception) {
+            lastInstallError = "dpkg --configure failed to start: ${e.message}"
+            emitOutput("[dpkg] ${lastInstallError}\n")
+            return false
+        }
+
+        val audit = try {
+            consumeProcess(execCommand(dpkg, listOf("--audit"), usrDir, env))
+        } catch (e: Exception) {
+            Log.w(TAG, "dpkg --audit failed to start: ${e.message}")
+            null
+        }
+        val auditProblems = audit?.lines?.filter {
+            it.isNotBlank() && !it.contains(".dpkg.cfg")
+        }.orEmpty()
+        val auditClean = audit != null && audit.exitCode == 0 && auditProblems.isEmpty()
+        val ok = unpack.exitCode == 0 && configure.exitCode == 0 && auditClean
+        val detail = "unpack=${unpack.exitCode} configure=${configure.exitCode} " +
+            "audit=${if (auditClean) "clean" else "${auditProblems.size} problem(s)"}"
+        if (ok) {
+            emitOutput("[dpkg] exit=0 ($detail; ${debs.size} package(s))\n")
+        } else {
+            emitOutput("[dpkg] exit=1 ($detail)\n")
+            lastInstallError = lastInstallError.ifBlank {
+                when {
+                    unpack.exitCode != 0 -> "dpkg --unpack failed"
+                    configure.exitCode != 0 -> "dpkg --configure failed"
+                    else -> "dpkg --audit reports broken packages"
+                }
+            }
+            val tail = (unpack.lines + configure.lines + auditProblems)
+                .filter { it.isNotBlank() }
+                .takeLast(8)
+            if (tail.isNotEmpty()) Log.w(TAG, "dpkg failure tail:\n${tail.joinToString("\n")}")
+        }
         return true
+    }
+
+    /**
+     * Rewrite /data/data/com.termux -> /data/data/com.devbox in the dpkg
+     * database (status, .list, conffiles, maintainer scripts, alternatives,
+     * triggers and updates).
+     *
+     * Both the leading-slash form used by status/.list/conffiles and the bare
+     * "data/data/..." form used by .md5sums are handled. The replacement is
+     * byte-wise and same-length, so it is safe for any database file.
+     */
+    private fun migrateDpkgPathsToDevbox(): Int {
+        val db = File(varDir, "lib/dpkg")
+        if (!db.isDirectory) return 0
+        val targets = mutableListOf<File>()
+        for (name in listOf(
+            "status", "status-old", "available", "diversions", "statoverride"
+        )) {
+            val file = File(db, name)
+            if (file.isFile) targets += file
+        }
+        for (dir in listOf("info", "alternatives", "triggers", "updates")) {
+            File(db, dir).listFiles()?.forEach { if (it.isFile) targets += it }
+        }
+        val patterns = listOf(
+            "/data/data/com.termux" to "/data/data/com.devbox",
+            "data/data/com.termux" to "data/data/com.devbox"
+        )
+        var changed = 0
+        for (file in targets) {
+            try {
+                var bytes = file.readBytes()
+                var modified = false
+                for ((oldText, newText) in patterns) {
+                    val updated = replaceBytes(
+                        bytes,
+                        oldText.toByteArray(Charsets.UTF_8),
+                        newText.toByteArray(Charsets.UTF_8)
+                    )
+                    if (updated != null) {
+                        bytes = updated
+                        modified = true
+                    }
+                }
+                if (modified) {
+                    file.writeBytes(bytes)
+                    changed++
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Cannot migrate dpkg db file ${file.absolutePath}: ${e.message}")
+            }
+        }
+        return changed
+    }
+
+    /** Replace every occurrence of [old] with the same-length [new]. */
+    private fun replaceBytes(source: ByteArray, old: ByteArray, new: ByteArray): ByteArray? {
+        if (old.isEmpty() || old.size != new.size || source.size < old.size) return null
+        var found = false
+        var index = 0
+        val result = source.copyOf()
+        while (index <= result.size - old.size) {
+            var match = true
+            for (j in old.indices) {
+                if (result[index + j] != old[j]) {
+                    match = false
+                    break
+                }
+            }
+            if (match) {
+                for (j in new.indices) result[index + j] = new[j]
+                found = true
+                index += old.size
+            } else {
+                index++
+            }
+        }
+        return if (found) result else null
     }
 
     private fun applyPostInstallFixups() {
         _setupState.value = SetupProgress(State.INSTALLING_PACKAGES, "Finalizing...", 82)
 
-        // dpkg --root installs under the package's baked-in com.termux prefix.
-        // Move that payload up into our real PREFIX.
-        val termuxPrefix = File(usrDir, "data/data/com.termux/files/usr")
-        if (termuxPrefix.isDirectory) {
-            runShellQuiet(
-                "SRC=\"$termuxPrefix\"; " +
-                    "if [ -d \"\$SRC\" ]; then cp -r \"\$SRC\"/* ${usrDir.absolutePath}/ && rm -rf ${usrDir.absolutePath}/data; fi"
+        // dpkg unpacks under the package's baked-in prefix. A raw Termux deb
+        // uses com.termux; a deb already rewritten by the pkg wrapper uses
+        // com.devbox. Move either payload up into the real PREFIX. (The apt
+        // cache can contain both kinds, e.g. an old pkg-installed hello.deb
+        // next to a freshly downloaded glib.deb.)
+        var movedNestedPayload = false
+        var copiedNestedPayload = true
+        // Rewritten (older cached) debs first, raw (current download) debs
+        // last, so a current package wins if the cache holds a stale copy of
+        // the same package.
+        for (nestedPrefix in listOf(
+            File(usrDir, "data/data/com.devbox/files/usr"),
+            File(usrDir, "data/data/com.termux/files/usr")
+        )) {
+            if (!nestedPrefix.isDirectory) continue
+            movedNestedPayload = true
+            val copied = runShellQuiet(
+                "SRC=\"$nestedPrefix\"; " +
+                    "if [ -d \"\$SRC\" ]; then cp -r \"\$SRC\"/* ${usrDir.absolutePath}/; fi"
             )
+            if (!copied) copiedNestedPayload = false
+        }
+        // Keep the nested trees on a partial copy so a retry can recover them.
+        if (movedNestedPayload && copiedNestedPayload) {
+            runShellQuiet("rm -rf ${usrDir.absolutePath}/data")
         }
 
         // Fix paths that packages baked in as text.

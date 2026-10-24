@@ -13,6 +13,7 @@ import androidx.core.content.ContextCompat
 import java.io.File
 import java.io.PrintWriter
 import java.io.StringWriter
+import java.nio.file.Files
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -99,6 +100,11 @@ class App : Application() {
 /**
  * Persisted choice of HOME/workspace storage.
  *
+ * Default (no preference) is the app-private internal HOME
+ * (`/data/user/0/com.devbox/files/home`). Shared storage was the old default
+ * and is kept working for existing `home_mode=external` installations, but it
+ * is never selected silently and its files are never moved automatically.
+ *
  * The service may be restarted by START_STICKY without an Activity, so the
  * choice must be stored outside the Activity and restored before code-server
  * is spawned. External storage is only ever used after verifying that the
@@ -109,9 +115,29 @@ object HomePrefs {
     private const val TAG = "HomePrefs"
     private const val PREFS_NAME = "amcode_prefs"
     private const val KEY_HOME_MODE = "home_mode"
+    private const val KEY_EXTERNAL_MIGRATION_PROMPTED = "external_migration_prompted"
+    private const val KEY_EXTERNAL_TRUST_WARNED = "external_trust_warned"
 
     const val MODE_INTERNAL = "internal"
     const val MODE_EXTERNAL = "external"
+
+    /**
+     * Termux-style shared-storage mount point. `/sdcard` resolves to the same
+     * FUSE mount, but the canonical path is stable across Android versions.
+     */
+    private const val SHARED_STORAGE_TARGET = "/storage/emulated/0"
+
+    /** Result of restoring HOME without an Activity (START_STICKY/service). */
+    data class RestoreResult(
+        val external: Boolean,
+        val home: File,
+        /**
+         * True when the persisted choice is external but it is currently
+         * unavailable; internal HOME is used for this launch only and the
+         * persisted choice is left untouched so an Activity can repair it.
+         */
+        val externalFallback: Boolean
+    )
 
     private fun prefs(context: Context) =
         context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -123,10 +149,24 @@ object HomePrefs {
         prefs(context).edit().putString(KEY_HOME_MODE, mode).apply()
     }
 
-    /** Standard shared-storage workspace: /sdcard/AMCode */
+    fun wasExternalMigrationPrompted(context: Context): Boolean =
+        prefs(context).getBoolean(KEY_EXTERNAL_MIGRATION_PROMPTED, false)
+
+    fun markExternalMigrationPrompted(context: Context) {
+        prefs(context).edit().putBoolean(KEY_EXTERNAL_MIGRATION_PROMPTED, true).apply()
+    }
+
+    fun wasExternalTrustWarningShown(context: Context): Boolean =
+        prefs(context).getBoolean(KEY_EXTERNAL_TRUST_WARNED, false)
+
+    fun markExternalTrustWarningShown(context: Context) {
+        prefs(context).edit().putBoolean(KEY_EXTERNAL_TRUST_WARNED, true).apply()
+    }
+
+    /** Legacy shared-storage workspace: /sdcard/AMCode */
     fun externalHomeDir(): File = File(Environment.getExternalStorageDirectory(), "AMCode")
 
-    /** Private, always-writable fallback: files/home */
+    /** Private, always-writable default: files/home */
     fun internalHomeDir(context: Context): File =
         File(context.applicationContext.filesDir, "home")
 
@@ -175,37 +215,172 @@ object HomePrefs {
     }
 
     /**
-     * Restore the persisted HOME into TermuxManager before code-server starts.
-     * Returns true when the external HOME was applied.
+     * Apply the internal HOME and make sure `~/storage/shared` exists. The
+     * symlink is created even when /sdcard is not readable yet: Android will
+     * deny access until the user grants it, and the link itself is harmless.
      */
-    fun restoreHomeDir(context: Context): Boolean {
+    fun applyInternalHome(context: Context, persist: Boolean = true): Boolean {
+        if (persist) setMode(context, MODE_INTERNAL)
+        val dir = internalHomeDir(context)
+        return try {
+            TermuxManager.setHomeDir(dir)
+            val ok = dir.isDirectory && dir.canWrite()
+            if (!ok) {
+                Log.e(TAG, "Internal HOME is not writable: ${dir.absolutePath}")
+                return false
+            }
+            ensureStorageLayout(dir)
+            Log.i(TAG, "Applied internal HOME: ${dir.absolutePath}")
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to apply internal HOME", e)
+            false
+        }
+    }
+
+    /** Apply the legacy external HOME after access/writability were checked. */
+    fun applyExternalHome(context: Context): Boolean {
+        val dir = externalHomeDir()
+        return try {
+            TermuxManager.setHomeDir(dir)
+            if (!dir.isDirectory || !dir.canWrite()) {
+                Log.w(TAG, "External HOME is not writable: ${dir.absolutePath}")
+                return false
+            }
+            setMode(context, MODE_EXTERNAL)
+            Log.i(TAG, "Applied external HOME: ${dir.absolutePath}")
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to apply external HOME", e)
+            false
+        }
+    }
+
+    /**
+     * Restore the persisted HOME into TermuxManager before code-server starts.
+     *
+     * Unlike the previous implementation this NEVER rewrites an explicit
+     * `external` preference to `internal`. If the external grant was revoked,
+     * internal HOME is used for this launch only and the Activity can prompt
+     * again; user files under /sdcard/AMCode stay where they are.
+     */
+    fun restoreHomeDir(context: Context): RestoreResult {
         val mode = getMode(context)
         if (mode == MODE_EXTERNAL) {
             if (hasExternalAccess(context) && isExternalWritable()) {
-                if (applyHomeDir(externalHomeDir())) {
-                    Log.i(TAG, "Restored external HOME: ${externalHomeDir().absolutePath}")
-                    return true
+                if (applyExternalHome(context)) {
+                    return RestoreResult(
+                        external = true,
+                        home = TermuxManager.homeDir,
+                        externalFallback = false
+                    )
                 }
                 Log.w(TAG, "Could not apply external HOME")
             } else {
                 Log.w(TAG, "Persisted external HOME is unavailable")
             }
-            // Keep the persisted mode and the effective HOME consistent for
-            // future START_STICKY restarts in this installation.
-            setMode(context, MODE_INTERNAL)
+            applyInternalHome(context, persist = false)
+            Log.w(
+                TAG,
+                "Using internal HOME for this launch; persisted external HOME is unchanged"
+            )
+            return RestoreResult(
+                external = false,
+                home = TermuxManager.homeDir,
+                externalFallback = true
+            )
         }
-        applyHomeDir(internalHomeDir(context))
-        Log.i(TAG, "Restored internal HOME: ${internalHomeDir(context).absolutePath}")
-        return false
+
+        if (mode != MODE_INTERNAL) setMode(context, MODE_INTERNAL)
+        applyInternalHome(context, persist = false)
+        return RestoreResult(
+            external = false,
+            home = TermuxManager.homeDir,
+            externalFallback = false
+        )
     }
 
-    private fun applyHomeDir(dir: File): Boolean {
+    /**
+     * Create `$HOME/storage/shared -> /storage/emulated/0`. Existing real
+     * directories are left untouched; only a symlink (including a dangling or
+     * stale one) or an empty directory is replaced.
+     */
+    fun ensureStorageLayout(home: File): Boolean {
         return try {
-            TermuxManager.setHomeDir(dir)
-            dir.isDirectory && dir.canWrite()
+            if (!home.isDirectory) return false
+            val storage = File(home, "storage")
+            if (!storage.exists() && !storage.mkdirs()) {
+                Log.w(TAG, "Cannot create ${storage.absolutePath}")
+                return false
+            }
+            if (!storage.isDirectory) {
+                Log.w(TAG, "Not a directory: ${storage.absolutePath}")
+                return false
+            }
+            ensureSharedStorageLink(File(storage, "shared"))
+            true
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to set HOME to ${dir.absolutePath}", e)
+            Log.w(TAG, "Cannot prepare ~/storage layout", e)
             false
+        }
+    }
+
+    private fun ensureSharedStorageLink(link: File) {
+        val linkPath = link.toPath()
+        val target = File(SHARED_STORAGE_TARGET).toPath()
+
+        if (Files.isSymbolicLink(linkPath)) {
+            val raw = try {
+                Files.readSymbolicLink(linkPath)
+            } catch (e: Exception) {
+                Log.w(TAG, "Cannot read ${link.absolutePath}", e)
+                null
+            }
+            val resolved = raw?.let {
+                try {
+                    if (it.isAbsolute) it.normalize()
+                    else link.parentFile?.toPath()?.resolve(it)?.normalize()
+                } catch (_: Exception) {
+                    null
+                }
+            }
+            if (resolved == target) {
+                Log.i(TAG, "storage/shared already points to $SHARED_STORAGE_TARGET")
+                return
+            }
+            // Only symlinks are removed here, never user data.
+            try {
+                Files.delete(linkPath)
+                Log.i(TAG, "Removed stale storage/shared link -> ${raw ?: "<unreadable>"}")
+            } catch (e: Exception) {
+                Log.w(TAG, "Cannot replace storage/shared symlink", e)
+                return
+            }
+        } else if (link.exists()) {
+            // A real directory is only replaced when it is empty; a directory
+            // with files is preserved and reported instead of being destroyed.
+            if (!link.isDirectory) {
+                Log.w(TAG, "Refusing to replace non-directory ${link.absolutePath}")
+                return
+            }
+            val entries = link.list()
+            if (entries == null || entries.isNotEmpty()) {
+                Log.w(TAG, "Refusing to replace non-empty ${link.absolutePath}")
+                return
+            }
+            if (!link.delete()) {
+                Log.w(TAG, "Cannot remove empty directory ${link.absolutePath}")
+                return
+            }
+        }
+
+        try {
+            Files.createSymbolicLink(linkPath, target)
+            Log.i(TAG, "Created ${link.absolutePath} -> $SHARED_STORAGE_TARGET")
+        } catch (e: UnsupportedOperationException) {
+            Log.w(TAG, "Filesystem does not support symlinks for ${link.absolutePath}", e)
+        } catch (e: Exception) {
+            Log.w(TAG, "Cannot create storage/shared symlink", e)
         }
     }
 }

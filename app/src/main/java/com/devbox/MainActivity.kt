@@ -44,6 +44,7 @@ import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import java.io.File
 import java.util.Locale
 
 /**
@@ -64,6 +65,8 @@ class MainActivity : AppCompatActivity() {
         private const val DEFAULT_SERVER_PORT = 8080
         private const val DEFAULT_SERVER_URL = "http://127.0.0.1:$DEFAULT_SERVER_PORT"
         private const val MAX_WEBVIEW_RETRIES = 3
+        private const val MAX_AUTH_RETRIES = 2
+        private const val SESSION_COOKIE_NAME = "code-server-session"
     }
 
     private lateinit var webView: WebView
@@ -93,6 +96,16 @@ class MainActivity : AppCompatActivity() {
     private var startupStarted = false
     private var storageResolved = false
     private var serviceStartRequested = false
+
+    /** Which flow launched a storage-permission Activity result. */
+    private enum class StoragePurpose { NONE, STARTUP_EXTERNAL, ON_DEMAND_SHARED }
+
+    private var pendingStoragePurpose = StoragePurpose.NONE
+    private var authRetryCount = 0
+    private var sharedStoragePromptShown = false
+    private var sharedTrustWarned = false
+    private var lastHandledSharedFolder: String? = null
+    private var pendingHomeSettingsDialog = false
 
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
@@ -157,20 +170,32 @@ class MainActivity : AppCompatActivity() {
         startCodeServerServiceOnce()
     }
 
-    // Android 11+ "All files access" settings screen.
+    // Android 11+ "All files access" settings screen. The result is consumed
+    // either by the startup external-HOME flow or by an on-demand request for
+    // a shared-storage folder (never requested for the internal default).
     private val storagePermissionLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) {
-        if (HomePrefs.hasExternalAccess(this@MainActivity) &&
-            HomePrefs.isExternalWritable()
-        ) {
-            completeStorageSetup(true)
-        } else {
-            completeStorageSetup(
-                false,
-                if (isChinese()) "无法访问共享存储，已改用内部存储"
-                else "External storage is unavailable; using internal storage"
-            )
+        val purpose = pendingStoragePurpose
+        pendingStoragePurpose = StoragePurpose.NONE
+        when (purpose) {
+            StoragePurpose.ON_DEMAND_SHARED -> {
+                onSharedStoragePermissionResult(HomePrefs.hasExternalAccess(this@MainActivity))
+            }
+            StoragePurpose.STARTUP_EXTERNAL -> {
+                if (!HomePrefs.hasExternalAccess(this@MainActivity)) {
+                    fallbackToInternalAfterExternalDenied()
+                } else if (!HomePrefs.isExternalWritable()) {
+                    showExternalUnavailableDialog()
+                } else {
+                    finishExternalHome()
+                }
+            }
+            StoragePurpose.NONE -> {
+                // A result delivered after process death/Activity recreation
+                // has no owning flow; never change HOME based on it.
+                Log.w(TAG, "Ignoring storage settings result with no pending purpose")
+            }
         }
     }
 
@@ -180,14 +205,23 @@ class MainActivity : AppCompatActivity() {
     ) { result ->
         val writeGranted = result[Manifest.permission.WRITE_EXTERNAL_STORAGE] == true
         val readGranted = result[Manifest.permission.READ_EXTERNAL_STORAGE] == true
-        if (writeGranted && readGranted && HomePrefs.isExternalWritable()) {
-            completeStorageSetup(true)
-        } else {
-            completeStorageSetup(
-                false,
-                if (isChinese()) "未获得存储权限，已改用内部存储"
-                else "Storage permission was denied; using internal storage"
-            )
+        val granted = writeGranted && readGranted
+        val purpose = pendingStoragePurpose
+        pendingStoragePurpose = StoragePurpose.NONE
+        when (purpose) {
+            StoragePurpose.ON_DEMAND_SHARED -> onSharedStoragePermissionResult(granted)
+            StoragePurpose.STARTUP_EXTERNAL -> {
+                if (!granted) {
+                    fallbackToInternalAfterExternalDenied()
+                } else if (!HomePrefs.isExternalWritable()) {
+                    showExternalUnavailableDialog()
+                } else {
+                    finishExternalHome()
+                }
+            }
+            StoragePurpose.NONE -> {
+                Log.w(TAG, "Ignoring legacy storage result with no pending purpose")
+            }
         }
     }
 
@@ -245,9 +279,31 @@ class MainActivity : AppCompatActivity() {
 
             // Single startup path: storage -> notification -> service.
             beginStartup()
+            handleLaunchIntent(intent)
         } catch (e: Exception) {
             Log.e(TAG, "Crash in onCreate", e)
             Toast.makeText(this, "App crashed: ${e.message}. Check crash log.", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleLaunchIntent(intent)
+    }
+
+    /**
+     * The ongoing notification exposes a "Storage" action that re-opens the
+     * app's HOME information / switch-to-internal dialog. A cold start must
+     * wait until storage resolution and the foreground service request are
+     * done so the dialog cannot be covered by a permission prompt.
+     */
+    private fun handleLaunchIntent(intent: Intent?) {
+        if (intent?.action == CodeServerService.ACTION_OPEN_HOME_SETTINGS) {
+            Log.i(TAG, "Workspace storage dialog requested from notification")
+            intent.action = null
+            pendingHomeSettingsDialog = true
+            maybeShowPendingHomeSettingsDialog()
         }
     }
 
@@ -265,94 +321,221 @@ class MainActivity : AppCompatActivity() {
         val savedMode = HomePrefs.getMode(this)
         Log.i(TAG, "Startup: persisted home mode=$savedMode")
 
-        // The user already chose internal storage: never ask again.
-        if (savedMode == HomePrefs.MODE_INTERNAL) {
-            completeStorageSetup(false)
-            return
-        }
-
-        if (HomePrefs.hasExternalAccess(this)) {
-            if (HomePrefs.isExternalWritable()) {
-                completeStorageSetup(true)
-            } else {
-                completeStorageSetup(
-                    false,
-                    if (isChinese()) "共享存储不可写，已改用内部存储"
-                    else "External storage is not writable; using internal storage"
-                )
+        when (savedMode) {
+            HomePrefs.MODE_EXTERNAL -> {
+                // Existing external installations keep working, but the user
+                // gets one explicit chance to move to the internal HOME.
+                // Nothing is moved or deleted in either case.
+                if (!HomePrefs.wasExternalMigrationPrompted(this)) {
+                    showExternalMigrationDialog()
+                } else {
+                    resolveExternalHome()
+                }
             }
-            return
-        }
-
-        // No storage access yet: resolve it before the service may start.
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            showAllFilesAccessDialog()
-        } else {
-            requestLegacyStoragePermissions()
+            HomePrefs.MODE_INTERNAL -> finishInternalHome(persist = true)
+            else -> {
+                // Fresh installation: internal HOME is the default. Never ask
+                // for MANAGE_EXTERNAL_STORAGE just to start the app.
+                Log.i(TAG, "No persisted HOME; defaulting to internal storage")
+                finishInternalHome(persist = true)
+            }
         }
     }
 
     /**
-     * Persist the effective HOME choice and continue. This is the ONLY place
-     * that marks storage as resolved, so the service cannot be started twice.
+     * One-time prompt for installations that already use /sdcard/AMCode.
+     * "Keep external" preserves the existing behavior; "Switch" only changes
+     * HOME, leaving every file in /sdcard/AMCode untouched.
      */
-    private fun completeStorageSetup(useExternal: Boolean, fallbackReason: String? = null) {
-        if (storageResolved) return
+    private fun showExternalMigrationDialog() {
+        if (isFinishing || isDestroyed) return
+        val isZh = isChinese()
+        AlertDialog.Builder(this)
+            .setTitle(if (isZh) "工作区存储方式" else "Workspace Storage")
+            .setMessage(
+                if (isZh)
+                    "AMCode 现在默认使用内部存储作为 HOME（Git/编译可执行，速度更快）。\n\n" +
+                        "你当前的工作区是 /sdcard/AMCode。切换不会移动或删除任何文件，它们仍可通过 ~/storage/shared 打开。\n\n" +
+                        "共享存储中的文件夹可能被其他应用修改，VS Code 会以受限模式打开并要求你确认信任。\n\n" +
+                        "是否切换到内部存储？"
+                else
+                    "AMCode now defaults to internal storage for HOME (Git/builds can run, and it is faster).\n\n" +
+                        "Your current workspace is /sdcard/AMCode. Switching does NOT move or delete any files; they stay reachable through ~/storage/shared.\n\n" +
+                        "Folders on shared storage can be modified by other apps. VS Code opens them in Restricted Mode and asks you to trust them.\n\n" +
+                        "Switch to internal storage now?"
+            )
+            .setCancelable(false)
+            .setPositiveButton(if (isZh) "切换到内部存储" else "Switch to internal") { _, _ ->
+                HomePrefs.markExternalMigrationPrompted(this)
+                finishInternalHome(persist = true)
+            }
+            .setNegativeButton(if (isZh) "保留外部存储" else "Keep external") { _, _ ->
+                HomePrefs.markExternalMigrationPrompted(this)
+                // The dialog above already explains shared-folder trust; avoid
+                // stacking a second warning on the same launch.
+                HomePrefs.markExternalTrustWarningShown(this)
+                sharedTrustWarned = true
+                resolveExternalHome()
+            }
+            .show()
+    }
+
+    private fun resolveExternalHome() {
+        if (!HomePrefs.hasExternalAccess(this)) {
+            // Only an explicit/kept external choice requests storage access at
+            // startup; the internal default never does.
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                showAllFilesAccessDialog()
+            } else {
+                requestLegacyStoragePermissions(StoragePurpose.STARTUP_EXTERNAL)
+            }
+            return
+        }
+        if (!HomePrefs.isExternalWritable()) {
+            showExternalUnavailableDialog()
+            return
+        }
+        finishExternalHome()
+    }
+
+    private fun finishInternalHome(
+        persist: Boolean,
+        fallbackReason: String? = null
+    ) {
+        if (isFinishing || isDestroyed) return
+        if (storageResolved) {
+            maybeShowPendingHomeSettingsDialog()
+            return
+        }
         storageResolved = true
-
-        var external = useExternal && HomePrefs.isExternalWritable()
-        if (external) {
-            val dir = HomePrefs.externalHomeDir()
-            HomePrefs.setMode(this, HomePrefs.MODE_EXTERNAL)
-            // TermuxManager.setHomeDir() ignores mkdirs() failures, so verify
-            // writability both before and after applying the choice.
-            try {
-                TermuxManager.setHomeDir(dir)
-                if (!dir.isDirectory || !dir.canWrite()) {
-                    external = false
-                } else {
-                    Log.i(TAG, "HOME set to external storage: ${dir.absolutePath}")
-                }
-            } catch (e: Exception) {
-                Log.e(TAG, "Cannot apply external HOME", e)
-                external = false
-            }
+        val ok = HomePrefs.applyInternalHome(this, persist)
+        if (!ok) {
+            Log.e(TAG, "Internal HOME could not be applied")
+            Toast.makeText(
+                this,
+                if (isChinese()) "内部存储不可写" else "Internal storage is not writable",
+                Toast.LENGTH_LONG
+            ).show()
+        } else if (persist) {
+            Log.i(TAG, "HOME set to internal storage")
         }
-
-        if (!external) {
-            val dir = HomePrefs.internalHomeDir(this)
-            HomePrefs.setMode(this, HomePrefs.MODE_INTERNAL)
-            try {
-                TermuxManager.setHomeDir(dir)
-                Log.i(TAG, "HOME set to internal storage: ${dir.absolutePath}")
-            } catch (e: Exception) {
-                Log.e(TAG, "Cannot apply internal HOME", e)
-            }
-            if (useExternal) {
-                Toast.makeText(
-                    this,
-                    fallbackReason ?: if (isChinese()) "已改用内部存储" else "Using internal storage",
-                    Toast.LENGTH_LONG
-                ).show()
-            }
+        if (fallbackReason != null) {
+            Toast.makeText(this, fallbackReason, Toast.LENGTH_LONG).show()
         }
-
+        if (shouldRestartServerForHome(HomePrefs.internalHomeDir(this))) {
+            // A service from an earlier Activity instance may still be serving
+            // the previous HOME. Restart it instead of leaving the WebView
+            // attached to the old server.
+            workspaceRestartRequested()
+            return
+        }
         proceedToNotificationPermission()
     }
 
-    private fun showAllFilesAccessDialog() {
+    /**
+     * True when a live code-server was started with a different HOME than
+     * [target] (for example an external workspace before the user switched to
+     * internal). The service must be restarted before the WebView reloads.
+     */
+    private fun shouldRestartServerForHome(target: File): Boolean {
+        if (CodeServerLauncher.status.value.state != CodeServerLauncher.ServerState.RUNNING) {
+            return false
+        }
+        val active = CodeServerLauncher.activeHomePath() ?: return true
+        return active != target.absolutePath
+    }
+
+    /** Continue startup after HOME was applied, restarting a stale service. */
+    private fun continueAfterExternalHome() {
+        if (shouldRestartServerForHome(HomePrefs.externalHomeDir())) {
+            workspaceRestartRequested()
+        } else {
+            proceedToNotificationPermission()
+        }
+    }
+
+    private fun finishExternalHome() {
+        if (isFinishing || isDestroyed) return
+        if (storageResolved) return
+        if (!HomePrefs.applyExternalHome(this)) {
+            showExternalUnavailableDialog()
+            return
+        }
+        HomePrefs.setMode(this, HomePrefs.MODE_EXTERNAL)
+        storageResolved = true
+        Log.i(TAG, "HOME set to external storage: ${HomePrefs.externalHomeDir().absolutePath}")
+        if (!HomePrefs.wasExternalTrustWarningShown(this)) {
+            showExternalTrustDialog()
+        } else {
+            sharedTrustWarned = true
+            continueAfterExternalHome()
+        }
+    }
+
+    /**
+     * App-level Workspace Trust warning. code-server is intentionally started
+     * WITHOUT `--disable-workspace-trust`: VS Code's Restricted Mode prompt is
+     * still authoritative; this dialog only makes the app-level choice
+     * explicit before shared storage is opened.
+     */
+    private fun showExternalTrustDialog() {
+        if (isFinishing || isDestroyed) return
         val isZh = isChinese()
         AlertDialog.Builder(this)
-            .setTitle(if (isZh) "需要存储权限" else "Storage Access Required")
-            .setMessage(if (isZh)
-                "AMCode 需要访问所有文件的权限，以便将 /sdcard/AMCode 作为工作目录。\n\n请选择一个选项："
-                else "AMCode needs access to all files to use /sdcard/AMCode as your workspace.\n\nChoose an option:")
+            .setTitle(if (isZh) "工作区信任提示" else "Workspace Trust Warning")
+            .setMessage(
+                if (isZh)
+                    "当前 HOME 位于共享存储 /sdcard/AMCode，其他应用可能修改其中的文件。\n\n" +
+                        "AMCode 不会绕过 VS Code 的 Workspace Trust；VS Code 会将此文件夹以受限模式打开，并可能询问你是否信任。请只信任你控制的文件夹。"
+                else
+                    "Your HOME is on shared storage (/sdcard/AMCode), where other apps can modify files.\n\n" +
+                        "AMCode does not bypass VS Code Workspace Trust. VS Code opens this folder in Restricted Mode and may ask whether to trust it. Only trust folders you control."
+            )
             .setCancelable(false)
-            .setPositiveButton(if (isZh) "授权访问" else "Grant Access") { _, _ ->
-                launchAllFilesAccessSettings()
+            .setPositiveButton(if (isZh) "继续" else "Continue") { _, _ ->
+                HomePrefs.markExternalTrustWarningShown(this)
+                sharedTrustWarned = true
+                continueAfterExternalHome()
             }
-            .setNeutralButton(if (isZh) "使用内部存储" else "Use Internal Storage") { _, _ ->
-                completeStorageSetup(false)
+            .setNegativeButton(if (isZh) "改用内部存储" else "Use internal HOME") { _, _ ->
+                HomePrefs.markExternalTrustWarningShown(this)
+                sharedTrustWarned = true
+                if (HomePrefs.applyInternalHome(this, persist = true)) {
+                    Log.i(TAG, "Switched to internal HOME from the trust dialog")
+                }
+                if (shouldRestartServerForHome(HomePrefs.internalHomeDir(this))) {
+                    workspaceRestartRequested()
+                } else {
+                    proceedToNotificationPermission()
+                }
+            }
+            .show()
+    }
+
+    private fun showExternalUnavailableDialog() {
+        if (storageResolved || isFinishing || isDestroyed) return
+        val isZh = isChinese()
+        AlertDialog.Builder(this)
+            .setTitle(if (isZh) "外部工作区不可用" else "External Workspace Unavailable")
+            .setMessage(
+                if (isZh)
+                    "/sdcard/AMCode 当前不可写。文件不会被移动或删除。\n\n可以本次先用内部存储启动，或永久切换到内部存储。"
+                else
+                    "/sdcard/AMCode is not writable right now. No files will be moved or deleted.\n\nStart with internal HOME for this launch, or switch to internal HOME permanently."
+            )
+            .setCancelable(false)
+            .setPositiveButton(if (isZh) "本次使用内部存储" else "Use internal for now") { _, _ ->
+                finishInternalHome(
+                    persist = false,
+                    fallbackReason = if (isZh) {
+                        "本次使用内部存储；/sdcard/AMCode 文件保持不变"
+                    } else {
+                        "Using internal HOME for this launch; files in /sdcard/AMCode are unchanged"
+                    }
+                )
+            }
+            .setNeutralButton(if (isZh) "永久切换" else "Switch permanently") { _, _ ->
+                finishInternalHome(persist = true)
             }
             .setNegativeButton(if (isZh) "退出" else "Exit") { _, _ ->
                 finish()
@@ -360,15 +543,40 @@ class MainActivity : AppCompatActivity() {
             .show()
     }
 
-    private fun launchAllFilesAccessSettings() {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
-            completeStorageSetup(
-                false,
-                if (isChinese()) "系统不支持该存储权限，已改用内部存储"
-                else "All-files access is not supported; using internal storage"
+    private fun showAllFilesAccessDialog() {
+        if (isFinishing || isDestroyed) return
+        val isZh = isChinese()
+        AlertDialog.Builder(this)
+            .setTitle(if (isZh) "需要存储权限" else "Storage Access Required")
+            .setMessage(
+                if (isZh)
+                    "你选择了共享存储 /sdcard/AMCode。Android 需要“所有文件访问”权限才能读写它。\n\n也可以改用内部存储（推荐），现有文件不会被移动。"
+                else
+                    "You chose shared storage /sdcard/AMCode. Android requires All files access to read and write it.\n\nYou can also use internal HOME (recommended); existing files are not moved."
             )
+            .setCancelable(false)
+            .setPositiveButton(if (isZh) "授权访问" else "Grant Access") { _, _ ->
+                launchAllFilesAccessSettings(StoragePurpose.STARTUP_EXTERNAL)
+            }
+            .setNeutralButton(if (isZh) "使用内部存储" else "Use Internal Storage") { _, _ ->
+                finishInternalHome(persist = true)
+            }
+            .setNegativeButton(if (isZh) "退出" else "Exit") { _, _ ->
+                finish()
+            }
+            .show()
+    }
+
+    private fun launchAllFilesAccessSettings(purpose: StoragePurpose) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+            if (purpose == StoragePurpose.ON_DEMAND_SHARED) {
+                requestLegacyStoragePermissions(purpose)
+            } else {
+                fallbackToInternalAfterExternalDenied()
+            }
             return
         }
+        pendingStoragePurpose = purpose
         val appSettings = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION).apply {
             data = Uri.parse("package:$packageName")
         }
@@ -382,18 +590,25 @@ class MainActivity : AppCompatActivity() {
             storagePermissionLauncher.launch(
                 Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
             )
+            return
         } catch (e: ActivityNotFoundException) {
             Log.w(TAG, "All-files settings not available", e)
-            completeStorageSetup(
-                false,
-                if (isChinese()) "无法打开存储设置，已改用内部存储"
-                else "Cannot open storage settings; using internal storage"
-            )
+        }
+        pendingStoragePurpose = StoragePurpose.NONE
+        if (purpose == StoragePurpose.ON_DEMAND_SHARED) {
+            Toast.makeText(
+                this,
+                if (isChinese()) "无法打开存储设置" else "Cannot open storage settings",
+                Toast.LENGTH_LONG
+            ).show()
+        } else {
+            fallbackToInternalAfterExternalDenied()
         }
     }
 
-    private fun requestLegacyStoragePermissions() {
-        Log.i(TAG, "Requesting READ/WRITE_EXTERNAL_STORAGE (API 26-29)")
+    private fun requestLegacyStoragePermissions(purpose: StoragePurpose) {
+        pendingStoragePurpose = purpose
+        Log.i(TAG, "Requesting READ/WRITE_EXTERNAL_STORAGE (API 26-29), purpose=$purpose")
         try {
             legacyStoragePermissionLauncher.launch(
                 arrayOf(
@@ -403,11 +618,70 @@ class MainActivity : AppCompatActivity() {
             )
         } catch (e: Exception) {
             Log.e(TAG, "Cannot request storage permissions", e)
-            completeStorageSetup(
-                false,
-                if (isChinese()) "无法申请存储权限，已改用内部存储"
-                else "Cannot request storage permission; using internal storage"
-            )
+            pendingStoragePurpose = StoragePurpose.NONE
+            if (purpose == StoragePurpose.ON_DEMAND_SHARED) {
+                Toast.makeText(
+                    this,
+                    if (isChinese()) "无法申请存储权限" else "Cannot request storage permission",
+                    Toast.LENGTH_LONG
+                ).show()
+            } else {
+                fallbackToInternalAfterExternalDenied()
+            }
+        }
+    }
+
+    /**
+     * The user kept/required external HOME but denied or could not obtain the
+     * permission. Start with internal HOME for this launch only; the persisted
+     * choice stays external so the files are never "moved" implicitly.
+     */
+    private fun fallbackToInternalAfterExternalDenied() {
+        if (storageResolved) return
+        finishInternalHome(
+            persist = false,
+            fallbackReason = if (isChinese()) {
+                "未获得共享存储权限，本次使用内部存储；/sdcard/AMCode 文件保持不变"
+            } else {
+                "Shared storage permission not granted; using internal HOME for this launch. Files in /sdcard/AMCode are unchanged"
+            }
+        )
+    }
+
+    /** Result of an on-demand shared-storage grant (not a HOME change). */
+    private fun onSharedStoragePermissionResult(granted: Boolean) {
+        Log.i(TAG, "On-demand shared storage permission: $granted")
+        if (!granted) {
+            Toast.makeText(
+                this,
+                if (isChinese()) "未获得共享存储权限" else "Shared storage access was not granted",
+                Toast.LENGTH_LONG
+            ).show()
+            return
+        }
+        Toast.makeText(
+            this,
+            if (isChinese()) "已获得共享存储访问权限" else "Shared storage access granted",
+            Toast.LENGTH_SHORT
+        ).show()
+        warnSharedFolderTrust()
+
+        // A persisted external HOME that was running in internal fallback
+        // should now switch back to the real external workspace.
+        if (HomePrefs.getMode(this) == HomePrefs.MODE_EXTERNAL &&
+            HomePrefs.isExternalWritable() &&
+            shouldRestartServerForHome(HomePrefs.externalHomeDir())
+        ) {
+            if (HomePrefs.applyExternalHome(this)) {
+                workspaceRestartRequested()
+                return
+            }
+        }
+
+        if (webViewReady && ::webView.isInitialized) {
+            webView.postDelayed({
+                if (!isFinishing && !isDestroyed) webView.reload()
+            }, 300)
         }
     }
 
@@ -528,10 +802,35 @@ class MainActivity : AppCompatActivity() {
                 return true
             }
 
+            override fun onPageStarted(
+                view: WebView?,
+                url: String?,
+                favicon: android.graphics.Bitmap?
+            ) {
+                super.onPageStarted(view, url, favicon)
+                if (url != null) maybeHandleSharedFolder(url)
+            }
+
+            override fun doUpdateVisitedHistory(
+                view: WebView?,
+                url: String?,
+                isReload: Boolean
+            ) {
+                super.doUpdateVisitedHistory(view, url, isReload)
+                if (url != null) maybeHandleSharedFolder(url)
+            }
+
             override fun onPageFinished(view: WebView?, url: String?) {
                 super.onPageFinished(view, url)
                 if (url == null || url.startsWith("about:")) return
                 if (!isLocalServerUrl(url)) return
+                if (isLoginUrl(url)) {
+                    // The session cookie was missing/stale. Re-authenticate
+                    // rather than showing code-server's password prompt (the
+                    // user never sees the random token).
+                    handleLoginPage()
+                    return
+                }
                 if (mainFrameError) {
                     // Chromium renders an error page and then calls
                     // onPageFinished; never dismiss the retry overlay for it.
@@ -541,6 +840,7 @@ class MainActivity : AppCompatActivity() {
 
                 val wasReady = webViewReady
                 webViewReady = true
+                authRetryCount = 0
                 mainFrameError = false
                 lastFailedUrl = null
                 webViewRetryCount = 0
@@ -827,6 +1127,349 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun isLoginUrl(url: String?): Boolean {
+        if (!isLocalServerUrl(url)) return false
+        val path = try {
+            Uri.parse(url).path
+        } catch (_: Exception) {
+            null
+        } ?: return false
+        return path == "/login" || path.startsWith("/login/")
+    }
+
+    private fun serverBaseUrl(): String? {
+        val uri = try {
+            Uri.parse(serverUrl)
+        } catch (_: Exception) {
+            return null
+        }
+        val host = uri.host ?: return null
+        val scheme = uri.scheme?.lowercase(Locale.US) ?: "http"
+        val port = if (uri.port > 0) uri.port else DEFAULT_SERVER_PORT
+        return "$scheme://$host:$port"
+    }
+
+    /**
+     * code-server prefers the last-opened folder stored in coder.json over the
+     * positional HOME argument. After a HOME switch that stale value could
+     * reopen the old external workspace, so every fresh navigation explicitly
+     * opens the effective HOME. The user can still Open Folder afterwards
+     * (that adds its own ?folder= query).
+     */
+    private fun buildInitialPageUrl(baseUrl: String): String {
+        val home = TermuxManager.homeDir
+        if (!home.isDirectory) return baseUrl
+        // Keep '/' readable; encode spaces and other query metacharacters.
+        val folder = Uri.encode(home.absolutePath, "/")
+        return "${baseUrl.trimEnd('/')}/?folder=$folder"
+    }
+
+    /**
+     * Install the already-validated code-server session cookie into the
+     * WebView's CookieManager and wait until it is visible. The token itself
+     * never reaches JavaScript or logcat.
+     */
+    private suspend fun installSessionCookie(cookieValue: String): Boolean {
+        val base = serverBaseUrl() ?: return false
+        val manager = CookieManager.getInstance()
+        manager.setAcceptCookie(true)
+        try {
+            // HttpOnly keeps workspace/web page JavaScript from reading the
+            // session value; the WebView still sends it on HTTP/WS requests.
+            manager.setCookie(base, "$SESSION_COOKIE_NAME=$cookieValue; Path=/; HttpOnly")
+            manager.flush()
+        } catch (e: Exception) {
+            Log.w(TAG, "Cannot set WebView session cookie", e)
+            return false
+        }
+        repeat(12) {
+            val stored = try {
+                manager.getCookie(base)
+            } catch (_: Exception) {
+                null
+            }
+            if (stored?.contains("$SESSION_COOKIE_NAME=") == true) {
+                Log.i(
+                    TAG,
+                    "Session cookie installed in WebView " +
+                        "(len=${cookieValue.length}, value redacted)"
+                )
+                return true
+            }
+            delay(50)
+        }
+        Log.w(TAG, "Session cookie was not visible to the WebView after 600ms")
+        return false
+    }
+
+    /**
+     * code-server should never show its login page in the WebView because the
+     * launcher already authenticated. If it does (stale cookie after a port
+     * change, server restart, ...), re-run the loopback login once or twice.
+     */
+    private fun handleLoginPage() {
+        if (isFinishing || isDestroyed) return
+        if (authRetryCount >= MAX_AUTH_RETRIES) {
+            Log.e(TAG, "Authentication retries exhausted")
+            showError(
+                if (isChinese()) "无法完成本地 VS Code 认证"
+                else "Could not authenticate the local VS Code session",
+                retry = { workspaceRestartRequested() },
+                showToast = false
+            )
+            return
+        }
+        authRetryCount++
+        Log.w(TAG, "code-server login page detected; re-authenticating ($authRetryCount/$MAX_AUTH_RETRIES)")
+        loadingOverlay.visibility = View.VISIBLE
+        progressBar.visibility = View.VISIBLE
+        progressBar.progress = 0
+        statusText.text = getString(R.string.initializing)
+        progressText.text = if (isChinese()) "正在重新认证…" else "Re-authenticating…"
+        clearErrorClicks()
+
+        val generation = ++loadGeneration
+        lifecycleScope.launch {
+            val cookie = CodeServerLauncher.refreshSessionCookie()
+            if (cookie.isNullOrBlank()) {
+                showError(
+                    if (isChinese()) "本地认证失败，请重试" else "Local authentication failed; please retry",
+                    retry = { workspaceRestartRequested() },
+                    showToast = false
+                )
+                return@launch
+            }
+            if (generation != loadGeneration || isFinishing || isDestroyed) return@launch
+            if (!installSessionCookie(cookie)) {
+                // getCookie() intentionally does not expose whether Chromium
+                // would send the cookie on the next request, so a negative
+                // confirmation is not fatal. If authentication really failed,
+                // the login-page detection above retries or reports an error.
+                Log.w(TAG, "Session cookie not confirmed before reload; continuing")
+            }
+            if (generation != loadGeneration || isFinishing || isDestroyed) return@launch
+            webView.loadUrl(buildInitialPageUrl(serverUrl))
+        }
+    }
+
+    /**
+     * Shared-storage folders need MANAGE_EXTERNAL_STORAGE (API 30+) or the
+     * legacy READ/WRITE grant (API 26-29) only when the user actually opens
+     * one. The internal HOME default never triggers this at launch.
+     */
+    private fun maybeHandleSharedFolder(url: String) {
+        if (!isLocalServerUrl(url)) return
+        val path = sharedFolderPathFromUrl(url) ?: return
+        if (path == lastHandledSharedFolder) return
+        lastHandledSharedFolder = path
+        Log.i(TAG, "Shared-storage folder opened: $path")
+
+        if (!HomePrefs.hasExternalAccess(this)) {
+            if (!sharedStoragePromptShown) {
+                sharedStoragePromptShown = true
+                showSharedStoragePrompt()
+            }
+            return
+        }
+        warnSharedFolderTrust()
+    }
+
+    private fun sharedFolderPathFromUrl(url: String): String? {
+        val uri = try {
+            Uri.parse(url)
+        } catch (_: Exception) {
+            return null
+        }
+        val raw = uri.getQueryParameter("folder")
+            ?: uri.getQueryParameter("workspace")
+            ?: return null
+        val path = raw.replace('\\', '/')
+        return if (isSharedStoragePath(path)) path else null
+    }
+
+    private fun isSharedStoragePath(path: String): Boolean {
+        return path == "/sdcard" ||
+            path.startsWith("/sdcard/") ||
+            path == "/storage/emulated" ||
+            path.startsWith("/storage/emulated/") ||
+            path.startsWith("/storage/self/") ||
+            path.contains("/files/home/storage/shared") ||
+            path.contains("/storage/shared")
+    }
+
+    private fun showSharedStoragePrompt() {
+        if (isFinishing || isDestroyed) return
+        val isZh = isChinese()
+        AlertDialog.Builder(this)
+            .setTitle(if (isZh) "共享存储访问" else "Shared Storage Access")
+            .setMessage(
+                if (isZh)
+                    "该工作区位于共享存储（/sdcard）。Android 需要额外的存储授权才能读写它。\n\n授权后 VS Code 仍会以受限模式打开该文件夹，并可能询问你是否信任。"
+                else
+                    "This workspace is on shared storage (/sdcard). Android requires additional storage access to read and write it.\n\nAfter granting it, VS Code still opens the folder in Restricted Mode and may ask you to trust it."
+            )
+            .setPositiveButton(if (isZh) "去授权" else "Grant access") { _, _ ->
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    launchAllFilesAccessSettings(StoragePurpose.ON_DEMAND_SHARED)
+                } else {
+                    requestLegacyStoragePermissions(StoragePurpose.ON_DEMAND_SHARED)
+                }
+            }
+            .setNegativeButton(if (isZh) "暂不" else "Not now", null)
+            .show()
+    }
+
+    private fun warnSharedFolderTrust() {
+        if (sharedTrustWarned || isFinishing || isDestroyed) return
+        sharedTrustWarned = true
+        val isZh = isChinese()
+        AlertDialog.Builder(this)
+            .setTitle(if (isZh) "工作区信任提示" else "Workspace Trust")
+            .setMessage(
+                if (isZh)
+                    "该文件夹位于共享存储，其他应用可能修改其中的文件。\n\nAMCode 不会绕过 VS Code 的 Workspace Trust：VS Code 会以受限模式打开它，并可能询问你是否信任。请只信任你控制的文件夹。"
+                else
+                    "This folder is on shared storage, where other apps can modify files.\n\nAMCode does not bypass VS Code Workspace Trust: VS Code opens it in Restricted Mode and may ask whether to trust it. Only trust folders you control."
+            )
+            .setPositiveButton(if (isZh) "我知道了" else "I understand", null)
+            .show()
+    }
+
+    private fun maybeShowPendingHomeSettingsDialog() {
+        if (!pendingHomeSettingsDialog) return
+        if (!storageResolved || !serviceStartRequested || isFinishing || isDestroyed) return
+        pendingHomeSettingsDialog = false
+        webView.postDelayed({
+            if (!isFinishing && !isDestroyed) showWorkspaceStorageDialog()
+        }, 300)
+    }
+
+    /**
+     * Persistent "switch to internal" path, reachable from the foreground
+     * notification's Storage action. Existing external installs get the same
+     * choice from the one-time startup migration dialog.
+     */
+    private fun showWorkspaceStorageDialog() {
+        if (isFinishing || isDestroyed) return
+        val isZh = isChinese()
+        val modeExternal = HomePrefs.getMode(this) == HomePrefs.MODE_EXTERNAL
+        val effective = TermuxManager.homeDir.absolutePath
+        val usingExternal = modeExternal &&
+            effective == HomePrefs.externalHomeDir().absolutePath
+        val message =
+            if (isZh) {
+                "当前 HOME：$effective\n\n" + when {
+                    usingExternal ->
+                        "使用共享存储 /sdcard/AMCode。共享存储不可执行二进制，Git/编译可能受限。切换到内部存储不会移动或删除文件。"
+                    modeExternal ->
+                        "外部工作区 /sdcard/AMCode 当前不可用，本次使用内部 HOME。文件不会被移动或删除。"
+                    else ->
+                        "使用内部存储。共享文件可通过 ~/storage/shared 打开；首次访问 /sdcard 时需要授权。"
+                }
+            } else {
+                "Current HOME: $effective\n\n" + when {
+                    usingExternal ->
+                        "Using shared storage /sdcard/AMCode. Shared storage is noexec, so Git/build tools may be limited. Switching to internal HOME does not move or delete files."
+                    modeExternal ->
+                        "The external workspace /sdcard/AMCode is unavailable; internal HOME is being used for this launch. Files are not moved or deleted."
+                    else ->
+                        "Using internal storage. Shared files are available through ~/storage/shared; Android asks for access the first time /sdcard is used."
+                }
+            }
+
+        val builder = AlertDialog.Builder(this)
+            .setTitle(if (isZh) "工作区存储" else "Workspace Storage")
+            .setMessage(message)
+            .setNegativeButton(if (isZh) "关闭" else "Close", null)
+            .setNeutralButton(if (isZh) "授权共享存储" else "Grant shared storage") { _, _ ->
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    launchAllFilesAccessSettings(StoragePurpose.ON_DEMAND_SHARED)
+                } else {
+                    requestLegacyStoragePermissions(StoragePurpose.ON_DEMAND_SHARED)
+                }
+            }
+        if (modeExternal) {
+            builder.setPositiveButton(if (isZh) "切换到内部存储" else "Switch to internal HOME") { _, _ ->
+                confirmSwitchToInternalHome()
+            }
+        } else {
+            builder.setPositiveButton(if (isZh) "好的" else "OK", null)
+        }
+        builder.show()
+    }
+
+    private fun confirmSwitchToInternalHome() {
+        if (isFinishing || isDestroyed) return
+        val isZh = isChinese()
+        AlertDialog.Builder(this)
+            .setTitle(if (isZh) "切换到内部存储？" else "Switch to internal storage?")
+            .setMessage(
+                if (isZh)
+                    "VS Code 会重启以使用内部 HOME，请先保存未保存的编辑内容。\n\n/sdcard/AMCode 中的文件不会被移动或删除，仍可通过 ~/storage/shared 打开。"
+                else
+                    "VS Code will restart with internal HOME. Save any unsaved editors first.\n\nFiles in /sdcard/AMCode are not moved or deleted and remain reachable through ~/storage/shared."
+            )
+            .setPositiveButton(if (isZh) "切换并重启" else "Switch and restart") { _, _ ->
+                performSwitchToInternalHome()
+            }
+            .setNegativeButton(if (isZh) "取消" else "Cancel", null)
+            .show()
+    }
+
+    private fun performSwitchToInternalHome() {
+        if (!HomePrefs.applyInternalHome(this, persist = true)) {
+            Toast.makeText(
+                this,
+                if (isChinese()) "无法切换到内部存储" else "Could not switch to internal storage",
+                Toast.LENGTH_LONG
+            ).show()
+            return
+        }
+        workspaceRestartRequested()
+    }
+
+    /** Ask the service to restart code-server (HOME change or auth recovery). */
+    private fun workspaceRestartRequested() {
+        Log.i(TAG, "Restarting code-server (HOME change or auth recovery)")
+        webViewRetryJob?.cancel()
+        webViewRetryJob = null
+        webViewRetryCount = 0
+        authRetryCount = 0
+        webViewReady = false
+        mainFrameError = false
+        lastFailedUrl = null
+        loadGeneration++
+        loadingOverlay.visibility = View.VISIBLE
+        progressBar.visibility = View.VISIBLE
+        progressBar.progress = 0
+        statusText.text = getString(R.string.initializing)
+        progressText.text = ""
+        clearErrorClicks()
+        serviceStartRequested = true
+        try {
+            val intent = Intent(this, CodeServerService::class.java)
+                .setAction(CodeServerService.ACTION_RESTART)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(intent)
+            } else {
+                startService(intent)
+            }
+            if (!serviceBound) {
+                bindService(
+                    Intent(this, CodeServerService::class.java),
+                    serviceConnection,
+                    Context.BIND_AUTO_CREATE or Context.BIND_IMPORTANT
+                )
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Cannot restart CodeServerService", e)
+            showError(
+                if (isChinese()) "无法重启 VS Code" else "Cannot restart VS Code",
+                retry = { retryService() }
+            )
+        }
+    }
+
     private fun isExternalSchemeAllowed(uri: Uri): Boolean {
         val scheme = uri.scheme?.lowercase(Locale.US) ?: return false
         return when (scheme) {
@@ -895,7 +1538,10 @@ class MainActivity : AppCompatActivity() {
             clearErrorClicks()
             mainFrameError = false
             loadGeneration++
-            webView.loadUrl(lastFailedUrl?.takeIf { isLocalServerUrl(it) } ?: serverUrl)
+            webView.loadUrl(
+                lastFailedUrl?.takeIf { isLocalServerUrl(it) }
+                    ?: buildInitialPageUrl(serverUrl)
+            )
         }
     }
 
@@ -919,7 +1565,8 @@ class MainActivity : AppCompatActivity() {
         progressText.text = ""
         clearErrorClicks()
 
-        val target = lastFailedUrl?.takeIf { isLocalServerUrl(it) } ?: serverUrl
+        val target = lastFailedUrl?.takeIf { isLocalServerUrl(it) }
+            ?: buildInitialPageUrl(serverUrl)
         Log.i(TAG, "Retrying WebView load: $target")
         webView.loadUrl(target)
     }
@@ -936,6 +1583,7 @@ class MainActivity : AppCompatActivity() {
         webViewRetryJob?.cancel()
         webViewRetryJob = null
         webViewRetryCount = 0
+        authRetryCount = 0
         mainFrameError = false
         webViewReady = false
         lastFailedUrl = null
@@ -951,7 +1599,28 @@ class MainActivity : AppCompatActivity() {
         lifecycleScope.launch {
             delay(300)
             if (generation != loadGeneration || isFinishing || isDestroyed) return@launch
-            webView.loadUrl(loadUrl)
+
+            // The launcher has already performed the loopback password login.
+            // Install its validated cookie before the first navigation so the
+            // WebView never shows code-server's login page.
+            val cookie = CodeServerLauncher.currentSessionCookie()
+                ?: CodeServerLauncher.refreshSessionCookie()
+            if (cookie.isNullOrBlank()) {
+                showError(
+                    if (isChinese()) "无法取得本地认证会话"
+                    else "Could not obtain the local authentication session",
+                    retry = { workspaceRestartRequested() },
+                    showToast = false
+                )
+                return@launch
+            }
+            if (generation != loadGeneration || isFinishing || isDestroyed) return@launch
+            if (!installSessionCookie(cookie)) {
+                Log.w(TAG, "Loading code-server without a confirmed WebView cookie")
+            }
+            if (generation != loadGeneration || isFinishing || isDestroyed) return@launch
+
+            webView.loadUrl(buildInitialPageUrl(loadUrl))
 
             delay(15000)
             if (generation != loadGeneration || isFinishing || isDestroyed) return@launch
@@ -1024,6 +1693,10 @@ class MainActivity : AppCompatActivity() {
             Toast.makeText(this, "Cannot start VS Code: ${e.message}", Toast.LENGTH_LONG).show()
         }
         updateProgress(getString(R.string.initializing), 0)
+        // A "Storage" notification action may have cold-started the Activity.
+        // Show its dialog only after the startup chain has requested the
+        // service (so a permission prompt is not covered).
+        webView.postDelayed({ maybeShowPendingHomeSettingsDialog() }, 800)
     }
 
     private fun retryService() {
@@ -1031,6 +1704,7 @@ class MainActivity : AppCompatActivity() {
         webViewRetryJob?.cancel()
         webViewRetryJob = null
         webViewRetryCount = 0
+        authRetryCount = 0
         webViewReady = false
         mainFrameError = false
         lastFailedUrl = null
@@ -1111,7 +1785,7 @@ class MainActivity : AppCompatActivity() {
         hideSystemBars()
         // If WebView was already loaded but server died, reload
         if (webViewReady && webView.url == null) {
-            webView.loadUrl(serverUrl)
+            webView.loadUrl(buildInitialPageUrl(serverUrl))
         }
         if (webViewReady && ::loadingOverlay.isInitialized &&
             loadingOverlay.visibility != View.VISIBLE &&

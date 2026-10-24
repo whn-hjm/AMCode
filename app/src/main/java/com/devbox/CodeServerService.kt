@@ -48,6 +48,8 @@ class CodeServerService : Service() {
     companion object {
         const val TAG = "CodeServerService"
         const val ACTION_STOP = "com.devbox.action.STOP"
+        const val ACTION_RESTART = "com.devbox.action.RESTART"
+        const val ACTION_OPEN_HOME_SETTINGS = "com.devbox.action.OPEN_HOME_SETTINGS"
         private const val HEALTH_INTERVAL_MS = 10_000L
         private const val RESTART_DELAY_MS = 2_000L
         private const val MAX_RESTARTS = 10
@@ -92,6 +94,27 @@ class CodeServerService : Service() {
                 stopEverything()
                 return START_NOT_STICKY
             }
+            ACTION_RESTART -> {
+                Log.i(TAG, "ACTION_RESTART received (HOME change or auth recovery)")
+                startForeground(
+                    App.NOTIFICATION_ID,
+                    createNotification("Restarting VS Code...", "Applying workspace storage")
+                )
+                _serviceStatus.value = ServiceStatus(
+                    ServiceState.INITIALIZING, "Restarting VS Code...", 0
+                )
+                // Cancel the current pipeline and wait for it to unwind before
+                // a new one starts, otherwise two servers could be spawned.
+                val previous = initJob
+                previous?.cancel()
+                initJob = null
+                healthCheckJob?.cancel()
+                healthCheckJob = null
+                restartCount = 0
+                CodeServerLauncher.stop()
+                initializeAndStart(waitFor = previous)
+                return START_STICKY
+            }
             else -> {
                 // Never enter a second initialization pipeline.
                 if (initJob?.isActive == true) {
@@ -121,6 +144,17 @@ class CodeServerService : Service() {
         }
     }
 
+    /**
+     * Task removal must not leave an orphan code-server behind. The activity
+     * owns the task; when the user swipes it away we stop the server and the
+     * service (the manifest also sets stopWithTask for the same guarantee).
+     */
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        Log.i(TAG, "Task removed; stopping code-server to avoid an orphan process")
+        stopEverything()
+        super.onTaskRemoved(rootIntent)
+    }
+
     override fun onDestroy() {
         Log.i(TAG, "Service destroying")
         initJob?.cancel()
@@ -140,8 +174,11 @@ class CodeServerService : Service() {
     /**
      * Full initialization pipeline: restore HOME → setup Termux env → start
      * code-server. Guarded by initJob so only one pipeline can run at a time.
+     *
+     * [waitFor] is an already-cancelled previous pipeline (HOME switch); the
+     * new pipeline joins it first so two servers can never be spawned.
      */
-    private fun initializeAndStart() {
+    private fun initializeAndStart(waitFor: Job? = null) {
         if (initJob?.isActive == true) {
             Log.i(TAG, "initializeAndStart ignored: already active")
             return
@@ -152,6 +189,13 @@ class CodeServerService : Service() {
 
         initJob = scope.launch {
             try {
+                if (waitFor != null) {
+                    try {
+                        waitFor.join()
+                    } catch (e: CancellationException) {
+                        throw e
+                    }
+                }
                 _serviceStatus.value = ServiceStatus(
                     ServiceState.INITIALIZING, "Initializing...", 0
                 )
@@ -159,8 +203,20 @@ class CodeServerService : Service() {
                 // Restore the persisted HOME before anything spawns code-server
                 // or creates Termux directories. This also covers START_STICKY
                 // restarts that arrive with a null Intent.
-                HomePrefs.restoreHomeDir(this@CodeServerService)
-                Log.i(TAG, "Initialization HOME=${TermuxManager.homeDir.absolutePath}")
+                val restored = HomePrefs.restoreHomeDir(this@CodeServerService)
+                Log.i(
+                    TAG,
+                    "Initialization HOME=${restored.home.absolutePath} " +
+                        "external=${restored.external} fallback=${restored.externalFallback}"
+                )
+                if (restored.externalFallback) {
+                    // Keep the persisted external choice: an Activity can prompt
+                    // for the missing grant without files being moved.
+                    updateNotification(
+                        "External workspace unavailable",
+                        "Using internal HOME for this launch"
+                    )
+                }
 
                 // Launch a collector to update UI from TermuxManager progress
                 val envCollector = launch {
@@ -196,6 +252,14 @@ class CodeServerService : Service() {
                 if (envResult.isFailure) {
                     throw envResult.exceptionOrNull()
                         ?: RuntimeException("Environment setup failed")
+                }
+
+                // Bootstrap extraction can (re)create HOME subdirectories, so
+                // make sure the Termux-style ~/storage/shared link is present
+                // before any terminal or extension starts. This is internal
+                // HOME only; an external HOME is already under /sdcard.
+                if (!restored.external) {
+                    HomePrefs.ensureStorageLayout(TermuxManager.homeDir)
                 }
 
                 // Launch a collector for code-server status
@@ -397,6 +461,18 @@ class CodeServerService : Service() {
                     this,
                     1,
                     Intent(this, CodeServerService::class.java).apply { action = ACTION_STOP },
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                )
+            )
+            .addAction(
+                android.R.drawable.ic_menu_manage,
+                "Storage",
+                PendingIntent.getActivity(
+                    this,
+                    2,
+                    Intent(this, MainActivity::class.java).apply {
+                        action = ACTION_OPEN_HOME_SETTINGS
+                    },
                     PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
                 )
             )

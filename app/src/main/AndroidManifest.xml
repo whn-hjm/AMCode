@@ -16,11 +16,12 @@
     <!-- Notifications: required for foreground service on Android 13+ -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
-    <!-- Storage: access project files and /sdcard.
-         API 26-29: READ/WRITE are requested at runtime before /sdcard/AMCode
-         is used. API 30+: MANAGE_EXTERNAL_STORAGE is requested via the
-         all-files settings screen. If access is denied the app falls back to
-         its private files/home directory. -->
+    <!-- Storage:
+         Default HOME is app-private files/home, so no storage permission is
+         requested at first launch. Shared storage is only requested on demand:
+         API 30+ via the All-files access settings screen, API 26-29 via
+         READ/WRITE_EXTERNAL_STORAGE. Existing installs that keep
+         home_mode=external still get the permission flow at startup. -->
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
         android:maxSdkVersion="32" />
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
@@ -54,11 +55,14 @@
             </intent-filter>
         </activity>
 
-        <!-- Foreground Service: runs code-server process -->
+        <!-- Foreground Service: runs code-server process.
+             stopWithTask + onTaskRemoved guarantee that swiping the task away
+             stops the local server instead of leaving an orphan process. -->
         <service
             android:name=".CodeServerService"
             android:exported="false"
-            android:foregroundServiceType="specialUse">
+            android:foregroundServiceType="specialUse"
+            android:stopWithTask="true">
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="runs_vs_code_web_server_for_local_development_environment" />

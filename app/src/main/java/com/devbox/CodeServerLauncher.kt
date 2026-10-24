@@ -20,8 +20,12 @@ import java.net.HttpURLConnection
 import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.URL
+import java.net.URLEncoder
+import java.nio.charset.StandardCharsets
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
+import java.security.MessageDigest
+import java.security.SecureRandom
 import java.util.concurrent.TimeUnit
 
 /**
@@ -41,6 +45,24 @@ object CodeServerLauncher {
     private const val BIND_HOST = "127.0.0.1"
     private const val READY_TIMEOUT_SECONDS = 60
     private const val STOP_GRACE_SECONDS = 5L
+
+    // ─── Loopback authentication ─────────────────────────────────────────────
+    // code-server is started with `--auth password` and a fresh random token
+    // written to an app-private 0600 YAML config file. The token is never put
+    // on the command line and never logged. After the server is ready the
+    // launcher performs the normal code-server login POST, verifies the
+    // session cookie, and hands only the cookie value to the WebView.
+    private const val AUTH_COOKIE_NAME = "code-server-session"
+    private const val AUTH_CONFIG_FILE = "code-server.yaml"
+    private const val AUTH_LOGIN_ATTEMPTS = 3
+    private const val AUTH_TOKEN_BYTES = 32
+    private const val HEX_CHARS = "0123456789abcdef"
+    private const val HTTP_SEE_OTHER = 303
+
+    // ─── Orphan process cleanup ──────────────────────────────────────────────
+    private const val RUN_DIR = "run"
+    private const val PID_FILE = "code-server.pid"
+    private const val ORPHAN_TERM_GRACE_MS = 3000L
 
     // ─── Android-as-Linux platform shim (experimental, on by default) ────────
     // code-server maps process.platform=android to target platform "web", so
@@ -79,6 +101,21 @@ object CodeServerLauncher {
     @Volatile
     private var monitorJob: Job? = null
 
+    /** Random per-launch password. Never log this value. */
+    @Volatile
+    private var authToken: String? = null
+
+    /** Validated `code-server-session` cookie value for [sessionPort]. */
+    @Volatile
+    private var sessionCookie: String? = null
+
+    @Volatile
+    private var sessionPort: Int = -1
+
+    /** HOME the live server was started with; null when no server is known. */
+    @Volatile
+    private var activeHomePath: String? = null
+
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
     // Generation token invalidates late process callbacks after stop/restart.
@@ -95,6 +132,30 @@ object CodeServerLauncher {
         get() = File(TermuxManager.binDir, "code-server")
 
     fun isInstalled(): Boolean = codeServerBin.exists()
+
+    /**
+     * Cookie value for the currently running server, or null when no session
+     * has been established. The WebView must install this cookie before its
+     * first navigation; the token itself is never exposed to the caller.
+     */
+    fun currentSessionCookie(): String? = sessionCookie
+
+    /** Absolute HOME path of the currently running server, if known. */
+    fun activeHomePath(): String? = activeHomePath
+
+    /**
+     * Re-run the loopback login POST and return a fresh cookie. Used by the
+     * Activity when a WebView navigation unexpectedly reaches /login (for
+     * example after a stale cookie survived a port change).
+     */
+    suspend fun refreshSessionCookie(): String? = withContext(Dispatchers.IO) {
+        val token = authToken ?: return@withContext null
+        val port = sessionPort.takeIf { it > 0 } ?: return@withContext null
+        val cookie = loginAndVerify(port, token) ?: return@withContext null
+        sessionCookie = cookie
+        Log.i(TAG, "Refreshed code-server session cookie (value redacted)")
+        cookie
+    }
 
     suspend fun prepareAndStart(): Result<Unit> {
         return try {
@@ -120,7 +181,7 @@ object CodeServerLauncher {
 
     suspend fun start() {
         val alreadyRunning = serverProcess
-        if (alreadyRunning?.isAlive == true &&
+        if (alreadyRunning != null && alreadyRunning.isAlive &&
             _status.value.state == ServerState.RUNNING
         ) {
             _status.value = ServerStatus(
@@ -128,7 +189,7 @@ object CodeServerLauncher {
                 "Already running",
                 _status.value.port,
                 _status.value.url,
-                getPid(alreadyRunning!!)
+                getPid(alreadyRunning)
             )
             return
         }
@@ -144,6 +205,12 @@ object CodeServerLauncher {
         )
 
         withContext(Dispatchers.IO) {
+            // Kill any code-server left behind by a previous app process before
+            // choosing a port or writing the new auth config. This also removes
+            // an old `--auth none` server that would otherwise stay reachable
+            // on loopback.
+            cleanupStaleCodeServerProcesses()
+
             // Prefer a real free port; 8080 remains only a last-resort fallback.
             val port = findFreePort() ?: DEFAULT_PORT
             val url = "http://$BIND_HOST:$port"
@@ -152,6 +219,19 @@ object CodeServerLauncher {
                 Log.i(TAG, "Start superseded before spawn")
                 return@withContext
             }
+
+            // Fresh random token per launch. Only its SHA-256 is written to
+            // the app-private 0600 config; the token itself stays in memory
+            // and is never in argv or logcat.
+            val token = generateAuthToken()
+            val authConfig = writeAuthConfig(port, token)
+            if (authConfig == null) {
+                throw RuntimeException("Cannot write code-server authentication config")
+            }
+            authToken = token
+            sessionCookie = null
+            sessionPort = port
+
             _status.value = ServerStatus(ServerState.STARTING, "Starting code-server...", port, url)
 
             val env = TermuxManager.environment.toMutableMap()
@@ -159,6 +239,10 @@ object CodeServerLauncher {
             env["SHELL"] = TermuxManager.getShell()
             env["CS_DISABLE_TELEMETRY"] = "true"
             env["CS_DISABLE_UPDATE_CHECK"] = "true"
+            // Do not inherit a plaintext password from the app environment;
+            // authentication comes from the 0600 config file instead.
+            env.remove("PASSWORD")
+            env.remove("HASHED_PASSWORD")
 
             // The TUR code-server package ships `rg` as an absolute symlink to
             // /data/data/com.termux/..., which does not exist in our rebranded
@@ -173,7 +257,8 @@ object CodeServerLauncher {
             val process = ProcessBuilder(
                 codeServerBin.absolutePath,
                 "--bind-addr", "$BIND_HOST:$port",
-                "--auth", "none",
+                "--auth", "password",
+                "--config", authConfig.absolutePath,
                 "--disable-telemetry",
                 "--disable-update-check",
                 "--user-data-dir", userDataDir,
@@ -186,8 +271,10 @@ object CodeServerLauncher {
             }.start()
 
             serverProcess = process
+            activeHomePath = home.absolutePath
             val pid = getPid(process)
-            Log.i(TAG, "code-server PID=$pid bound to $BIND_HOST:$port")
+            writePidFile(pid, port)
+            Log.i(TAG, "code-server PID=$pid bound to $BIND_HOST:$port (auth=password)")
 
             // Monitor output + process exit. Use a local process reference so a
             // restart can never have its status overwritten by the old process.
@@ -196,9 +283,18 @@ object CodeServerLauncher {
                     val reader = BufferedReader(InputStreamReader(process.inputStream))
                     var line: String?
                     while (reader.readLine().also { line = it } != null) {
-                        Log.d(TAG, "code-server: ${line!!}")
-                        if (line!!.contains("HTTP server listening") ||
-                            line!!.contains("Server listening on")
+                        val raw = line!!
+                        // Defence in depth: code-server redacts passwords
+                        // itself, but never let our token reach logcat if a
+                        // future version prints it.
+                        val safe = if (raw.contains(token)) {
+                            raw.replace(token, "<redacted>")
+                        } else {
+                            raw
+                        }
+                        Log.d(TAG, "code-server: $safe")
+                        if (raw.contains("HTTP server listening") ||
+                            raw.contains("Server listening on")
                         ) {
                             Log.i(TAG, "code-server reported listening")
                         }
@@ -210,6 +306,11 @@ object CodeServerLauncher {
                 Log.w(TAG, "code-server process exited with code $exitCode")
                 if (serverProcess === process && isCurrent(generation)) {
                     serverProcess = null
+                    activeHomePath = null
+                    removePidFile(pid)
+                    sessionCookie = null
+                    sessionPort = -1
+                    authToken = null
                     _status.value = ServerStatus(
                         ServerState.STOPPED,
                         "Process exited (code $exitCode)",
@@ -221,8 +322,7 @@ object CodeServerLauncher {
 
             if (!isCurrent(generation)) {
                 Log.i(TAG, "Start superseded after spawn; killing code-server")
-                process.destroyForcibly()
-                if (serverProcess === process) serverProcess = null
+                abortStartedProcess(process, pid)
                 return@withContext
             }
 
@@ -230,13 +330,39 @@ object CodeServerLauncher {
 
             if (!isCurrent(generation)) {
                 Log.i(TAG, "Start superseded while waiting; killing code-server")
-                process.destroyForcibly()
-                if (serverProcess === process) serverProcess = null
+                abortStartedProcess(process, pid)
                 return@withContext
             }
 
+            // Perform the same login POST a browser would, then verify the
+            // resulting session cookie against an authenticated endpoint. A
+            // server that is up but cannot be authenticated must never be
+            // exposed to the WebView as "ready".
+            val cookie = loginAndVerify(port, token)
+            if (cookie == null) {
+                abortStartedProcess(process, pid)
+                throw RuntimeException("code-server password authentication failed")
+            }
+            sessionCookie = cookie
+            sessionPort = port
+            Log.i(TAG, "code-server session established (cookie len=${cookie.length}, value redacted)")
+
             _status.value = ServerStatus(ServerState.RUNNING, "Server running", port, url, pid)
         }
+    }
+
+    /** Kill a process that was spawned but must not become the live server. */
+    private fun abortStartedProcess(process: Process, pid: Int) {
+        try {
+            process.destroyForcibly()
+        } catch (e: Exception) {
+            Log.w(TAG, "Cannot kill aborted code-server", e)
+        }
+        if (serverProcess === process) serverProcess = null
+        if (serverProcess == null) activeHomePath = null
+        removePidFile(pid)
+        sessionCookie = null
+        sessionPort = -1
     }
 
     // ─── Runtime repairs / compatibility ─────────────────────────────────────
@@ -462,6 +588,11 @@ object CodeServerLauncher {
     /**
      * Non-blocking stop: the caller (including the main thread) only requests
      * the stop; destroy/waitFor/kill happen on the launcher's IO scope.
+     *
+     * The PID file and the 0600 auth config are removed after the process tree
+     * is gone. If there is no live Process reference (for example the service
+     * is destroyed after the app process restarted) a validated orphan sweep
+     * still runs so a previous `code-server` cannot stay reachable on loopback.
      */
     fun stop() {
         val stopGeneration = nextGeneration()
@@ -479,42 +610,549 @@ object CodeServerLauncher {
             previous.pid
         )
 
-        if (process == null) {
-            _status.value = ServerStatus(
-                ServerState.STOPPED,
-                "Stopped",
-                previous.port,
-                previous.url
-            )
-            return
-        }
-
-        // Send the terminate signal immediately (cheap), but do the blocking
-        // wait/force-kill on the launcher's IO scope.
+        // Send the terminate signal immediately (cheap), but the blocking
+        // wait/force-kill happens on the launcher's IO scope.
         try {
-            process.destroy()
+            process?.destroy()
         } catch (e: Exception) {
             Log.w(TAG, "Error sending destroy to code-server", e)
         }
 
         scope.launch {
-            try {
-                if (!process.waitFor(STOP_GRACE_SECONDS, TimeUnit.SECONDS)) {
-                    Log.w(TAG, "code-server did not exit in ${STOP_GRACE_SECONDS}s; killing")
-                    process.destroyForcibly()
+            val proc = process
+            val pid = if (proc != null) getPid(proc) else previous.pid
+            if (proc != null) {
+                try {
+                    if (!proc.waitFor(STOP_GRACE_SECONDS, TimeUnit.SECONDS)) {
+                        Log.w(TAG, "code-server did not exit in ${STOP_GRACE_SECONDS}s; killing")
+                        proc.destroyForcibly()
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Error while waiting for code-server to stop", e)
+                    try { proc.destroyForcibly() } catch (_: Exception) { }
                 }
-            } catch (e: Exception) {
-                Log.w(TAG, "Error while waiting for code-server to stop", e)
-                try { process.destroyForcibly() } catch (_: Exception) { }
             }
+
+            val livePid = serverProcess?.let { getPid(it) } ?: -1
+            // A global signature sweep is only safe while this stop still owns
+            // the launcher generation; a superseded stop may otherwise kill the
+            // server a new start just spawned.
+            val sweep = isCurrent(stopGeneration)
+            killCodeServerProcessTree(pid, livePid, sweep)
+            if (pid > 0) {
+                removePidFile(pid)
+            } else if (sweep) {
+                // Never delete the PID file a newer start may just have written.
+                removePidFile()
+            }
+
             if (isCurrent(stopGeneration)) {
+                deleteAuthConfig()
+                sessionCookie = null
+                authToken = null
+                sessionPort = -1
+                activeHomePath = null
                 _status.value = ServerStatus(
                     ServerState.STOPPED,
                     "Stopped",
                     previous.port,
                     previous.url
                 )
+            } else {
+                Log.d(TAG, "Stop superseded by a new start; keeping new runtime files")
             }
+        }
+    }
+
+    // ─── Orphan / PID file cleanup ───────────────────────────────────────────
+
+    private data class PidRecord(
+        val pid: Int,
+        val startTime: String?,
+        val port: Int
+    )
+
+    private fun runDir(): File = File(App.instance.filesDir, RUN_DIR)
+
+    private fun pidFile(): File = File(runDir(), PID_FILE)
+
+    /**
+     * The auth config lives in the cache directory: it is re-created for every
+     * launch, and the cache domain is excluded from Android Auto Backup so a
+     * token can never be restored to another device. The process reads it only
+     * during startup; the token is kept in memory afterwards.
+     */
+    private fun authConfigFile(): File =
+        File(File(App.instance.cacheDir, RUN_DIR), AUTH_CONFIG_FILE)
+
+    private fun authConfigTmpFile(): File =
+        File(authConfigFile().parentFile, "$AUTH_CONFIG_FILE.tmp")
+
+    /** Old location from earlier builds; removed on cleanup as well. */
+    private fun legacyAuthConfigFile(): File = File(runDir(), AUTH_CONFIG_FILE)
+
+    private fun writePidFile(pid: Int, port: Int) {
+        if (pid <= 1) {
+            Log.w(TAG, "Not writing PID file for invalid pid=$pid")
+            return
+        }
+        try {
+            val dir = runDir()
+            if (!dir.exists() && !dir.mkdirs()) {
+                Log.w(TAG, "Cannot create ${dir.absolutePath}")
+                return
+            }
+            val record = "pid=$pid\n" +
+                "start=${readProcStartTime(pid) ?: ""}\n" +
+                "port=$port\n" +
+                "bin=${codeServerBin.absolutePath}\n"
+            val tmp = File(dir, "$PID_FILE.tmp")
+            tmp.writeText(record)
+            restrictRuntimeFile(tmp)
+            val dest = pidFile()
+            if (dest.exists()) dest.delete()
+            if (!tmp.renameTo(dest)) {
+                tmp.delete()
+                Log.w(TAG, "Cannot write PID file ${dest.absolutePath}")
+                return
+            }
+            restrictRuntimeFile(dest)
+            Log.i(TAG, "Wrote ${dest.absolutePath} (pid=$pid port=$port)")
+        } catch (e: Exception) {
+            Log.w(TAG, "Cannot write PID file", e)
+        }
+    }
+
+    private fun readPidRecord(): PidRecord? {
+        return try {
+            val file = pidFile()
+            if (!file.isFile) return null
+            var pid = -1
+            var start: String? = null
+            var port = -1
+            file.readLines().forEach { line ->
+                val idx = line.indexOf('=')
+                if (idx <= 0) return@forEach
+                val key = line.substring(0, idx).trim()
+                val value = line.substring(idx + 1).trim()
+                when (key) {
+                    "pid" -> pid = value.toIntOrNull() ?: -1
+                    "start" -> start = value.ifBlank { null }
+                    "port" -> port = value.toIntOrNull() ?: -1
+                }
+            }
+            if (pid > 1) PidRecord(pid, start, port) else null
+        } catch (e: Exception) {
+            Log.w(TAG, "Cannot read PID file", e)
+            null
+        }
+    }
+
+    /**
+     * Remove the PID file only when it still describes [pid] (or when [pid] is
+     * negative, i.e. unconditional cleanup).
+     */
+    private fun removePidFile(pid: Int = -1) {
+        try {
+            val file = pidFile()
+            if (!file.exists()) return
+            if (pid > 0) {
+                val record = readPidRecord()
+                if (record != null && record.pid != pid) {
+                    Log.d(TAG, "Keeping PID file for newer pid=${record.pid}")
+                    return
+                }
+            }
+            if (file.delete()) {
+                Log.i(TAG, "Removed PID file ${file.absolutePath}")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Cannot remove PID file", e)
+        }
+    }
+
+    private fun deleteAuthConfig() {
+        for (file in listOf(authConfigFile(), authConfigTmpFile(), legacyAuthConfigFile())) {
+            try {
+                if (file.exists() && file.delete()) {
+                    Log.d(TAG, "Removed code-server auth config")
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Cannot remove code-server auth config", e)
+            }
+        }
+    }
+
+    /** Kill stale code-server processes before spawning a new one. */
+    private fun cleanupStaleCodeServerProcesses() {
+        val recorded = readPidRecord()
+        val targets = LinkedHashSet<Int>()
+        recorded?.pid?.let { if (it > 1) targets.add(it) }
+        targets.addAll(collectSignedCodeServerPids())
+
+        val livePid = serverProcess?.let { getPid(it) } ?: -1
+        val exclude = setOf(android.os.Process.myPid(), livePid)
+        val validated = targets.filter { pid ->
+            if (pid <= 1 || pid in exclude) {
+                false
+            } else {
+                val cmd = readCmdline(pid)
+                if (cmd == null) {
+                    // Cannot validate: never signal an unknown process.
+                    Log.w(TAG, "Skipping unreadable process $pid during cleanup")
+                    false
+                } else {
+                    val recordedMatch = recorded?.pid == pid &&
+                        (recorded.startTime == null ||
+                            recorded.startTime == readProcStartTime(pid))
+                    isCodeServerCmdline(cmd) || recordedMatch
+                }
+            }
+        }
+
+        if (validated.isNotEmpty()) {
+            Log.i(TAG, "Cleaning up ${validated.size} stale code-server process(es)")
+            signalAndWait(validated)
+        }
+        removePidFile()
+        deleteAuthConfig()
+    }
+
+    /**
+     * Kill [rootPid] and (optionally) every process whose command line matches
+     * this app's code-server installation. [livePid] is never signalled.
+     */
+    private fun killCodeServerProcessTree(rootPid: Int, livePid: Int, sweep: Boolean) {
+        val candidates = LinkedHashSet<Int>()
+        if (rootPid > 1) candidates.add(rootPid)
+        if (sweep) candidates.addAll(collectSignedCodeServerPids())
+        if (rootPid > 1) candidates.addAll(collectDescendantPids(rootPid))
+
+        val exclude = setOf(android.os.Process.myPid(), livePid)
+        val validated = candidates.filter { pid ->
+            if (pid <= 1 || pid in exclude) {
+                false
+            } else {
+                // Re-validate immediately before signalling: a recycled PID
+                // that is not code-server must never be killed.
+                readCmdline(pid)?.let { isCodeServerCmdline(it) } == true
+            }
+        }
+        if (validated.isEmpty()) return
+        Log.i(TAG, "Stopping ${validated.size} code-server process(es): $validated")
+        signalAndWait(validated)
+    }
+
+    /** SIGTERM, wait up to [ORPHAN_TERM_GRACE_MS], then SIGKILL survivors. */
+    private fun signalAndWait(pids: Collection<Int>) {
+        val ordered = pids.distinct().sortedDescending()
+        ordered.forEach { sendSignal(it, "TERM") }
+
+        val deadline = System.currentTimeMillis() + ORPHAN_TERM_GRACE_MS
+        var survivors = ordered.filter { isProcessAlive(it) }
+        while (survivors.isNotEmpty() && System.currentTimeMillis() < deadline) {
+            try {
+                Thread.sleep(100)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+                break
+            }
+            survivors = survivors.filter { isProcessAlive(it) }
+        }
+        if (survivors.isNotEmpty()) {
+            Log.w(TAG, "Force-killing code-server process(es): $survivors")
+            survivors.forEach { sendSignal(it, "KILL") }
+        }
+    }
+
+    private fun sendSignal(pid: Int, signal: String): Boolean {
+        if (pid <= 1 || pid == android.os.Process.myPid()) return false
+        return try {
+            val process = ProcessBuilder("/system/bin/kill", "-$signal", pid.toString())
+                .redirectErrorStream(true)
+                .start()
+            val finished = process.waitFor(2, TimeUnit.SECONDS)
+            if (!finished) process.destroyForcibly()
+            finished && process.exitValue() == 0
+        } catch (e: Exception) {
+            Log.w(TAG, "Cannot send SIG$signal to $pid", e)
+            false
+        }
+    }
+
+    private fun isProcessAlive(pid: Int): Boolean {
+        val cmd = readCmdline(pid) ?: return false
+        return cmd.isNotBlank()
+    }
+
+    private fun readCmdline(pid: Int): String? {
+        if (pid <= 1) return null
+        return try {
+            val bytes = File("/proc/$pid/cmdline").readBytes()
+            if (bytes.isEmpty()) return null
+            String(bytes, StandardCharsets.UTF_8)
+                .replace('\u0000', ' ')
+                .trim()
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun readProcStartTime(pid: Int): String? {
+        if (pid <= 1) return null
+        return try {
+            val stat = File("/proc/$pid/stat").readText()
+            val end = stat.lastIndexOf(')')
+            if (end < 0) return null
+            // Field 3 is the first token after "comm)": field 22 (starttime)
+            // is therefore at index 22 - 3 = 19.
+            stat.substring(end + 2).trim().split(' ').getOrNull(19)
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun collectSignedCodeServerPids(): List<Int> {
+        val result = ArrayList<Int>()
+        val proc = File("/proc")
+        val entries = proc.listFiles() ?: return result
+        for (entry in entries) {
+            val pid = entry.name.toIntOrNull() ?: continue
+            if (pid <= 1 || pid == android.os.Process.myPid()) continue
+            val cmd = readCmdline(pid) ?: continue
+            if (isCodeServerCmdline(cmd)) result.add(pid)
+        }
+        return result
+    }
+
+    /** Collect direct/indirect children of [rootPid] (best effort). */
+    private fun collectDescendantPids(rootPid: Int): List<Int> {
+        val result = ArrayList<Int>()
+        val queue = ArrayDeque<Int>()
+        queue.add(rootPid)
+        val seen = HashSet<Int>()
+        while (queue.isNotEmpty() && seen.size < 128) {
+            val parent = queue.removeFirst()
+            if (!seen.add(parent)) continue
+            try {
+                val children = File("/proc/$parent/task/$parent/children")
+                    .readText()
+                    .trim()
+                    .split(' ')
+                    .mapNotNull { it.toIntOrNull() }
+                for (child in children) {
+                    if (child > 1 && child != android.os.Process.myPid()) {
+                        result.add(child)
+                        queue.add(child)
+                    }
+                }
+            } catch (_: Exception) {
+                // Process already gone or children file unavailable.
+            }
+        }
+        return result
+    }
+
+    /**
+     * A process belongs to this app's code-server installation when its
+     * command line contains our package data path AND a code-server path.
+     * This intentionally does NOT match plain Termux shells or editors, so an
+     * unrelated user terminal survives a cleanup.
+     */
+    private fun isCodeServerCmdline(cmd: String): Boolean {
+        if (cmd.isBlank()) return false
+        if (!cmd.contains(App.instance.packageName)) return false
+        return cmd.contains("/usr/lib/code-server/") ||
+            cmd.contains("/.code-server-data") ||
+            cmd.contains("libexec/amcode/android-as-linux.js")
+    }
+
+    // ─── Authentication helpers ──────────────────────────────────────────────
+
+    /** 32 random bytes as 64 lowercase hex characters. */
+    private fun generateAuthToken(): String {
+        val bytes = ByteArray(AUTH_TOKEN_BYTES)
+        SecureRandom().nextBytes(bytes)
+        val builder = StringBuilder(bytes.size * 2)
+        for (b in bytes) {
+            val value = b.toInt() and 0xff
+            builder.append(HEX_CHARS[value ushr 4])
+            builder.append(HEX_CHARS[value and 0x0f])
+        }
+        return builder.toString()
+    }
+
+    /** SHA-256 of the login token, lowercase hex (code-server SHA256 mode). */
+    private fun sha256Hex(input: String): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+            .digest(input.toByteArray(StandardCharsets.UTF_8))
+        val builder = StringBuilder(digest.size * 2)
+        for (b in digest) {
+            val value = b.toInt() and 0xff
+            builder.append(HEX_CHARS[value ushr 4])
+            builder.append(HEX_CHARS[value and 0x0f])
+        }
+        return builder.toString()
+    }
+
+    /**
+     * Write the per-launch password hash into an app-private YAML config.
+     * Using a config file (instead of `PASSWORD` in the environment/argv)
+     * keeps the token out of the process command line; the file is 0600 and
+     * removed on stop. code-server's own debug logging redacts passwords.
+     *
+     * `hashed-password` (SHA-256) is used instead of a plaintext `password`:
+     * with a plaintext password code-server runs argon2.verify() on EVERY
+     * authenticated request (measured ~140 ms per request on the emulator),
+     * while an ARGON2/SHA256 hashed-password uses a constant-time string
+     * comparison (~3 ms). The login password is a 256-bit random token, so a
+     * preimage-resistant hash is sufficient; there is no human password to
+     * brute-force. code-server 4.143.1 supports this legacy config path.
+     */
+    private fun writeAuthConfig(port: Int, token: String): File? {
+        return try {
+            val dir = authConfigFile().parentFile
+            if (dir == null || (!dir.exists() && !dir.mkdirs())) {
+                Log.e(TAG, "Cannot create auth config directory")
+                return null
+            }
+            val dest = authConfigFile()
+            val tmp = authConfigTmpFile()
+            val hashedPassword = sha256Hex(token)
+            // The hash is hex, but quoting also prevents any YAML numeric
+            // interpretation for future token formats.
+            tmp.writeText(
+                "auth: password\n" +
+                    "hashed-password: \"$hashedPassword\"\n" +
+                    "bind-addr: $BIND_HOST:$port\n"
+            )
+            restrictRuntimeFile(tmp)
+            if (dest.exists() && !dest.delete()) {
+                tmp.delete()
+                Log.e(TAG, "Cannot replace ${dest.absolutePath}")
+                return null
+            }
+            if (!tmp.renameTo(dest)) {
+                tmp.delete()
+                Log.e(TAG, "Cannot install ${dest.absolutePath}")
+                return null
+            }
+            restrictRuntimeFile(dest)
+            dest
+        } catch (e: Exception) {
+            Log.e(TAG, "Cannot write code-server auth config", e)
+            null
+        }
+    }
+
+    private fun restrictRuntimeFile(file: File) {
+        try {
+            file.setReadable(false, false)
+            file.setWritable(false, false)
+            file.setExecutable(false, false)
+            file.setReadable(true, true)
+            file.setWritable(true, true)
+        } catch (e: Exception) {
+            Log.w(TAG, "Cannot restrict permissions on ${file.name}", e)
+        }
+    }
+
+    /**
+     * Perform code-server's normal browser login:
+     *   POST /login (application/x-www-form-urlencoded, password=<token>)
+     *   -> 302 + Set-Cookie: code-server-session=<sha256 hex>
+     * The cookie is then verified against POST /mint-key, which requires auth
+     * and returns 401/403 without a valid session.
+     */
+    private fun loginAndVerify(port: Int, token: String): String? {
+        var attempt = 0
+        while (attempt < AUTH_LOGIN_ATTEMPTS) {
+            attempt++
+            val cookie = postLogin(port, token)
+            if (cookie != null && verifySession(port, cookie)) {
+                Log.i(TAG, "Password login to code-server succeeded (attempt $attempt)")
+                return cookie
+            }
+            Log.w(TAG, "Password login attempt $attempt failed")
+            try {
+                Thread.sleep(400L * attempt)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+                break
+            }
+        }
+        return null
+    }
+
+    private fun postLogin(port: Int, token: String): String? {
+        var connection: HttpURLConnection? = null
+        return try {
+            val body = "password=" + URLEncoder.encode(token, StandardCharsets.UTF_8.name())
+            val bodyBytes = body.toByteArray(StandardCharsets.UTF_8)
+            val conn = URL("http://$BIND_HOST:$port/login")
+                .openConnection() as HttpURLConnection
+            connection = conn
+            conn.requestMethod = "POST"
+            conn.instanceFollowRedirects = false
+            conn.connectTimeout = 5_000
+            conn.readTimeout = 10_000
+            conn.doOutput = true
+            conn.setRequestProperty("Content-Type", "application/x-www-form-urlencoded")
+            conn.setRequestProperty("Accept", "text/html")
+            conn.setFixedLengthStreamingMode(bodyBytes.size)
+            conn.outputStream.use { it.write(bodyBytes) }
+
+            val status = conn.responseCode
+            if (status != HttpURLConnection.HTTP_MOVED_TEMP && status != HTTP_SEE_OTHER) {
+                Log.w(TAG, "Login POST returned HTTP $status (expected redirect)")
+                return null
+            }
+            var setCookie: String? = null
+            for ((name, values) in conn.headerFields) {
+                if (name != null && name.equals("Set-Cookie", ignoreCase = true)) {
+                    setCookie = values?.firstOrNull()
+                    break
+                }
+            }
+            val pair = setCookie?.substringBefore(';')?.trim().orEmpty()
+            if (!pair.startsWith("$AUTH_COOKIE_NAME=")) {
+                Log.w(TAG, "Login response did not include $AUTH_COOKIE_NAME")
+                return null
+            }
+            pair.substringAfter('=', "").ifBlank { null }
+        } catch (e: Exception) {
+            Log.w(TAG, "Login POST failed: ${e.javaClass.simpleName}")
+            null
+        } finally {
+            connection?.disconnect()
+        }
+    }
+
+    private fun verifySession(port: Int, cookieValue: String): Boolean {
+        var connection: HttpURLConnection? = null
+        return try {
+            val conn = URL("http://$BIND_HOST:$port/mint-key")
+                .openConnection() as HttpURLConnection
+            connection = conn
+            conn.requestMethod = "POST"
+            conn.instanceFollowRedirects = false
+            conn.connectTimeout = 5_000
+            conn.readTimeout = 5_000
+            conn.doOutput = true
+            conn.setFixedLengthStreamingMode(0)
+            conn.setRequestProperty("Cookie", "$AUTH_COOKIE_NAME=$cookieValue")
+            conn.outputStream.use { }
+            val status = conn.responseCode
+            if (status != HttpURLConnection.HTTP_OK) {
+                Log.w(TAG, "Authenticated probe returned HTTP $status")
+                return false
+            }
+            true
+        } catch (e: Exception) {
+            Log.w(TAG, "Authenticated probe failed: ${e.javaClass.simpleName}")
+            false
+        } finally {
+            connection?.disconnect()
         }
     }
 
