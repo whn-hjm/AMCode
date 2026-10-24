@@ -41,6 +41,10 @@ mkdir -p \
     "$PREFIX/var/lib/dpkg" \
     "$PREFIX/var/cache/apt/archives" 2>/dev/null || true
 
+# Leftover dpkg-wrapper temp trees (a SIGKILLed .deb rewrite) are never
+# reused across runs and can be hundreds of MB; drop them.
+find "$PREFIX/tmp" -maxdepth 1 -name 'amcode-deb.*' -exec rm -rf {} + 2>/dev/null || true
+
 # ---------------------------------------------------------------- 1. keyring
 key_count=0
 for src in "$PREFIX"/share/termux-keyring/*.gpg "$PREFIX"/libexec/amcode/tur.gpg; do

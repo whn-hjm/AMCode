@@ -2,11 +2,19 @@ import java.io.FileOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
 import java.security.MessageDigest
+import java.util.Properties
 
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
 }
+
+data class SigningCreds(
+    val storeFile: String,
+    val storePassword: String,
+    val keyAlias: String,
+    val keyPassword: String
+)
 
 android {
     namespace = "com.devbox"
@@ -16,8 +24,8 @@ android {
         applicationId = "com.devbox"
         minSdk = 26
         targetSdk = 28  // API 28 to bypass W^X restriction (apps targeting 29+ cannot exec from app data dir)
-        versionCode = 1
-        versionName = "1.0.0"
+        versionCode = 2
+        versionName = "1.1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables.useSupportLibrary = true
@@ -27,18 +35,43 @@ android {
         disable += "ExpiredTargetSdkVersion"
     }
 
+    // Release signing credentials come from app/keystore.properties (gitignored)
+    // or AMCODE_STORE_FILE/AMCODE_STORE_PASSWORD/AMCODE_KEY_ALIAS/AMCODE_KEY_PASSWORD
+    // environment variables. Nothing is hardcoded in the repository. Without
+    // either source the release APK is built unsigned (clean clones / CI).
+    val releaseSigning = run {
+        val props = Properties()
+        val propsFile = File(projectDir, "keystore.properties")
+        if (propsFile.isFile) {
+            propsFile.inputStream().use { props.load(it) }
+        }
+        fun cred(prop: String, env: String): String? =
+            props.getProperty(prop) ?: providers.environmentVariable(env).orNull
+        val storeFile = cred("storeFile", "AMCODE_STORE_FILE")
+        val storePassword = cred("storePassword", "AMCODE_STORE_PASSWORD")
+        val keyAlias = cred("keyAlias", "AMCODE_KEY_ALIAS")
+        val keyPassword = cred("keyPassword", "AMCODE_KEY_PASSWORD")
+        if (storeFile != null && storePassword != null && keyAlias != null && keyPassword != null) {
+            SigningCreds(storeFile, storePassword, keyAlias, keyPassword)
+        } else {
+            null
+        }
+    }
+
     signingConfigs {
-        create("release") {
-            storeFile = file("amcode-release.jks")
-            storePassword = "amcode123"
-            keyAlias = "amcode"
-            keyPassword = "amcode123"
+        releaseSigning?.let { creds ->
+            create("release") {
+                storeFile = file(creds.storeFile)
+                storePassword = creds.storePassword
+                keyAlias = creds.keyAlias
+                keyPassword = creds.keyPassword
+            }
         }
     }
 
     buildTypes {
         release {
-            signingConfig = signingConfigs.getByName("release")
+            releaseSigning?.let { signingConfig = signingConfigs.getByName("release") }
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(
@@ -80,51 +113,85 @@ android {
 }
 
 // ─── Download Termux bootstrap during build ──────────────
+//
+// Both ABI bootstrap zips are required runtime assets (TermuxManager copies
+// them from the APK on first launch); a clean clone has neither because the
+// zips are gitignored (32MB each). Each archive is pinned by SHA-256 so a
+// truncated or tampered download can never be bundled silently.
 
 val bootstrapDir = File(projectDir, "src/main/assets")
-val bootstrapFile = File(bootstrapDir, "bootstrap-aarch64.zip")
-val bootstrapUrl = "https://github.com/termux/termux-packages/releases/download/bootstrap-2026.08.02-r1%2Bapt.android-7/bootstrap-aarch64.zip"
-val bootstrapMirrorUrl = "https://ghproxy.com/$bootstrapUrl"
+val bootstrapTag = "bootstrap-2026.08.02-r1%2Bapt.android-7"
+val bootstrapArchives = mapOf(
+    "bootstrap-aarch64.zip" to
+        ("90a352db1c79aa5b6773003553d52c71da68cbe3eca2d277d0c5683d5163e658" to 32_203_582L),
+    "bootstrap-x86_64.zip" to
+        ("c2d9892ff6284ada4943c0234296008098d70a73df3a419987ddd03e58af0424" to 32_112_380L)
+)
 
 tasks.register("downloadBootstrap") {
     group = "setup"
-    description = "Download Termux bootstrap for bundling in APK assets"
+    description = "Download Termux bootstrap zips for bundling in APK assets"
 
     doLast {
-        if (bootstrapFile.exists() && bootstrapFile.length() > 10_000_000) {
-            println("Bootstrap already cached: ${bootstrapFile.absolutePath} (${bootstrapFile.length()} bytes)")
-            return@doLast
-        }
+        for ((name, pinned) in bootstrapArchives) {
+            val (expectedSha, expectedSize) = pinned
+            val bootstrapFile = File(bootstrapDir, name)
 
-        bootstrapDir.mkdirs()
-        val urls = listOf(bootstrapUrl, bootstrapMirrorUrl)
+            if (bootstrapFile.isFile && bootstrapFile.length() == expectedSize &&
+                offlineSha256(bootstrapFile).equals(expectedSha, ignoreCase = true)
+            ) {
+                println("Bootstrap already cached: ${bootstrapFile.absolutePath} (${bootstrapFile.length()} bytes)")
+                continue
+            }
+            bootstrapFile.delete()
 
-        for (url in urls) {
-            try {
-                println("Downloading bootstrap from: $url")
-                val connection = URL(url).openConnection()
-                connection.connectTimeout = 15000
-                connection.readTimeout = 300000
-                connection.setRequestProperty("User-Agent", "VSBoxed-Build/1.0")
+            bootstrapDir.mkdirs()
+            val urls = listOf(
+                "https://github.com/termux/termux-packages/releases/download/$bootstrapTag/$name",
+                "https://ghproxy.com/https://github.com/termux/termux-packages/releases/download/$bootstrapTag/$name"
+            )
+            var downloaded = false
+            for (url in urls) {
+                try {
+                    println("Downloading $name from: $url")
+                    val connection = URL(url).openConnection()
+                    connection.connectTimeout = 15000
+                    connection.readTimeout = 300000
+                    connection.setRequestProperty("User-Agent", "VSBoxed-Build/1.0")
 
-                connection.getInputStream().use { input ->
-                    bootstrapFile.outputStream().use { output ->
-                        input.copyTo(output)
+                    val tmp = File(bootstrapDir, "$name.part")
+                    connection.getInputStream().use { input ->
+                        tmp.outputStream().use { output -> input.copyTo(output) }
                     }
+                    if (tmp.length() != expectedSize ||
+                        !offlineSha256(tmp).equals(expectedSha, ignoreCase = true)
+                    ) {
+                        println("Checksum mismatch for $name (${tmp.length()} bytes); discarding")
+                        tmp.delete()
+                        continue
+                    }
+                    if (!tmp.renameTo(bootstrapFile)) {
+                        tmp.delete()
+                        throw GradleException("Cannot rename $tmp to $bootstrapFile")
+                    }
+                    downloaded = true
+                    println("Bootstrap downloaded: ${bootstrapFile.length()} bytes (sha256 verified)")
+                    break
+                } catch (e: Exception) {
+                    println("Failed from $url: ${e.message}")
+                    bootstrapFile.delete()
+                    File(bootstrapDir, "$name.part").delete()
                 }
-                println("Bootstrap downloaded: ${bootstrapFile.length()} bytes")
-                return@doLast
-            } catch (e: Exception) {
-                println("Failed from $url: ${e.message}")
-                bootstrapFile.delete()
+            }
+            if (!downloaded) {
+                println("WARNING: Cannot download $name (network issue).")
+                println("The app requires this asset at first launch; the build would ship a broken APK.")
+                println("1. Download manually: https://github.com/termux/termux-packages/releases/download/$bootstrapTag/$name")
+                println("2. Place it at: ${bootstrapFile.absolutePath}")
+                println("3. Rebuild")
+                throw GradleException("Missing bootstrap asset: $name")
             }
         }
-        println("WARNING: Cannot download bootstrap (network issue).")
-        println("The app will download it on first launch, or you can:")
-        println("1. Download manually: $bootstrapUrl")
-        println("2. Place it at: ${bootstrapFile.absolutePath}")
-        println("3. Rebuild")
-        println("Continuing build without bundled bootstrap...")
     }
 }
 

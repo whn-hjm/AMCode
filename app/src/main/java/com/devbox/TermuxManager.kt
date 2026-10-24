@@ -211,13 +211,17 @@ object TermuxManager {
             _setupState.value = SetupProgress(State.EXTRACTING, "Extracting bootstrap from APK...", 5)
 
             // Step 2: Extract bootstrap from APK (bundled, no network)
-            val bootstrapZip = File(filesDir, "bootstrap-aarch64.zip")
+            val bootstrapZip = File(filesDir, bootstrapAsset())
             if (!bootstrapZip.exists()) {
                 _setupState.value = SetupProgress(State.EXTRACTING, "Extracting environment files...", 8)
                 try {
+                    // Copy to a temp file and verify the byte count before the
+                    // rename: a truncated cache zip would otherwise be reused
+                    // by every future launch until the user clears app data.
+                    val tmp = File(filesDir, "${bootstrapZip.name}.tmp")
                     context.assets.openFd(bootstrapAsset()).use { fd ->
                         fd.createInputStream().use { input ->
-                            FileOutputStream(bootstrapZip).use { output ->
+                            FileOutputStream(tmp).use { output ->
                                 val buffer = ByteArray(65536)
                                 var total = 0L
                                 var count: Int
@@ -225,11 +229,21 @@ object TermuxManager {
                                     output.write(buffer, 0, count)
                                     total += count
                                 }
+                                if (total != fd.length) {
+                                    throw IOException("bootstrap copy truncated ($total/${fd.length})")
+                                }
                                 Log.i(TAG, "Bootstrap extracted: $total bytes (from ${fd.length} in APK)")
                             }
                         }
                     }
+                    if (!tmp.renameTo(bootstrapZip)) {
+                        bootstrapZip.delete()
+                        if (!tmp.renameTo(bootstrapZip)) {
+                            throw IOException("cannot install bootstrap cache at $bootstrapZip")
+                        }
+                    }
                 } catch (e: Exception) {
+                    File(filesDir, "${bootstrapZip.name}.tmp").delete()
                     Log.e(TAG, "Bootstrap extraction failed", e)
                     _setupState.value = SetupProgress(State.FAILED, "Extraction failed: ${e.message}", 0)
                     return@withContext Result.failure(e)
@@ -239,7 +253,15 @@ object TermuxManager {
             // Step 3: Extract bootstrap zip
             _setupState.value = SetupProgress(State.EXTRACTING, "Extracting environment...", 12)
             emitOutput("[2/6] Extracting Termux bootstrap...\n")
-            extractBootstrap(bootstrapZip)
+            try {
+                extractBootstrap(bootstrapZip)
+            } catch (e: Exception) {
+                // An unreadable cache zip would brick every following launch
+                // (the cache above is reused); drop it so the next attempt
+                // re-copies a fresh copy from the APK.
+                bootstrapZip.delete()
+                throw e
+            }
 
             // Step 4: Patch binary paths
             _setupState.value = SetupProgress(State.PATCHING, "Patching binary paths...", 20)
@@ -292,6 +314,10 @@ object TermuxManager {
 
             _setupState.value = SetupProgress(State.READY, "Environment ready", 100)
             File(filesDir, ".amcode-ready").writeText("1")
+            // The ~32MB bootstrap cache is no longer needed once usr/ is built.
+            // Also drop the legacy always-aarch64-named copy from older builds.
+            bootstrapZip.delete()
+            File(filesDir, "bootstrap-aarch64.zip").delete()
             Log.i(TAG, "Termux environment initialized successfully")
             Result.success(Unit)
 
@@ -567,10 +593,18 @@ object TermuxManager {
         for ((name, url) in mirrors) {
             try {
                 val start = System.currentTimeMillis()
-                val proc = execShell("$curlBin -sI --connect-timeout 5 --max-time 10 $url/dists/stable/Release 2>/dev/null | head -1", workDir = usrDir)
+                // `%{http_code}` prints the status on stdout and the exit code
+                // is curl's own, so a mirror that fails DNS immediately can no
+                // longer win the speed test by being "fastest".
+                val proc = execShell(
+                    "$curlBin -s -o /dev/null -w '%{http_code}' " +
+                        "--connect-timeout 5 --max-time 10 $url/dists/stable/Release",
+                    workDir = usrDir
+                )
+                val status = proc.inputStream.bufferedReader().use { it.readText().trim() }
                 proc.waitFor()
                 val elapsed = System.currentTimeMillis() - start
-                if (proc.exitValue() == 0 && elapsed < bestTime) {
+                if (proc.exitValue() == 0 && status == "200" && elapsed < bestTime) {
                     bestTime = elapsed
                     bestMirror = name to url
                 }
@@ -744,6 +778,13 @@ object TermuxManager {
             if (exitCode != 0) {
                 Log.w(TAG, "ensurePkgSetup full repair failed: exit=$exitCode; marker not written")
                 return false
+            }
+
+            // Finish packages left half-configured by an interrupted/failed
+            // install. No-op (and fast) when the database is already clean;
+            // the health check below only passes once the audit is clean.
+            if (!finishDpkgConfigure()) {
+                Log.w(TAG, "ensurePkgSetup: dpkg --configure -a did not fully succeed")
             }
 
             // The bundled bootstrap pkg still has the Termux cache path while
@@ -1029,6 +1070,10 @@ object TermuxManager {
             when {
                 statusText.contains("/data/data/com.termux") ->
                     "dpkg status still references /data/data/com.termux"
+                statusText.contains("Status: install ok unpacked") ||
+                    statusText.contains("half-configured") ||
+                    statusText.contains("half-installed") ->
+                    "dpkg status has unconfigured packages (pending --configure -a)"
                 pkgText.contains("/data/data/com.devbox/cache/apt") ||
                     pkgText.contains("/data/data/com.termux/cache/apt") ->
                     "bin/pkg still uses the broken cache path"
@@ -1099,8 +1144,13 @@ object TermuxManager {
      * from the fast main mirror if needed. Idempotent and safe on every launch.
      */
     private fun ensureLibCpp30(): Boolean {
+        // The full-file symbol scan is pure setup cost once the check has
+        // passed; a tiny marker file caches the positive result.
+        val marker = File(filesDir, ".amcode-libcpp30")
         val lib = File(usrDir, "lib/libc++_shared.so")
+        if (marker.isFile && lib.isFile) return true
         if (libcxxHasHashSymbol(lib)) {
+            marker.writeText("1")
             Log.i(TAG, "libc++_shared.so already has the libc++ 30 hash_memory symbol")
             return true
         }
@@ -1146,6 +1196,7 @@ object TermuxManager {
             return false
         }
         if (libcxxHasHashSymbol(lib)) {
+            marker.writeText("1")
             emitOutput("[fix] libc++ 30 installed.\n")
             return true
         }
@@ -1158,6 +1209,7 @@ object TermuxManager {
             Log.w(TAG, "apt reinstall libc++ failed to start: ${e.message}")
         }
         if (libcxxHasHashSymbol(lib)) {
+            marker.writeText("1")
             emitOutput("[fix] libc++ 30 installed (forced).\n")
             return true
         }
@@ -1330,6 +1382,12 @@ object TermuxManager {
         }
     }
 
+    /** Remove the staged bundled .deb copies after a failed bundle install. */
+    private fun deleteStagedBundledDebs(bundle: OfflineBundle) {
+        val stageDir = File(varDir, "cache/apt/archives")
+        bundle.packages.forEach { File(stageDir, it.filename).delete() }
+    }
+
     /**
      * Install the pinned TUR debs that were bundled at build time.
      *
@@ -1387,6 +1445,7 @@ object TermuxManager {
                 if (!moved) {
                     lastInstallError = "cannot temporarily disable the TUR apt source"
                     emitOutput("[offline] $lastInstallError; falling back to online install.\n")
+                    deleteStagedBundledDebs(bundle)
                     return false
                 }
             }
@@ -1398,6 +1457,7 @@ object TermuxManager {
             if (!runAptCommand("update")) {
                 lastInstallError = "apt update (main mirror) failed during bundled install"
                 emitOutput("[offline] Main mirror update failed; falling back to online install.\n")
+                deleteStagedBundledDebs(bundle)
                 return false
             }
             _setupState.value = SetupProgress(
@@ -1409,11 +1469,13 @@ object TermuxManager {
             if (!runAptCommand("install", "-y", "-d", *deps)) {
                 lastInstallError = "dependency download from main mirror failed"
                 emitOutput("[offline] Dependency download failed; falling back to online install.\n")
+                deleteStagedBundledDebs(bundle)
                 return false
             }
         } catch (e: Exception) {
             lastInstallError = "bundled dependency setup: ${e.message}"
             emitOutput("[offline] ${lastInstallError}\n")
+            deleteStagedBundledDebs(bundle)
             return false
         } finally {
             if (moved) {
@@ -1443,16 +1505,19 @@ object TermuxManager {
         val bundledDebs = bundle.packages.map { File(stageDir, it.filename) }
         if (bundledDebs.any { !it.isFile || it.length() == 0L }) {
             lastInstallError = "bundled .deb missing from apt cache"
+            deleteStagedBundledDebs(bundle)
             return false
         }
 
         _setupState.value = SetupProgress(State.INSTALLING_PACKAGES, "Installing bundled packages...", 60)
         if (!installDebFiles(depDebs + bundledDebs)) {
+            deleteStagedBundledDebs(bundle)
             return false
         }
         if (!isNodeInstalled() || !isCodeServerInstalled()) {
             lastInstallError = "bundled install finished but code-server/nodejs binary is missing"
             emitOutput("[offline] $lastInstallError\n")
+            deleteStagedBundledDebs(bundle)
             return false
         }
         // The two large debs are still in the APK; do not keep a second
@@ -1561,11 +1626,23 @@ object TermuxManager {
         val archives = File(varDir, "cache/apt/archives")
         val all = archives.listFiles { f -> f.isFile && f.extension == "deb" && f.length() > 0 }
             ?.toList() ?: emptyList()
-        val deps = all.filterNot {
+        // Only the newest cached version of each package: a repo bump can
+        // leave an older deb next to a fresh download, and handing both to
+        // one `dpkg --force-all --unpack` risks downgrades/ordering issues.
+        // The lexically larger version string wins, which matches Debian
+        // ordering for same-epoch point updates.
+        val newest = all.groupBy { file ->
+            val name = file.name
+            val idx = name.indexOf('_')
+            if (idx > 0) name.substring(0, idx) else name
+        }.mapNotNull { (_, files) ->
+            files.maxByOrNull { it.name.substringAfter('_', "") }
+        }
+        val deps = newest.filterNot {
             it.name.startsWith("code-server_") || it.name.startsWith("nodejs-24_")
         }.sortedBy { it.name }
-        val node = all.filter { it.name.startsWith("nodejs-24_") }
-        val codeServer = all.filter { it.name.startsWith("code-server_") }
+        val node = newest.filter { it.name.startsWith("nodejs-24_") }
+        val codeServer = newest.filter { it.name.startsWith("code-server_") }
         return deps + node + codeServer
     }
 
@@ -1669,26 +1746,54 @@ object TermuxManager {
             it.isNotBlank() && !it.contains(".dpkg.cfg")
         }.orEmpty()
         val auditClean = audit != null && audit.exitCode == 0 && auditProblems.isEmpty()
-        val ok = unpack.exitCode == 0 && configure.exitCode == 0 && auditClean
         val detail = "unpack=${unpack.exitCode} configure=${configure.exitCode} " +
             "audit=${if (auditClean) "clean" else "${auditProblems.size} problem(s)"}"
-        if (ok) {
-            emitOutput("[dpkg] exit=0 ($detail; ${debs.size} package(s))\n")
-        } else {
+        if (unpack.exitCode != 0) {
+            // Payload is not reliably on disk: hard failure so the caller can
+            // retry or fall back instead of persisting a broken environment.
             emitOutput("[dpkg] exit=1 ($detail)\n")
-            lastInstallError = lastInstallError.ifBlank {
-                when {
-                    unpack.exitCode != 0 -> "dpkg --unpack failed"
-                    configure.exitCode != 0 -> "dpkg --configure failed"
-                    else -> "dpkg --audit reports broken packages"
-                }
-            }
+            lastInstallError = lastInstallError.ifBlank { "dpkg --unpack failed" }
             val tail = (unpack.lines + configure.lines + auditProblems)
                 .filter { it.isNotBlank() }
                 .takeLast(8)
             if (tail.isNotEmpty()) Log.w(TAG, "dpkg failure tail:\n${tail.joinToString("\n")}")
+            return false
+        }
+        if (!configureClean(configure.exitCode, auditClean)) {
+            // Binaries are in place, but some maintainer script failed or the
+            // audit is dirty. Half-configured packages are detected by
+            // pkgSetupHealthFailure (this same launch, via ensurePkgSetup)
+            // which re-runs dpkg --configure -a until the database is clean.
+            emitOutput("[dpkg] WARN configure incomplete ($detail); repair will re-configure\n")
+            if (lastInstallError.isBlank()) {
+                lastInstallError = "dpkg configure incomplete ($detail)"
+            }
+        } else {
+            emitOutput("[dpkg] exit=0 ($detail; ${debs.size} package(s))\n")
         }
         return true
+    }
+
+    private fun configureClean(configureExit: Int, auditClean: Boolean): Boolean =
+        configureExit == 0 && auditClean
+
+    /** Finish any pending package configuration (no-op when the DB is clean). */
+    private fun finishDpkgConfigure(): Boolean {
+        return try {
+            val dpkg = File(binDir, "dpkg").absolutePath
+            val env = mapOf("DEBIAN_FRONTEND" to "noninteractive")
+            consumeProcess(
+                execCommand(
+                    dpkg,
+                    listOf("--force-all", "--force-script-chrootless", "--configure", "-a"),
+                    usrDir,
+                    env
+                )
+            ).exitCode == 0
+        } catch (e: Exception) {
+            Log.w(TAG, "dpkg --configure -a failed to start: ${e.message}")
+            false
+        }
     }
 
     /**
@@ -1794,14 +1899,24 @@ object TermuxManager {
             )
             if (!copied) copiedNestedPayload = false
         }
-        // Keep the nested trees on a partial copy so a retry can recover them.
-        if (movedNestedPayload && copiedNestedPayload) {
+        // The nested tree is never reused: the next install re-unpacks every
+        // deb from its .deb file, and a leftover tree would just shadow the
+        // payload during patching.
+        if (movedNestedPayload) {
             runShellQuiet("rm -rf ${usrDir.absolutePath}/data")
+            if (!copiedNestedPayload) {
+                Log.w(TAG, "Nested payload copy reported a failure; continuing with rewrite")
+            }
         }
 
-        // Fix paths that packages baked in as text.
+        // Fix paths that packages baked in as text. opt/ (nodejs-24), share/
+        // and include/ are included so the first-install path matches what
+        // the dpkg wrapper rewrites for every later package install.
         runShellQuiet(
-            "grep -rl 'com.termux' ${binDir.absolutePath} ${File(usrDir, "lib").absolutePath} 2>/dev/null | " +
+            "for d in ${binDir.absolutePath} ${File(usrDir, "lib").absolutePath} " +
+                "${File(usrDir, "opt").absolutePath} ${File(usrDir, "share").absolutePath} " +
+                "${File(usrDir, "include").absolutePath}; do " +
+                "[ -d \"\$d\" ] && grep -rl 'com.termux' \"\$d\" 2>/dev/null; done | " +
                 "xargs -r sed -i 's|com.termux|com.devbox|g' 2>/dev/null"
         )
         // Also patch etc/ but exclude mirrors/ (pkg uses mirror URLs with 'termux' in domain).
@@ -1853,58 +1968,6 @@ object TermuxManager {
             }
         }
         return ProcessResult(process.waitFor(), lines)
-    }
-
-    /** Extract .deb to PREFIX — handles com.termux → com.devbox path mapping */
-    private fun runDpkgInstall(debFile: File): Boolean {
-        // dpkg-deb extracts to ./data/data/com.termux/files/usr/... (hardcoded in package)
-        // Since our PREFIX is /data/data/com.devbox/files/usr, we extract and then
-        // move files from the termux path to the devbox path.
-        val termuxPrefixInDeb = File(usrDir, "data/data/com.termux/files/usr")
-
-        // Extract data files
-        val dpkgDeb = File(binDir, "dpkg-deb").absolutePath
-        val proc1 = execCommand(dpkgDeb, listOf("-x", debFile.absolutePath, usrDir.absolutePath), usrDir, environment.toMutableMap())
-        proc1.waitFor()
-
-        // Move files from com.termux path to actual PREFIX
-        if (termuxPrefixInDeb.isDirectory) {
-            termuxPrefixInDeb.listFiles()?.forEach { dir ->
-                val target = File(usrDir, dir.name)
-                dir.copyRecursively(target, overwrite = true)
-            }
-            termuxPrefixInDeb.parentFile?.deleteRecursively()
-            // Remove the stray data/ directory if empty
-            val dataDir = File(usrDir, "data")
-            if (dataDir.isDirectory && dataDir.listFiles()?.isEmpty() == true) dataDir.delete()
-            return true
-        }
-        return false
-    }
-
-    /** Install code-server via npm */
-    private fun runNpmInstall(): Boolean {
-        val env = environment.toMutableMap()
-        // Use npm from Termux bin
-        val npmPath = File(binDir, "npm").absolutePath
-        if (!File(npmPath).exists()) {
-            emitOutput("[npm] npm not found, installing...\n")
-            // npm should come with nodejs
-            return false
-        }
-        val process = execCommand(npmPath,
-            listOf("install", "-g", "code-server", "--unsafe-perm"),
-            homeDir, env)
-        val reader = process.inputStream.bufferedReader()
-        var line: String?
-        while (reader.readLine().also { line = it } != null) {
-            val text = line!!
-            if (text.isNotBlank() && !text.startsWith("npm WARN")) {
-                emitOutput("  $text\n")
-            }
-        }
-        val exitCode = process.waitFor()
-        return exitCode == 0
     }
 
     fun isNodeInstalled(): Boolean = File(binDir, "node").exists()

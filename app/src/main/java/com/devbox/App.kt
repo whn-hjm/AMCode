@@ -31,7 +31,8 @@ class App : Application() {
 
         /** Path to crash log on external storage, for easy access without ADB */
         fun getCrashLogPath(): File {
-            return File(instance.getExternalFilesDir(null), "vsboxed_crash.log")
+            val dir = instance.getExternalFilesDir(null) ?: instance.filesDir
+            return File(dir, "vsboxed_crash.log")
         }
     }
 
@@ -117,6 +118,7 @@ object HomePrefs {
     private const val KEY_HOME_MODE = "home_mode"
     private const val KEY_EXTERNAL_MIGRATION_PROMPTED = "external_migration_prompted"
     private const val KEY_EXTERNAL_TRUST_WARNED = "external_trust_warned"
+    private const val KEY_INTERNAL_TRUST_HINT_SHOWN = "internal_trust_hint_shown"
 
     const val MODE_INTERNAL = "internal"
     const val MODE_EXTERNAL = "external"
@@ -161,6 +163,13 @@ object HomePrefs {
 
     fun markExternalTrustWarningShown(context: Context) {
         prefs(context).edit().putBoolean(KEY_EXTERNAL_TRUST_WARNED, true).apply()
+    }
+
+    fun wasInternalTrustHintShown(context: Context): Boolean =
+        prefs(context).getBoolean(KEY_INTERNAL_TRUST_HINT_SHOWN, false)
+
+    fun markInternalTrustHintShown(context: Context) {
+        prefs(context).edit().putBoolean(KEY_INTERNAL_TRUST_HINT_SHOWN, true).apply()
     }
 
     /** Legacy shared-storage workspace: /sdcard/AMCode */

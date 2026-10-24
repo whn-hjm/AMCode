@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Android 12+ backup rules. Mirrors backup_rules.xml: the Termux
+     environment, code-server data, the bootstrap cache and per-launch
+     runtime files (PID/auth config) are never backed up or transferred.
+     files/home (the user's workspace) stays backed up. -->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="root" path="files/usr" />
+        <exclude domain="root" path="files/code-server" />
+        <exclude domain="root" path="files/.code-server-data" />
+        <exclude domain="root" path="files/.code-server-extensions" />
+        <exclude domain="root" path="files/bootstrap-aarch64.zip" />
+        <exclude domain="root" path="files/run" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="root" path="files/usr" />
+        <exclude domain="root" path="files/code-server" />
+        <exclude domain="root" path="files/.code-server-data" />
+        <exclude domain="root" path="files/.code-server-extensions" />
+        <exclude domain="root" path="files/bootstrap-aarch64.zip" />
+        <exclude domain="root" path="files/run" />
+    </device-transfer>
+</data-extraction-rules>

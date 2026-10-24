@@ -12,6 +12,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import org.json.JSONObject
 import java.io.BufferedReader
 import java.io.File
 import java.io.FileOutputStream
@@ -254,6 +255,10 @@ object CodeServerLauncher {
             val extDir = File(App.instance.filesDir, ".code-server-extensions").absolutePath
             val home = TermuxManager.homeDir
 
+            // Seed required default settings (files.watcherExclude for the
+            // ~/storage/shared symlink) before the server reads them on boot.
+            ensureDefaultUserSettings(File(userDataDir))
+
             val process = ProcessBuilder(
                 codeServerBin.absolutePath,
                 "--bind-addr", "$BIND_HOST:$port",
@@ -348,6 +353,64 @@ object CodeServerLauncher {
             Log.i(TAG, "code-server session established (cookie len=${cookie.length}, value redacted)")
 
             _status.value = ServerStatus(ServerState.RUNNING, "Server running", port, url, pid)
+        }
+    }
+
+    /**
+     * Seed code-server user settings that AMCode depends on. The internal HOME
+     * contains `~/storage/shared -> /storage/emulated/0`; without an exclusion
+     * the VS Code file watcher follows the whole FUSE mount, which wastes CPU
+     * and can stall on Android shared storage. Only missing keys are added, so
+     * user edits always win. VS Code settings.json is JSONC: when an existing
+     * file cannot be parsed as plain JSON (comments, trailing commas) it is
+     * left completely untouched rather than corrupted.
+     */
+    private fun ensureDefaultUserSettings(userDataDir: File) {
+        val watcherKey = "**/storage/shared/**"
+        try {
+            val userDir = File(userDataDir, "User")
+            val settings = File(userDir, "settings.json")
+            var root: JSONObject? = null
+            var existed = false
+            if (settings.isFile) {
+                existed = true
+                root = try {
+                    JSONObject(settings.readText())
+                } catch (_: Exception) {
+                    // JSONC/custom content: never rewrite a file we can't parse.
+                    Log.i(TAG, "User settings.json is not plain JSON; leaving it untouched")
+                    null
+                }
+            }
+            val doc = root ?: JSONObject()
+            val watcher = doc.optJSONObject("files.watcherExclude")
+            if (watcher?.has(watcherKey) == true) return
+            if (watcher == null) {
+                doc.put("files.watcherExclude", JSONObject())
+            }
+            doc.getJSONObject("files.watcherExclude").put(watcherKey, true)
+
+            if (!userDir.isDirectory && !userDir.mkdirs()) {
+                Log.w(TAG, "Cannot create ${userDir.absolutePath}; skipping settings seed")
+                return
+            }
+            val tmp = File(userDir, "settings.json.tmp")
+            tmp.writeText(doc.toString(2))
+            if (!tmp.renameTo(settings)) {
+                settings.delete()
+                if (!tmp.renameTo(settings)) {
+                    tmp.delete()
+                    Log.w(TAG, "Cannot install seeded user settings at $settings")
+                    return
+                }
+            }
+            Log.i(
+                TAG,
+                (if (existed) "Updated" else "Seeded") +
+                    " user settings: files.watcherExclude includes $watcherKey"
+            )
+        } catch (e: Exception) {
+            Log.w(TAG, "Cannot seed code-server user settings", e)
         }
     }
 
