@@ -1,18 +1,25 @@
 package com.devbox
 
 import android.content.Context
-import android.os.Environment
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.withContext
+import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
-import java.io.InputStream
+import java.io.IOException
 import java.net.HttpURLConnection
+import java.net.URI
 import java.net.URL
+import java.security.MessageDigest
+import java.util.concurrent.Callable
+import java.util.concurrent.ExecutionException
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import java.util.zip.ZipInputStream
 
 /**
@@ -34,8 +41,34 @@ object TermuxManager {
 
     private const val TAG = "TermuxManager"
 
+    /** TUR is the only source of code-server and nodejs-24. Keep this in sync
+     *  with String constants used by the build-time offline bundle. */
+    private const val TUR_SOURCE =
+        "deb [trusted=yes] https://tur.kcubeterm.com tur-packages tur tur-on-device tur-continuous\n"
+
+    /** Max simultaneous HTTP Range connections for one large .deb. */
+    private const val MAX_RANGE_CONNECTIONS = 8
+
+    /**
+     * libc++ 30 added this symbol; libc++ 29 lacks it. TUR code-server native
+     * modules (spdlog / @parcel/watcher) fail to load without it.
+     */
+    private const val LIBCPP_HASH_SYMBOL = "_ZNSt6__ndk113__hash_memoryEPKvm"
+
     // Package name MUST be exactly 10 chars to match "com.termux" for binary patching
     const val PACKAGE_NAME = "com.devbox"
+
+    // Set by initialize(); all install paths need the AssetManager for the
+    // optional build-time TUR bundle and setup scripts.
+    private lateinit var appContext: Context
+
+    // Only inspect the (optional) bundled debs once per initialize() run.
+    private var offlineBundleChecked = false
+
+    // Last real download/apt error, surfaced to the setup UI instead of a
+    // generic "check network" message.
+    @Volatile
+    private var lastInstallError: String = ""
 
     // Bootstrap asset file — selected by architecture at runtime
     private fun bootstrapAsset(): String {
@@ -127,6 +160,9 @@ object TermuxManager {
      */
     suspend fun initialize(context: Context): Result<Unit> = withContext(Dispatchers.IO) {
         filesDir = context.filesDir
+        appContext = context.applicationContext
+        offlineBundleChecked = false
+        lastInstallError = ""
 
         // Existing installations (including an APK installed over an older data
         // directory) must also get the keyring/SYMLINKS/pkg/dpkg repairs. This
@@ -136,6 +172,10 @@ object TermuxManager {
             // Migrate an older installation that already has code-server but
             // predates the completion marker: do not reinstall it.
             if (isBootstrapReady() && File(binDir, "code-server").exists()) {
+                // Repair installs created before libc++ 30 was available. TUR
+                // code-server native modules (spdlog/@parcel/watcher) otherwise
+                // fail with "_ZNSt6__ndk113__hash_memoryEPKvm" (libc++ 29).
+                ensureLibCpp30()
                 File(filesDir, ".amcode-ready").writeText("1")
             }
         }
@@ -220,15 +260,19 @@ object TermuxManager {
             }
 
             if (!ok) {
-                emitOutput("[FAILED] Could not install packages after 3 attempts.\n")
-                _setupState.value = SetupProgress(State.FAILED, "Installation failed. Check network.", 0)
-                return@withContext Result.failure(RuntimeException("Package installation failed"))
+                val detail = lastInstallError.ifBlank { "download or package installation failed" }
+                emitOutput("[FAILED] Could not install packages after 3 attempts: $detail\n")
+                emitOutput("[hint] TUR is the slow part: build with -PofflineBundle=true to ship\n")
+                emitOutput("       the pinned code-server/nodejs debs inside the APK.\n")
+                _setupState.value = SetupProgress(State.FAILED, "Install failed: $detail", 0)
+                return@withContext Result.failure(RuntimeException("Package installation failed: $detail"))
             }
 
             // The initial install uses `dpkg --root` and moves the com.termux
             // tree into place by hand. Migrate the resulting dpkg database
             // paths so later `pkg install` runs see a consistent package DB.
             ensurePkgSetup(context)
+            ensureLibCpp30()
 
             _setupState.value = SetupProgress(State.READY, "Environment ready", 100)
             File(filesDir, ".amcode-ready").writeText("1")
@@ -237,7 +281,8 @@ object TermuxManager {
 
         } catch (e: Exception) {
             Log.e(TAG, "Failed to initialize Termux environment", e)
-            _setupState.value = SetupProgress(State.FAILED, "Failed: ${e.message}", 0)
+            val detail = lastInstallError.ifBlank { e.message ?: e.javaClass.simpleName }
+            _setupState.value = SetupProgress(State.FAILED, "Failed: $detail", 0)
             Result.failure(e)
         }
     }
@@ -681,7 +726,112 @@ object TermuxManager {
     }
 
     /**
-     * Install nodejs and code-server from Termux repos.
+     * The TUR code-server debs contain native modules built against libc++ 30.
+     * Bootstrap/old installs can still have libc++ 29, which lacks
+     * `_ZNSt6__ndk113__hash_memoryEPKvm` and makes spdlog/@parcel/watcher fail.
+     * Check the actual shared library (not just the dpkg version) and upgrade
+     * from the fast main mirror if needed. Idempotent and safe on every launch.
+     */
+    private fun ensureLibCpp30(): Boolean {
+        val lib = File(usrDir, "lib/libc++_shared.so")
+        if (libcxxHasHashSymbol(lib)) {
+            Log.i(TAG, "libc++_shared.so already has the libc++ 30 hash_memory symbol")
+            return true
+        }
+        if (!lib.exists()) {
+            emitOutput("[fix] libc++_shared.so missing; installing libc++...\n")
+        } else {
+            emitOutput("[fix] libc++ is older than 30 (missing hash_memory symbol); upgrading...\n")
+        }
+        if (!File(binDir, "apt").exists()) {
+            emitOutput("[fix] WARN apt is missing; cannot install libc++ 30\n")
+            return false
+        }
+        _setupState.value = SetupProgress(
+            State.INSTALLING_PACKAGES,
+            "Updating libc++ for code-server...",
+            92
+        )
+        var installed = try {
+            runApt("install", "-y", "libc++", quick = true).exitCode == 0
+        } catch (e: Exception) {
+            Log.w(TAG, "apt install libc++ failed to start: ${e.message}")
+            false
+        }
+        if (!installed) {
+            // A cleaned/empty apt list is common after pkg maintenance. Refresh
+            // once (quick timeouts) and retry before giving up.
+            emitOutput("[fix] apt install libc++ failed; refreshing package index...\n")
+            try {
+                runApt("update", quick = true)
+            } catch (e: Exception) {
+                Log.w(TAG, "apt update for libc++ failed to start: ${e.message}")
+            }
+            installed = try {
+                runApt("install", "-y", "libc++", quick = true).exitCode == 0
+            } catch (e: Exception) {
+                Log.w(TAG, "apt install libc++ retry failed to start: ${e.message}")
+                false
+            }
+        }
+        if (!installed) {
+            emitOutput("[fix] WARN could not install libc++: " +
+                lastInstallError.ifBlank { "check the main mirror" } + "\n")
+            return false
+        }
+        if (libcxxHasHashSymbol(lib)) {
+            emitOutput("[fix] libc++ 30 installed.\n")
+            return true
+        }
+        // A stale/odd dpkg database may think 29 already satisfies the
+        // candidate; force the main-repo 30 package to be reinstalled.
+        emitOutput("[fix] libc++ still lacks the symbol; forcing reinstall...\n")
+        try {
+            runApt("install", "-y", "--reinstall", "libc++", quick = true)
+        } catch (e: Exception) {
+            Log.w(TAG, "apt reinstall libc++ failed to start: ${e.message}")
+        }
+        if (libcxxHasHashSymbol(lib)) {
+            emitOutput("[fix] libc++ 30 installed (forced).\n")
+            return true
+        }
+        emitOutput("[fix] WARN libc++ 30 symbol still missing at ${lib.absolutePath}\n")
+        return false
+    }
+
+    private fun libcxxHasHashSymbol(file: File): Boolean {
+        if (!file.isFile) return false
+        val needle = LIBCPP_HASH_SYMBOL.toByteArray(Charsets.US_ASCII)
+        return try {
+            val bytes = file.readBytes()
+            if (bytes.size < needle.size) return false
+            outer@ for (i in 0..(bytes.size - needle.size)) {
+                for (j in needle.indices) {
+                    if (bytes[i + j] != needle[j]) continue@outer
+                }
+                return true
+            }
+            false
+        } catch (e: Exception) {
+            Log.w(TAG, "Cannot read ${file.absolutePath}: ${e.message}")
+            false
+        }
+    }
+
+    /**
+     * Install nodejs and code-server.
+     *
+     * Two paths are supported:
+     *  1. Optional build-time TUR bundle (`-PofflineBundle=true`): the pinned
+     *     code-server + nodejs-24 debs are in APK assets. Only the small,
+     *     fast-moving dependencies come from the main Termux mirror. No TUR
+     *     download is needed on first launch.
+     *  2. Online: apt resolves the TUR dependency graph, then the two large
+     *     TUR debs are fetched with parallel HTTP Range requests + resume
+     *     instead of apt's single slow connection. If that fails, apt's own
+     *     downloader is used as a fallback; its error output is no longer
+     *     swallowed.
+     *
      * Uses dpkg directly for reliable installation.
      */
     fun installPackages(): Boolean = tryInstall(0)
@@ -689,62 +839,470 @@ object TermuxManager {
     private fun tryInstall(attempt: Int): Boolean {
         if (!isBootstrapReady()) return false
         val retrying = attempt > 0
+        lastInstallError = ""
+
+        // 1. Try the opt-in bundle once. It only exists when the APK was built
+        //    with -PofflineBundle=true and for this device ABI.
+        if (!offlineBundleChecked) {
+            offlineBundleChecked = true
+            val bundled = tryOfflineBundleInstall()
+            if (bundled == true) {
+                emitOutput("[done] All packages installed from bundled debs.\n")
+                _setupState.value = SetupProgress(State.READY, "Ready", 100)
+                return true
+            }
+            if (bundled == false) {
+                lastInstallError = ""
+                emitOutput("[offline] Bundled install failed; falling back to online TUR install.\n")
+            }
+        }
 
         _setupState.value = SetupProgress(State.INSTALLING_PACKAGES,
             if (retrying) "Retrying..." else "Updating package index...",
             if (retrying) 30 else 32)
-        runAptCommand("update")
-
-        // Step 2: Configure TUR + download
-        emitOutput(if (retrying) "[apt] Retrying download...\n" else "[apt] Downloading packages (~236MB)...\n")
-        val turListDir = File(etcDir, "apt/sources.list.d")
-        turListDir.mkdirs()
-        File(turListDir, "tur.list").writeText(
-            "deb [trusted=yes] https://tur.kcubeterm.com tur-packages tur tur-on-device tur-continuous\n"
-        )
-        runAptCommand("update")
-        _setupState.value = SetupProgress(State.INSTALLING_PACKAGES, "Downloading packages...", 48)
-        // Install GPG keyring first so pkg update works in terminal
-        runAptCommand("install", "-y", "-d", "termux-keyring")
-        runAptCommand("install", "-y", "-d", "code-server")
-
-        // Step 3: Install via dpkg
-        _setupState.value = SetupProgress(State.INSTALLING_PACKAGES, "Extracting packages...", 55)
-        val dpkgBin = File(binDir, "dpkg").absolutePath
-        val archivesDir = File(varDir, "cache/apt/archives").absolutePath
-        execShell("cd $archivesDir && $dpkgBin --root=$usrDir --force-all -i *.deb 2>&1",
-            workDir = usrDir).waitFor()
-
-        // Step 4: Post-install fixups
-        _setupState.value = SetupProgress(State.INSTALLING_PACKAGES, "Finalizing...", 75)
-        execShell("SRC=\"$usrDir/data/data/com.termux/files/usr\"; " +
-            "if [ -d \"\$SRC\" ]; then cp -r \"\$SRC\"/* $usrDir/ && rm -rf $usrDir/data; fi",
-            workDir = usrDir).waitFor()
-        execShell("grep -rl 'com.termux' $usrDir/bin $usrDir/lib 2>/dev/null | " +
-            "xargs -r sed -i 's|com.termux|com.devbox|g' 2>/dev/null", workDir = usrDir).waitFor()
-        // Also patch etc/ but exclude mirrors/ (pkg uses mirror URLs with 'termux' in domain)
-        execShell("grep -rl 'com.termux' $usrDir/etc 2>/dev/null | grep -v '/termux/' | " +
-            "xargs -r sed -i 's|com.termux|com.devbox|g' 2>/dev/null", workDir = usrDir).waitFor()
-
-        // Node symlinks
-        val nodeJs24 = File(usrDir, "opt/nodejs-24/bin/node")
-        val nodeLink = File(binDir, "node")
-        if (nodeJs24.exists()) {
-            if (!nodeLink.exists()) try { java.nio.file.Files.createSymbolicLink(nodeLink.toPath(), nodeJs24.toPath()) } catch (_: Exception) {}
-            val csLink = File(usrDir, "lib/code-server/lib/node")
-            csLink.parentFile?.mkdirs()
-            try { csLink.delete(); java.nio.file.Files.createSymbolicLink(csLink.toPath(), nodeJs24.toPath()) } catch (_: Exception) {}
+        if (!runAptCommand("update")) {
+            lastInstallError = lastInstallError.ifBlank { "apt update (main mirror) failed" }
+            emitOutput("[apt] Main mirror index update failed; continuing with existing index.\n")
         }
 
-        // Check + retry
+        // Configure TUR only for the online path. The bundled path keeps TUR
+        // out of apt update so first install never touches the slow host.
+        ensureTurSource()
+        emitOutput(if (retrying) "[apt] Retrying TUR package index...\n" else "[apt] Updating TUR package index...\n")
+        if (!runAptCommand("update")) {
+            lastInstallError = lastInstallError.ifBlank { "apt update (TUR) failed" }
+            emitOutput("[apt] TUR index update failed. The TUR host is slow/blocked on this network.\n")
+            return false
+        }
+
+        _setupState.value = SetupProgress(State.INSTALLING_PACKAGES, "Downloading packages...", 38)
+        // Install GPG keyring first so pkg update works in terminal.
+        if (!runAptCommand("install", "-y", "-d", "termux-keyring")) {
+            emitOutput("[apt] termux-keyring download failed; continuing (setup will retry later).\n")
+        }
+
+        // Resolve package URLs without downloading, then grab the big TUR debs
+        // with multiple HTTP Range connections. At ~31 KB/s per connection
+        // this is the difference between ~75 minutes and a handful of minutes.
+        _setupState.value = SetupProgress(State.INSTALLING_PACKAGES, "Resolving TUR download URLs...", 42)
+        val specs = resolveDownloadUris("code-server")
+        var downloaded = false
+        if (specs.isNotEmpty()) {
+            emitOutput("[net] Downloading ${specs.size} package(s) with HTTP Range" +
+                " (up to $MAX_RANGE_CONNECTIONS connections)...\n")
+            downloaded = downloadDebs(specs)
+        } else {
+            emitOutput("[net] Could not resolve individual .deb URLs; using apt downloader.\n")
+        }
+        if (!downloaded) {
+            if (specs.isNotEmpty()) {
+                emitOutput("[net] Parallel download failed; falling back to apt (single connection, may be slow).\n")
+            }
+            _setupState.value = SetupProgress(State.INSTALLING_PACKAGES,
+                "Downloading from TUR (slow link)...", 48)
+            if (!runAptCommand("install", "-y", "-d", "code-server")) {
+                lastInstallError = lastInstallError.ifBlank { "TUR download failed" }
+                emitOutput("[apt] code-server download failed: $lastInstallError\n")
+                return false
+            }
+            // apt completed the download; the parallel .partN files are now
+            // redundant. Keep them on failure so the next retry can resume.
+            cleanupPartialDownloads(specs)
+        }
+
+        // Install via dpkg. Dependencies are listed before nodejs/code-server
+        // so dpkg configures them in the right order.
+        _setupState.value = SetupProgress(State.INSTALLING_PACKAGES, "Extracting packages...", 72)
+        if (!installDownloadedDebs(collectArchiveDebs())) {
+            return false
+        }
+
         val ok = isNodeInstalled() && isCodeServerInstalled()
         if (ok) {
             emitOutput("[done] All packages installed.\n")
             _setupState.value = SetupProgress(State.READY, "Ready", 100)
             return true
         }
+        lastInstallError = if (lastInstallError.isBlank()) {
+            "code-server or nodejs binary is missing after dpkg"
+        } else {
+            "code-server or nodejs binary is missing after dpkg (${lastInstallError})"
+        }
         if (attempt < 1) return tryInstall(attempt + 1)
         return false
+    }
+
+    /** Write the TUR source in the form that works before its keyring is usable. */
+    private fun ensureTurSource() {
+        val turListDir = File(etcDir, "apt/sources.list.d")
+        turListDir.mkdirs()
+        File(turListDir, "tur.list").writeText(TUR_SOURCE)
+    }
+
+    // ─── Optional build-time TUR bundle ───────────────────────
+
+    private data class OfflinePackage(
+        val name: String,
+        val version: String,
+        val filename: String,
+        val size: Long,
+        val sha256: String
+    )
+
+    private data class OfflineBundle(
+        val arch: String,
+        val aptDependencies: List<String>,
+        val packages: List<OfflinePackage>
+    )
+
+    private fun offlineArchName(): String {
+        val primary = android.os.Build.SUPPORTED_ABIS.firstOrNull() ?: "arm64-v8a"
+        return when {
+            primary.startsWith("x86_64") -> "x86_64"
+            primary.startsWith("x86") -> "i686"
+            else -> "aarch64"
+        }
+    }
+
+    /**
+     * Install the pinned TUR debs that were bundled at build time.
+     *
+     * Returns null when this APK has no bundle for this ABI, false when a
+     * bundle exists but could not be installed (caller then uses the online
+     * path), true on success.
+     *
+     * The bundle deliberately contains only code-server and nodejs-24: both
+     * are TUR-only and account for ~127 of the ~145 MB first install. Their
+     * dependencies all exist on the fast main Termux mirror and are resolved
+     * by apt normally, so only the two large immutable GitHub-hosted TUR debs
+     * are pinned.
+     */
+    private fun tryOfflineBundleInstall(): Boolean? {
+        val bundle = readOfflineBundle() ?: return null
+        if (!isBootstrapReady()) return null
+
+        val bundledSize = bundle.packages.sumOf { it.size }
+        emitOutput("[offline] Using bundled TUR packages (${bundledSize / (1024 * 1024)} MB): " +
+            bundle.packages.joinToString { "${it.name} ${it.version}" } + "\n")
+
+        val stageDir = File(varDir, "cache/apt/archives")
+        stageDir.mkdirs()
+        for ((index, pkg) in bundle.packages.withIndex()) {
+            val dest = File(stageDir, pkg.filename)
+            if (!offlineFileValid(dest, pkg)) {
+                try {
+                    copyOfflineAsset("offline-debs/${bundle.arch}/${pkg.filename}", dest, pkg)
+                } catch (e: Exception) {
+                    lastInstallError = "bundled ${pkg.name}: ${e.message}"
+                    emitOutput("[offline] ${lastInstallError}\n")
+                    return false
+                }
+            }
+            _setupState.value = SetupProgress(
+                State.INSTALLING_PACKAGES,
+                "Verifying bundled ${pkg.name}...",
+                30 + ((index + 1) * 8 / bundle.packages.size)
+            )
+        }
+
+        // apt must see only the main repository while it fetches dependencies:
+        // otherwise it may choose the slow TUR source for a dependency. Move
+        // the TUR list aside and restore it in finally.
+        val turList = File(etcDir, "apt/sources.list.d/tur.list")
+        val turBackup = File(turList.parentFile, "tur.list.amcode-bundle-bak")
+        if (!turList.exists() && turBackup.exists()) {
+            turBackup.renameTo(turList)
+        }
+        var moved = false
+        try {
+            if (turList.exists()) {
+                turBackup.delete()
+                moved = turList.renameTo(turBackup)
+                if (!moved) {
+                    lastInstallError = "cannot temporarily disable the TUR apt source"
+                    emitOutput("[offline] $lastInstallError; falling back to online install.\n")
+                    return false
+                }
+            }
+            // Drop cached TUR indexes too: the bundled path must resolve the
+            // small dependencies from the main mirror only.
+            File(varDir, "lib/apt/lists").listFiles { f ->
+                f.name.contains("tur.kcubeterm.com")
+            }?.forEach { it.delete() }
+            if (!runAptCommand("update")) {
+                lastInstallError = "apt update (main mirror) failed during bundled install"
+                emitOutput("[offline] Main mirror update failed; falling back to online install.\n")
+                return false
+            }
+            _setupState.value = SetupProgress(
+                State.INSTALLING_PACKAGES,
+                "Downloading dependencies from main mirror...",
+                42
+            )
+            val deps = bundle.aptDependencies.toTypedArray()
+            if (!runAptCommand("install", "-y", "-d", *deps)) {
+                lastInstallError = "dependency download from main mirror failed"
+                emitOutput("[offline] Dependency download failed; falling back to online install.\n")
+                return false
+            }
+        } catch (e: Exception) {
+            lastInstallError = "bundled dependency setup: ${e.message}"
+            emitOutput("[offline] ${lastInstallError}\n")
+            return false
+        } finally {
+            if (moved) {
+                if (!turList.exists()) turBackup.renameTo(turList)
+                else turBackup.delete()
+            } else if (turBackup.exists() && !turList.exists()) {
+                turBackup.renameTo(turList)
+            }
+        }
+
+        // Keep TUR available for pkg/extension installs after first launch.
+        ensureTurSource()
+        turBackup.delete()
+
+        // Drop any older code-server/nodejs deb left by a failed online
+        // attempt; otherwise dpkg would be asked to install two versions.
+        val expectedDebs = bundle.packages.map { it.filename }.toSet()
+        stageDir.listFiles { f ->
+            f.isFile && (f.name.startsWith("code-server_") || f.name.startsWith("nodejs-24_")) &&
+                f.name !in expectedDebs
+        }?.forEach { it.delete() }
+
+        val depDebs = stageDir.listFiles { f ->
+            f.isFile && f.extension == "deb" && f.length() > 0 &&
+                !f.name.startsWith("code-server_") && !f.name.startsWith("nodejs-24_")
+        }?.sortedBy { it.name } ?: emptyList()
+        val bundledDebs = bundle.packages.map { File(stageDir, it.filename) }
+        if (bundledDebs.any { !it.isFile || it.length() == 0L }) {
+            lastInstallError = "bundled .deb missing from apt cache"
+            return false
+        }
+
+        _setupState.value = SetupProgress(State.INSTALLING_PACKAGES, "Installing bundled packages...", 60)
+        if (!installDebFiles(depDebs + bundledDebs)) {
+            return false
+        }
+        if (!isNodeInstalled() || !isCodeServerInstalled()) {
+            lastInstallError = "bundled install finished but code-server/nodejs binary is missing"
+            emitOutput("[offline] $lastInstallError\n")
+            return false
+        }
+        // The two large debs are still in the APK; do not keep a second
+        // ~127 MB copy in the apt cache after a verified install.
+        bundle.packages.forEach { File(stageDir, it.filename).delete() }
+        emitOutput("[offline] Bundled packages installed without TUR download.\n")
+        return true
+    }
+
+    private fun readOfflineBundle(): OfflineBundle? {
+        if (!this::appContext.isInitialized) return null
+        val arch = offlineArchName()
+        val assetDir = "offline-debs/$arch"
+        val entries = try {
+            appContext.assets.list(assetDir)
+        } catch (_: Exception) {
+            null
+        }
+        if (entries == null || entries.isEmpty() || !entries.contains("manifest.json")) return null
+
+        val text = try {
+            appContext.assets.open("$assetDir/manifest.json").bufferedReader().use { it.readText() }
+        } catch (e: Exception) {
+            Log.w(TAG, "Cannot read $assetDir/manifest.json: ${e.message}")
+            return null
+        }
+
+        return try {
+            val root = JSONObject(text)
+            if (root.optInt("schema", 0) != 1) return null
+            if (root.optString("arch") != arch) return null
+            val array = root.getJSONArray("packages")
+            val packages = mutableListOf<OfflinePackage>()
+            for (i in 0 until array.length()) {
+                val obj = array.getJSONObject(i)
+                val filename = obj.getString("filename")
+                if (filename.contains('/') || filename.contains("..") || !filename.endsWith(".deb")) {
+                    return null
+                }
+                val sha = obj.getString("sha256").lowercase()
+                if (!Regex("^[0-9a-f]{64}$").matches(sha)) return null
+                packages += OfflinePackage(
+                    name = obj.getString("name"),
+                    version = obj.optString("version", ""),
+                    filename = filename,
+                    size = obj.getLong("size"),
+                    sha256 = sha
+                )
+            }
+            val depsArray = root.optJSONArray("aptDependencies") ?: return null
+            val dependencies = mutableListOf<String>()
+            for (i in 0 until depsArray.length()) {
+                val dep = depsArray.getString(i)
+                if (Regex("^[a-z0-9][a-z0-9+.-]*$").matches(dep)) dependencies += dep
+            }
+            if (packages.isEmpty() || dependencies.isEmpty()) return null
+            OfflineBundle(arch, dependencies, packages)
+        } catch (e: Exception) {
+            Log.w(TAG, "Invalid offline bundle manifest: ${e.message}")
+            null
+        }
+    }
+
+    private fun offlineFileValid(file: File, pkg: OfflinePackage): Boolean {
+        if (!file.isFile) return false
+        if (pkg.size > 0 && file.length() != pkg.size) return false
+        return sha256File(file).equals(pkg.sha256, ignoreCase = true)
+    }
+
+    private fun copyOfflineAsset(assetPath: String, dest: File, pkg: OfflinePackage) {
+        val tmp = File(dest.parentFile, "${dest.name}.amcode-tmp")
+        tmp.delete()
+        val digest = MessageDigest.getInstance("SHA-256")
+        var total = 0L
+        try {
+            appContext.assets.open(assetPath).use { input ->
+                FileOutputStream(tmp).use { output ->
+                    val buffer = ByteArray(64 * 1024)
+                    var count: Int
+                    while (input.read(buffer).also { count = it } != -1) {
+                        output.write(buffer, 0, count)
+                        digest.update(buffer, 0, count)
+                        total += count
+                    }
+                }
+            }
+            if (pkg.size > 0 && total != pkg.size) {
+                throw IOException("size mismatch (${total}/${pkg.size}) for $assetPath")
+            }
+            val actual = digest.digest().joinToString("") { "%02x".format(it.toInt() and 0xff) }
+            if (!actual.equals(pkg.sha256, ignoreCase = true)) {
+                throw IOException("SHA-256 mismatch for $assetPath")
+            }
+            if (!tmp.renameTo(dest)) {
+                dest.delete()
+                if (!tmp.renameTo(dest)) throw IOException("cannot rename $tmp to $dest")
+            }
+        } finally {
+            if (tmp.exists()) tmp.delete()
+        }
+    }
+
+    // ─── dpkg install / post-install fixups ───────────────────
+
+    private fun collectArchiveDebs(): List<File> {
+        val archives = File(varDir, "cache/apt/archives")
+        val all = archives.listFiles { f -> f.isFile && f.extension == "deb" && f.length() > 0 }
+            ?.toList() ?: emptyList()
+        val deps = all.filterNot {
+            it.name.startsWith("code-server_") || it.name.startsWith("nodejs-24_")
+        }.sortedBy { it.name }
+        val node = all.filter { it.name.startsWith("nodejs-24_") }
+        val codeServer = all.filter { it.name.startsWith("code-server_") }
+        return deps + node + codeServer
+    }
+
+    private fun installDownloadedDebs(debs: List<File>): Boolean {
+        if (debs.isEmpty()) {
+            lastInstallError = "no .deb files were downloaded"
+            emitOutput("[dpkg] No .deb files in apt cache.\n")
+            return false
+        }
+        return installDebFiles(debs)
+    }
+
+    private fun installDebFiles(debs: List<File>): Boolean {
+        val dpkg = File(binDir, "dpkg").absolutePath
+        val args = mutableListOf("--root=${usrDir.absolutePath}", "--force-all", "--install")
+        args += debs.map { it.absolutePath }
+        val env = mapOf("DEBIAN_FRONTEND" to "noninteractive")
+        val result = try {
+            consumeProcess(execCommand(dpkg, args, usrDir, env))
+        } catch (e: Exception) {
+            lastInstallError = "dpkg failed to start: ${e.message}"
+            emitOutput("[dpkg] ${lastInstallError}\n")
+            return false
+        }
+        if (result.exitCode != 0) {
+            val tail = result.lines.filter { it.isNotBlank() }.takeLast(6).joinToString("\n")
+            emitOutput("[dpkg] exit=${result.exitCode}; continuing to check installed files.\n")
+            if (tail.isNotBlank()) Log.w(TAG, "dpkg tail:\n$tail")
+            result.lines.firstOrNull {
+                it.contains("dependency problems") || it.contains("not installed") || it.contains("error")
+            }?.let { lastInstallError = it.trim() }
+        }
+        applyPostInstallFixups()
+        return true
+    }
+
+    private fun applyPostInstallFixups() {
+        _setupState.value = SetupProgress(State.INSTALLING_PACKAGES, "Finalizing...", 82)
+
+        // dpkg --root installs under the package's baked-in com.termux prefix.
+        // Move that payload up into our real PREFIX.
+        val termuxPrefix = File(usrDir, "data/data/com.termux/files/usr")
+        if (termuxPrefix.isDirectory) {
+            runShellQuiet(
+                "SRC=\"$termuxPrefix\"; " +
+                    "if [ -d \"\$SRC\" ]; then cp -r \"\$SRC\"/* ${usrDir.absolutePath}/ && rm -rf ${usrDir.absolutePath}/data; fi"
+            )
+        }
+
+        // Fix paths that packages baked in as text.
+        runShellQuiet(
+            "grep -rl 'com.termux' ${binDir.absolutePath} ${File(usrDir, "lib").absolutePath} 2>/dev/null | " +
+                "xargs -r sed -i 's|com.termux|com.devbox|g' 2>/dev/null"
+        )
+        // Also patch etc/ but exclude mirrors/ (pkg uses mirror URLs with 'termux' in domain).
+        runShellQuiet(
+            "grep -rl 'com.termux' ${etcDir.absolutePath} 2>/dev/null | grep -v '/termux/' | " +
+                "xargs -r sed -i 's|com.termux|com.devbox|g' 2>/dev/null"
+        )
+
+        // nodejs-24 installs into opt/nodejs-24/bin; code-server expects both
+        // bin/node and lib/code-server/lib/node.
+        val nodeJs24 = File(usrDir, "opt/nodejs-24/bin/node")
+        val nodeLink = File(binDir, "node")
+        if (nodeJs24.exists()) {
+            if (!nodeLink.exists()) {
+                try {
+                    java.nio.file.Files.createSymbolicLink(nodeLink.toPath(), nodeJs24.toPath())
+                } catch (_: Exception) {
+                }
+            }
+            val csLink = File(usrDir, "lib/code-server/lib/node")
+            csLink.parentFile?.mkdirs()
+            try {
+                csLink.delete()
+                java.nio.file.Files.createSymbolicLink(csLink.toPath(), nodeJs24.toPath())
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    private fun runShellQuiet(script: String): Boolean {
+        return try {
+            consumeProcess(execShell(script, usrDir)).exitCode == 0
+        } catch (e: Exception) {
+            Log.w(TAG, "Shell fixup failed: ${e.message}")
+            false
+        }
+    }
+
+    private data class ProcessResult(val exitCode: Int, val lines: List<String>)
+
+    private fun consumeProcess(process: Process): ProcessResult {
+        val lines = mutableListOf<String>()
+        process.inputStream.bufferedReader().use { reader ->
+            var line: String?
+            while (reader.readLine().also { line = it } != null) {
+                val text = line!!
+                lines += text
+                if (text.isNotBlank()) Log.i(TAG, text)
+            }
+        }
+        return ProcessResult(process.waitFor(), lines)
     }
 
     /** Extract .deb to PREFIX — handles com.termux → com.devbox path mapping */
@@ -802,32 +1360,512 @@ object TermuxManager {
     fun isNodeInstalled(): Boolean = File(binDir, "node").exists()
     fun isCodeServerInstalled(): Boolean = File(binDir, "code-server").exists()
 
-    private fun runAptCommand(vararg args: String): Boolean {
+    // ─── apt wrapper / URL resolution ─────────────────────────
+
+    private data class AptResult(val exitCode: Int, val lines: List<String>)
+
+    private fun runAptCommand(vararg args: String): Boolean = runApt(*args).exitCode == 0
+
+    private fun runApt(vararg args: String, quiet: Boolean = false, quick: Boolean = false): AptResult {
         val env = environment.toMutableMap()
         env["DEBIAN_FRONTEND"] = "noninteractive"
 
-        val aptArgs = args.toList()
+        val fullArgs = mutableListOf(
+            "-o", "Acquire::Retries=${if (quick) 1 else 5}",
+            "-o", "Acquire::http::Timeout=${if (quick) 15 else 30}",
+            "-o", "Acquire::https::Timeout=${if (quick) 15 else 30}"
+        )
+        fullArgs += args
         val aptPath = File(binDir, "apt").absolutePath
-        val process = execCommand(aptPath, aptArgs, homeDir, env)
+        val process = execCommand(aptPath, fullArgs, homeDir, env)
 
-        // Stream output, filtering known-benign seccomp/GPG warnings
+        val lines = mutableListOf<String>()
         val reader = process.inputStream.bufferedReader()
         var line: String?
+        // Only truly benign Termux/bionic noise is hidden. In particular
+        // "W: Failed to fetch" and GPG/fetch errors are shown: they are the
+        // only evidence of why TUR failed.
         val skipPatterns = listOf(
             "Bad system call", "pre-installation script", "post-installation script",
             "dependency problems, but configuring anyway",
-            "Errors were encountered while processing:",
-            "W: GPG error:", "Couldn't execute", "apt-key",
-            "W: Failed to fetch", "The following signatures couldn't be verified",
             "installed tur-repo package", "new nodejs package"
         )
         while (reader.readLine().also { line = it } != null) {
             val text = line!!
-            if (text.isNotBlank() && !skipPatterns.any { text.contains(it) }) {
+            lines += text
+            if (text.isBlank()) continue
+            if (text.contains("Failed to fetch") ||
+                text.contains("Unable to fetch") ||
+                text.contains("Could not connect") ||
+                text.contains("Temporary failure") ||
+                text.startsWith("E:")
+            ) {
+                lastInstallError = text.trim()
+            }
+            if (quiet) {
+                Log.i(TAG, text)
+                continue
+            }
+            if (!skipPatterns.any { text.contains(it) }) {
                 emitOutput("  $text\n")
+                if (text.startsWith("Get:") || text.startsWith("Fetched ")) {
+                    _setupState.value = SetupProgress(
+                        State.INSTALLING_PACKAGES,
+                        text.take(140),
+                        50
+                    )
+                }
             }
         }
         val exitCode = process.waitFor()
-        return exitCode == 0
+        return AptResult(exitCode, lines)
+    }
+
+    private data class DownloadSpec(
+        val url: String,
+        val filename: String,
+        val size: Long,
+        val sha256: String?
+    )
+
+    /**
+     * Ask apt for the exact URLs of everything code-server needs without
+     * downloading it. Lines look like:
+     *   'https://tur.../code-server_4.143.1_aarch64.deb' code-server_...deb 102502792 SHA256:04e...
+     *
+     * TUR currently 302-redirects each .deb to a GitHub release asset.
+     * HttpURLConnection follows that redirect for every Range request, so
+     * each worker gets a fresh signed URL instead of one that can expire
+     * during a very slow download.
+     */
+    private fun resolveDownloadUris(pkg: String): List<DownloadSpec> {
+        val result = runApt("install", "-y", "-d", "--print-uris", pkg, quiet = true)
+        if (result.exitCode != 0) {
+            lastInstallError = result.lines.lastOrNull {
+                it.contains("Failed to fetch") || it.startsWith("E:")
+            }?.trim() ?: "apt --print-uris failed"
+            return emptyList()
+        }
+        val regex = Regex("""'([^']+)'\s+(\S+\.deb)\s+(\d+)(?:\s+(\S+))?""")
+        val specs = mutableListOf<DownloadSpec>()
+        for (line in result.lines) {
+            val m = regex.find(line) ?: continue
+            val url = m.groupValues[1]
+            val rawName = m.groupValues[2]
+            val uriName = try {
+                URI(url).path?.substringAfterLast('/')
+            } catch (_: Exception) {
+                null
+            }
+            val filename = (uriName ?: rawName).takeIf {
+                it.endsWith(".deb") && !it.contains('/') && !it.contains("..")
+            } ?: continue
+            val size = m.groupValues[3].toLongOrNull() ?: 0L
+            val token = m.groupValues[4]
+            val sha = token.substringAfter(':', token).lowercase().takeIf {
+                it.length == 64 && it.all { c -> c in '0'..'9' || c in 'a'..'f' }
+            }
+            specs += DownloadSpec(url, filename, size, sha)
+        }
+        return specs.distinctBy { it.filename }
+    }
+
+    // ─── Parallel Range downloader ────────────────────────────
+
+    private class RangeUnsupportedException(message: String) : IOException(message)
+
+    private fun cleanupPartialDownloads(specs: List<DownloadSpec>) {
+        val dir = File(varDir, "cache/apt/archives")
+        for (spec in specs) {
+            File(dir, "${spec.filename}.part").delete()
+            for (i in 0 until MAX_RANGE_CONNECTIONS) {
+                File(dir, "${spec.filename}.part$i").delete()
+            }
+        }
+    }
+
+    private fun downloadDebs(specs: List<DownloadSpec>): Boolean {
+        val archivesDir = File(varDir, "cache/apt/archives").apply { mkdirs() }
+        val totalBytes = specs.sumOf { if (it.size > 0) it.size else 1L }
+        var completedBefore = 0L
+        val startedAt = System.nanoTime()
+
+        for (spec in specs) {
+            val dest = File(archivesDir, spec.filename)
+            if (isCompleteDeb(dest, spec)) {
+                cleanupPartialDownloads(listOf(spec))
+                completedBefore += if (spec.size > 0) spec.size else dest.length()
+                continue
+            }
+            val lastReport = AtomicLong(0L)
+            val ok = try {
+                downloadOne(spec, dest) { done, _ ->
+                    val now = System.nanoTime()
+                    if (now - lastReport.get() >= 2_000_000_000L) {
+                        lastReport.set(now)
+                        val overall = completedBefore + done
+                        val pct = if (totalBytes > 0) {
+                            ((overall * 100) / totalBytes).toInt().coerceIn(0, 100)
+                        } else 0
+                        val seconds = ((now - startedAt) / 1e9).coerceAtLeast(0.1)
+                        val speed = (overall / 1024.0 / seconds).toInt()
+                        _setupState.value = SetupProgress(
+                            State.INSTALLING_PACKAGES,
+                            "Downloading ${spec.filename}... $pct% " +
+                                "(${overall / (1024 * 1024)}/${totalBytes / (1024 * 1024)} MB, $speed KB/s)",
+                            42 + pct * 28 / 100
+                        )
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Download failed for ${spec.filename}: ${e.message}", e)
+                lastInstallError = "download ${spec.filename}: ${e.message}"
+                false
+            }
+            if (!ok) {
+                emitOutput("[net] Failed while downloading ${spec.filename}.\n")
+                return false
+            }
+            completedBefore += if (spec.size > 0) spec.size else dest.length()
+            emitOutput("[net] Downloaded ${spec.filename} (${dest.length() / (1024 * 1024)} MB)\n")
+        }
+        return true
+    }
+
+    private fun downloadOne(
+        spec: DownloadSpec,
+        dest: File,
+        onProgress: (Long, Long) -> Unit
+    ): Boolean {
+        if (dest.exists() && !isCompleteDeb(dest, spec)) dest.delete()
+        val size = if (spec.size > 0) spec.size else contentLength(spec.url)
+        if (size <= 0) return downloadSingle(spec, dest, null, onProgress)
+
+        val connections = when {
+            size >= 32L * 1024 * 1024 -> MAX_RANGE_CONNECTIONS
+            size >= 8L * 1024 * 1024 -> 6
+            size >= 2L * 1024 * 1024 -> 4
+            else -> 1
+        }
+        if (connections <= 1) return downloadSingle(spec, dest, size, onProgress)
+
+        return try {
+            downloadRanged(spec, dest, size, connections, onProgress)
+        } catch (e: RangeUnsupportedException) {
+            Log.i(TAG, "Range not supported for ${spec.filename}; using single stream")
+            for (i in 0 until connections) {
+                File(dest.parentFile, "${dest.name}.part$i").delete()
+            }
+            downloadSingle(spec, dest, size, onProgress)
+        }
+    }
+
+    private fun downloadRanged(
+        spec: DownloadSpec,
+        dest: File,
+        size: Long,
+        connections: Int,
+        onProgress: (Long, Long) -> Unit
+    ): Boolean {
+        val segments = minOf(connections, ((size + 4L * 1024 * 1024 - 1) / (4L * 1024 * 1024)).toInt())
+            .coerceAtLeast(1)
+        if (segments <= 1) return downloadSingle(spec, dest, size, onProgress)
+        val segmentSize = (size + segments - 1) / segments
+        val downloaded = AtomicLong(0L)
+        val abort = AtomicBoolean(false)
+
+        // Resume any parts left by a previous app run. Guard against parts
+        // larger than the current segment (e.g. a repo switched versions).
+        for (i in 0 until segments) {
+            val start = i.toLong() * segmentSize
+            val end = minOf(size - 1, start + segmentSize - 1)
+            val expected = end - start + 1
+            val part = File(dest.parentFile, "${dest.name}.part$i")
+            if (part.length() > expected) part.delete()
+            downloaded.addAndGet(part.length())
+        }
+
+        val pool = Executors.newFixedThreadPool(segments)
+        try {
+            val tasks: List<Callable<Boolean>> = (0 until segments).map { index ->
+                Callable {
+                    val start = index.toLong() * segmentSize
+                    val end = minOf(size - 1, start + segmentSize - 1)
+                    downloadSegment(
+                        spec.url, dest, index, start, end,
+                        downloaded, abort, onProgress, size
+                    )
+                }
+            }
+            val futures = pool.invokeAll(tasks)
+            var rangeUnsupported = false
+            for (future in futures) {
+                try {
+                    if (!future.get()) {
+                        abort.set(true)
+                        return false
+                    }
+                } catch (e: ExecutionException) {
+                    if (e.cause is RangeUnsupportedException) {
+                        rangeUnsupported = true
+                    } else {
+                        Log.w(TAG, "Segment failure: ${e.cause?.message}", e.cause)
+                        abort.set(true)
+                        return false
+                    }
+                }
+            }
+            if (rangeUnsupported) throw RangeUnsupportedException("server ignored Range")
+            if (!mergeSegments(spec, dest, segments, size)) return false
+            for (i in 0 until segments) {
+                File(dest.parentFile, "${dest.name}.part$i").delete()
+            }
+            return true
+        } finally {
+            pool.shutdownNow()
+        }
+    }
+
+    private fun downloadSegment(
+        url: String,
+        dest: File,
+        index: Int,
+        start: Long,
+        end: Long,
+        downloaded: AtomicLong,
+        abort: AtomicBoolean,
+        onProgress: (Long, Long) -> Unit,
+        total: Long
+    ): Boolean {
+        val part = File(dest.parentFile, "${dest.name}.part$index")
+        val expected = end - start + 1
+        if (part.length() > expected) part.delete()
+        var attempt = 0
+        while (attempt < 5 && !abort.get()) {
+            val have = if (part.exists()) part.length() else 0L
+            if (have >= expected) return true
+            var conn: HttpURLConnection? = null
+            try {
+                conn = openHttp(url)
+                conn.setRequestProperty("Range", "bytes=${start + have}-$end")
+                when (val code = conn.responseCode) {
+                    HttpURLConnection.HTTP_PARTIAL -> {
+                        val contentRange = conn.getHeaderField("Content-Range")
+                        if (contentRange != null && !contentRange.startsWith("bytes ${start + have}-")) {
+                            throw IOException("unexpected Content-Range: $contentRange")
+                        }
+                        var remaining = expected - have
+                        conn.inputStream.use { input ->
+                            FileOutputStream(part, true).use { output ->
+                                val buffer = ByteArray(64 * 1024)
+                                while (remaining > 0 && !abort.get()) {
+                                    val count = input.read(buffer)
+                                    if (count == -1) break
+                                    val toWrite = minOf(count.toLong(), remaining).toInt()
+                                    output.write(buffer, 0, toWrite)
+                                    downloaded.addAndGet(toWrite.toLong())
+                                    remaining -= toWrite
+                                    onProgress(downloaded.get(), total)
+                                }
+                            }
+                        }
+                        if (remaining > 0) throw IOException("short segment, missing $remaining bytes")
+                        return true
+                    }
+                    HttpURLConnection.HTTP_OK -> {
+                        abort.set(true)
+                        throw RangeUnsupportedException("server returned 200 for a Range request")
+                    }
+                    HttpURLConnection.HTTP_ENTITY_TOO_LARGE,
+                    416 -> {
+                        if (part.length() == expected) return true
+                        part.delete()
+                        throw IOException("HTTP $code for segment")
+                    }
+                    else -> throw IOException("HTTP $code")
+                }
+            } catch (e: RangeUnsupportedException) {
+                throw e
+            } catch (e: Exception) {
+                attempt++
+                Log.w(TAG, "Segment $index attempt $attempt failed: ${e.message}")
+                if (attempt >= 5) return false
+                try {
+                    Thread.sleep(minOf(5000L, 1000L * attempt))
+                } catch (_: InterruptedException) {
+                    return false
+                }
+            } finally {
+                conn?.disconnect()
+            }
+        }
+        return part.length() == expected
+    }
+
+    private fun mergeSegments(spec: DownloadSpec, dest: File, segments: Int, size: Long): Boolean {
+        val parts = (0 until segments).map { File(dest.parentFile, "${dest.name}.part$it") }
+        if (parts.any { !it.isFile }) return false
+        val total = parts.sumOf { it.length() }
+        if (total != size) {
+            lastInstallError = "download size mismatch for ${spec.filename} ($total/$size)"
+            return false
+        }
+        // Append into part0 instead of allocating a second full-size temp file:
+        // code-server is 102 MB and phone storage is often tight.
+        val first = parts[0]
+        try {
+            FileOutputStream(first, true).use { output ->
+                for (i in 1 until parts.size) {
+                    parts[i].inputStream().use { input -> input.copyTo(output) }
+                }
+            }
+        } catch (e: Exception) {
+            lastInstallError = "cannot merge ${spec.filename}: ${e.message}"
+            return false
+        }
+        if (spec.sha256 != null) {
+            val actual = sha256File(first)
+            if (!actual.equals(spec.sha256, ignoreCase = true)) {
+                lastInstallError = "SHA-256 mismatch for ${spec.filename}"
+                parts.forEach { it.delete() }
+                return false
+            }
+        }
+        dest.delete()
+        if (!first.renameTo(dest)) return false
+        parts.drop(1).forEach { it.delete() }
+        return true
+    }
+
+    private fun downloadSingle(
+        spec: DownloadSpec,
+        dest: File,
+        knownSize: Long?,
+        onProgress: (Long, Long) -> Unit
+    ): Boolean {
+        val part = File(dest.parentFile, "${dest.name}.part")
+        var attempt = 0
+        while (attempt < 5) {
+            var have = if (part.exists()) part.length() else 0L
+            if (knownSize != null && knownSize > 0 && have == knownSize) {
+                if (finishSingle(spec, part, dest)) return true
+                have = 0L
+            }
+            var conn: HttpURLConnection? = null
+            try {
+                conn = openHttp(spec.url)
+                if (have > 0) conn.setRequestProperty("Range", "bytes=$have-")
+                var code = conn.responseCode
+                if (code == HttpURLConnection.HTTP_OK && have > 0) {
+                    // Server ignored the Range header: restart from byte 0.
+                    part.delete()
+                    have = 0L
+                }
+                if (code != HttpURLConnection.HTTP_OK && code != HttpURLConnection.HTTP_PARTIAL) {
+                    throw IOException("HTTP $code")
+                }
+                if (code == HttpURLConnection.HTTP_PARTIAL) {
+                    val contentRange = conn.getHeaderField("Content-Range")
+                    if (contentRange != null && !contentRange.startsWith("bytes $have-")) {
+                        part.delete()
+                        have = 0L
+                        throw IOException("unexpected Content-Range: $contentRange")
+                    }
+                }
+                val contentLength = conn.contentLengthLong
+                val total = when {
+                    knownSize != null && knownSize > 0 -> knownSize
+                    contentLength > 0 -> have + contentLength
+                    else -> -1L
+                }
+                conn.inputStream.use { input ->
+                    FileOutputStream(part, true).use { output ->
+                        val buffer = ByteArray(64 * 1024)
+                        var count: Int
+                        while (input.read(buffer).also { count = it } != -1) {
+                            output.write(buffer, 0, count)
+                            have += count
+                            onProgress(have, total)
+                        }
+                    }
+                }
+                if (total > 0 && part.length() != total) {
+                    throw IOException("short download (${part.length()}/$total)")
+                }
+                if (finishSingle(spec, part, dest)) return true
+                throw IOException("checksum/rename failed")
+            } catch (e: Exception) {
+                attempt++
+                Log.w(TAG, "Download ${spec.filename} attempt $attempt failed: ${e.message}")
+                if (attempt >= 5) return false
+                try {
+                    Thread.sleep(minOf(5000L, 1000L * attempt))
+                } catch (_: InterruptedException) {
+                    return false
+                }
+            } finally {
+                conn?.disconnect()
+            }
+        }
+        return false
+    }
+
+    private fun finishSingle(spec: DownloadSpec, part: File, dest: File): Boolean {
+        if (!part.isFile || part.length() == 0L) return false
+        if (spec.size > 0 && part.length() != spec.size) return false
+        if (spec.sha256 != null && !sha256File(part).equals(spec.sha256, ignoreCase = true)) {
+            part.delete()
+            lastInstallError = "SHA-256 mismatch for ${spec.filename}"
+            return false
+        }
+        dest.delete()
+        return part.renameTo(dest)
+    }
+
+    private fun contentLength(url: String): Long {
+        var conn: HttpURLConnection? = null
+        return try {
+            conn = openHttp(url)
+            conn.requestMethod = "HEAD"
+            conn.responseCode
+            conn.contentLengthLong
+        } catch (_: Exception) {
+            -1L
+        } finally {
+            conn?.disconnect()
+        }
+    }
+
+    private fun openHttp(url: String): HttpURLConnection {
+        val conn = URL(url).openConnection() as HttpURLConnection
+        conn.instanceFollowRedirects = true
+        conn.connectTimeout = 20_000
+        conn.readTimeout = 60_000
+        conn.useCaches = false
+        conn.setRequestProperty("User-Agent", "AMCode/1.0 (Android)")
+        conn.setRequestProperty("Accept", "*/*")
+        conn.setRequestProperty("Accept-Encoding", "identity")
+        return conn
+    }
+
+    private fun isCompleteDeb(file: File, spec: DownloadSpec): Boolean {
+        if (!file.isFile || file.length() == 0L) return false
+        if (spec.size > 0 && file.length() != spec.size) return false
+        if (spec.sha256 != null && !sha256File(file).equals(spec.sha256, ignoreCase = true)) {
+            return false
+        }
+        return true
+    }
+
+    private fun sha256File(file: File): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        file.inputStream().use { input ->
+            val buffer = ByteArray(64 * 1024)
+            var count: Int
+            while (input.read(buffer).also { count = it } != -1) {
+                digest.update(buffer, 0, count)
+            }
+        }
+        return digest.digest().joinToString("") { "%02x".format(it.toInt() and 0xff) }
     }
 }

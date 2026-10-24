@@ -124,14 +124,16 @@ A 在修复过程中还完成了真正的首次安装验证：
 ## 4. 仍未解决 / 残余风险
 
 1. **`--auth none` 仍在**：已只 bind `127.0.0.1`，LAN 暴露消除；但 Android loopback 不隔离 app，同机其他有 INTERNET 权限的 app 仍可访问 code-server 终端。要彻底解决需随机 token / 认证代理。
-2. **扩展/native 模块**：运行日志仍有 `spdlog.node` 的 libc++ 符号错误、`ripgrep-universal/.../rg ENOENT`。UI 可用，但 extension host/搜索功能不完整；这是 TUR code-server 的 native 模块与 bootstrap ABI/绝对 symlink 问题，不是本次 pkg 修复能覆盖的。
+2. **扩展/native 模块**：`ripgrep` 的 13 个绝对链接已修复，libc++30 已安装，`spdlog`/`@parcel/watcher` 现在能加载；但 Linux/glibc native 扩展（如 glibc 版 `watcher.node`）在 bionic 上仍会 `libstdc++.so.6 not found`。纯 JS/语言包/主题可用，Microsoft Marketplace 仍不支持。
 3. **`/sdcard` 工作区**：默认仍是外部 `/sdcard/AMCode`；Git/编译产物/noexec 的官方限制仍在（`HomePrefs` 允许内部，但没有 UI 切换）。
-4. **键盘 IME**：按“不要过度扩展”要求未做 inset/padding 重构，键盘遮挡仍可能。
+4. **键盘 IME**：已修（`terminal_output` 抢 IME + IME inset）；扩展搜索框一次点击可弹出键盘，WebView 缩到 `0,0-1600,551`。终端输入仍需用户实测确认。
 5. **孤儿 code-server**：硬杀 app 进程仍可能留下旧进程；动态端口避免误判，但没有 PID 文件/进程树清理。
 6. **API 26–29 未实测**：代码已加运行时权限和 fallback，但需要在 API 28/29 模拟器上验证 grant/deny。
 7. **启动耗时**：`ensurePkgSetup` 每次启动约 8 秒（扫描 1163 symlink + DB），可后续加版本 marker/轻量检查优化。
 8. **release APK 未安装**：release 已构建（64.48MB），debug 已验证；release 签名与 debug 不同，不能直接覆盖安装。
 9. **`$HOME/.dpkg.cfg` warning**：`dpkg --audit` 会提示 `/storage/emulated/0/AMCode/.dpkg.cfg` 权限不足；不影响安装，但外部 HOME 的副作用仍在。
+10. **Workspace Trust**：打开未信任文件夹时，用户扩展会被 Restricted Mode 禁用，需要点 Trust；未默认加 `--disable-workspace-trust`（安全取舍）。
+11. **Git 未安装**：`$PREFIX/bin/git` 不存在，Git 相关扩展会报 “Git installation not found”。
 
 ---
 
@@ -165,11 +167,43 @@ clang --version
 
 ---
 
-## 6. 建议下一步
+## 6. 第二轮修复（2026-10-24 晚）
 
-1. 在 API 28/29 AVD 上跑存储授权/拒绝回归。
-2. 给 `ensurePkgSetup` 加版本 marker，避免每次启动 8 秒。
-3. 解决 extension host 的 `spdlog`/`ripgrep` native 问题（TUR 包 ABI 或补 symlink）。
-4. 加 code-server token/auth，彻底解决同机 loopback 访问。
-5. 决定 `/sdcard` 与内部 HOME 的产品策略；把 Git/编译推荐路径写进 UI。
-6. 把本轮改动 commit（当前未提交），再打 release tag；release APK 安装前需卸载 debug（签名不同）。
+针对用户反馈的三个问题做了第二批：
+
+### 6.1 WebView 输入框不聚焦
+
+**根因（已实测）**：`loading_overlay` 虽然 GONE，但其中 `textIsSelectable="true"` 的 `terminal_output` TextView 在启动时抢到了 Android focus；`dumpsys input_method` 显示 `mServedView=...terminal_output`，Chromium 的 `showSoftInput()` 被系统以 “view is not served” 丢弃。按钮不需要 IME 所以正常，输入框表现为点很多次才偶尔成功。
+
+**修复**：
+
+- `activity_main.xml`：根布局加 `@id/root`；WebView `focusable/focusableInTouchMode/clickable`；overlay `descendantFocusability=blocksDescendants` 且不可聚焦；日志 TextView/ScrollView 不可聚焦。
+- `MainActivity.kt`：`ensureWebViewFocus()` 在 `onPageFinished`/`onWindowFocusChanged`/`onResume`/`ACTION_DOWN` 时把 Android focus 和 IME served view 拉到 WebView；IME bottom inset 转成 WebView bottom margin，键盘弹出时 WebView 从 `0,0-1600,1200` 缩到 `0,0-1600,551`；JS focus shim 仅处理 input/textarea/contenteditable/xterm helper textarea，不抢按钮/链接。
+- **实测**：冷启动 `mServedView=WebView`；扩展搜索框一次点击 `mInputShown=true`，键盘出现，WebView 缩到 551；不再出现 “Ignoring showSoftInput”。截图：[`review-assets/batch2-focus.png`](review-assets/batch2-focus.png)。
+
+### 6.2 首次安装网络
+
+**事实**：TUR 没有可用镜像；所有 deb 302 到 GitHub release assets。坏网络单连接约 20–31KB/s。
+
+**修复**：
+
+- 默认 APK：apt 解析 TUR 依赖后，用 Kotlin **8 连接 HTTP Range** 下载大 deb，支持断点续传、SHA256、进度/错误回显，失败回退 apt；默认 APK 不增大。
+- opt-in `-PofflineBundle=true`：把 code-server 4.143.1 + nodejs-24 24.18.0 两个大 deb 打包进 APK（+127MB，APK 约 199MB），首次只从快速主镜像拉 ~18MB 依赖，完全不访问 TUR。
+- **实测**：清空 app 数据后首次启动，日志出现
+  `[net] Downloading 16 package(s) with HTTP Range (up to 8 connections)...`，
+  随后 `[net] Downloaded nodejs-24...`；速度明显高于单连接。完整 139MB 下载/安装仍需几分钟；离线 bundle 可彻底去掉 TUR 依赖。
+- 新增 `ensureLibCpp30()`：检测 `libc++_shared.so` 是否含 `_ZNSt6__ndk113__hash_memoryEPKvm`，缺失则 `apt install -y libc++`，实测把 29 升到 30；`spdlog`/`@parcel/watcher` 错误消失。
+
+### 6.3 扩展兼容
+
+- **ripgrep**：TUR 包 13 个 `@vscode/ripgrep-universal/bin/*/rg` 都是指向 `/data/data/com.termux/...` 的绝对 symlink；启动时全部重链到 `$PREFIX/bin/rg`，`rg --version` = 15.2.0。
+- **Platform shim**：默认开启 `android-as-linux.js`；由于 VS Code fork 扩展宿主前会删除 `NODE_OPTIONS`，shim 在主进程把 `--require` 追加到 `process.execArgv`，扩展宿主真正看到 `linux`；fileWatcher/ptyHost/terminal 保持 `android`。
+- **实测**：扩展宿主 cmdline 带 `--require .../android-as-linux.js`；`spdlog` 不再报错；`rg` 可执行；纯 JS 语言包/editorconfig 可安装激活；glibc native 扩展仍失败。
+- Kill switch：`$HOME/.amcode/disable-platform-shim` 或 `AMCODE_ANDROID_PLATFORM_SHIM=0`。
+
+### 6.4 残余
+
+- 默认在线路径完整安装仍需数分钟（TUR/GitHub 限速不是代码能完全消除的）；真正“无 TUR”用 opt-in bundle。
+- 运行时的 Range 下载、bundle 首次安装路径仍需更多网络环境验证；本次已看到并行下载启动和 nodejs 完成。
+- Linux/glibc native 扩展仍然不可用；需要 proot/glibc 用户态或 VHEditor 式 patched code-server。
+- Workspace Trust、Git 未安装、API 26–29、孤儿进程、8 秒 setup 等仍在 backlog。

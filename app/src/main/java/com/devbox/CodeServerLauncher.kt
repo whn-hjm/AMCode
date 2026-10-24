@@ -14,11 +14,14 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.BufferedReader
 import java.io.File
+import java.io.FileOutputStream
 import java.io.InputStreamReader
 import java.net.HttpURLConnection
 import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.URL
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
 import java.util.concurrent.TimeUnit
 
 /**
@@ -38,6 +41,22 @@ object CodeServerLauncher {
     private const val BIND_HOST = "127.0.0.1"
     private const val READY_TIMEOUT_SECONDS = 60
     private const val STOP_GRACE_SECONDS = 5L
+
+    // ─── Android-as-Linux platform shim (experimental, on by default) ────────
+    // code-server maps process.platform=android to target platform "web", so
+    // the server refuses to install/run non-Web extensions.  The official
+    // code-server/Termux workaround is to require a script that makes
+    // process.platform report "linux".  It is scoped to the code-server main
+    // process and the extension host only (see android-as-linux.js), and can be
+    // killed with $HOME/.amcode/disable-platform-shim or
+    // AMCODE_ANDROID_PLATFORM_SHIM=0.  Linux native extensions (glibc) still
+    // cannot run on bionic.
+    private const val PLATFORM_SHIM_ASSET = "android-as-linux.js"
+    private const val PLATFORM_SHIM_PATH = "libexec/amcode/android-as-linux.js"
+    private const val PLATFORM_SHIM_ENV = "AMCODE_ANDROID_PLATFORM_SHIM"
+    private const val PLATFORM_SHIM_DISABLE_FILE = ".amcode/disable-platform-shim"
+    private const val PLATFORM_SHIM_APP_DISABLE_FILE = ".amcode-disable-platform-shim"
+    private const val PLATFORM_SHIM_DEFAULT_ENABLED = true
 
     enum class ServerState {
         STOPPED, STARTING, RUNNING, STOPPING, ERROR
@@ -140,6 +159,13 @@ object CodeServerLauncher {
             env["SHELL"] = TermuxManager.getShell()
             env["CS_DISABLE_TELEMETRY"] = "true"
             env["CS_DISABLE_UPDATE_CHECK"] = "true"
+
+            // The TUR code-server package ships `rg` as an absolute symlink to
+            // /data/data/com.termux/..., which does not exist in our rebranded
+            // prefix.  Repair the links before node/VS Code resolves them.
+            repairRipgrep()
+            configurePlatformShim(env)
+
             val userDataDir = File(App.instance.filesDir, ".code-server-data").absolutePath
             val extDir = File(App.instance.filesDir, ".code-server-extensions").absolutePath
             val home = TermuxManager.homeDir
@@ -210,6 +236,226 @@ object CodeServerLauncher {
             }
 
             _status.value = ServerStatus(ServerState.RUNNING, "Server running", port, url, pid)
+        }
+    }
+
+    // ─── Runtime repairs / compatibility ─────────────────────────────────────
+
+    /**
+     * TUR's code-server package installs @vscode/ripgrep-universal with one
+     * absolute symlink per platform directory:
+     *
+     *   bin/<platform>/rg -> /data/data/com.termux/files/usr/bin/rg
+     *
+     * Our rebranded prefix is /data/data/com.devbox/files/usr, so those links
+     * are dangling and VS Code search fails with ENOENT.  Repair every link
+     * (android-x64 today; linux-x64/linux-arm64 once the platform shim is on)
+     * so it points at the Termux rg that ships in $PREFIX/bin.  If symlinks are
+     * not supported by the filesystem, fall back to copying the real binary.
+     */
+    private fun repairRipgrep() {
+        val realRg = File(TermuxManager.binDir, "rg")
+        if (!realRg.isFile) {
+            Log.w(TAG, "ripgrep repair skipped: $realRg is missing")
+            return
+        }
+        if (!realRg.canExecute()) realRg.setExecutable(true, false)
+
+        var repaired = 0
+        var candidates = 0
+        for (root in codeServerPackageRoots()) {
+            val binRoot = File(root, "lib/vscode/node_modules/@vscode/ripgrep-universal/bin")
+            if (binRoot.isDirectory) {
+                binRoot.listFiles()?.forEach { platformDir ->
+                    if (platformDir.isDirectory) {
+                        candidates++
+                        if (repairRipgrepLink(File(platformDir, "rg"), realRg)) repaired++
+                    }
+                }
+            }
+            // Older @vscode/ripgrep layout (single binary, no platform dirs).
+            val legacy = File(root, "lib/vscode/node_modules/@vscode/ripgrep/bin/rg")
+            if (legacy.parentFile?.isDirectory == true) {
+                candidates++
+                if (repairRipgrepLink(legacy, realRg)) repaired++
+            }
+        }
+        Log.i(TAG, "ripgrep repair: $repaired/$candidates link(s) updated -> $realRg")
+        if (repaired > 0) verifyRipgrep(realRg)
+    }
+
+    /** Known locations for the code-server package (apt/TUR and npm -g). */
+    private fun codeServerPackageRoots(): List<File> {
+        val lib = File(TermuxManager.usrDir, "lib")
+        return listOf(
+            File(lib, "code-server"),              // Termux/TUR apt package
+            File(lib, "node_modules/code-server")  // npm install -g code-server
+        ).distinct()
+    }
+
+    private fun repairRipgrepLink(link: File, realRg: File): Boolean {
+        val parent = link.parentFile ?: return false
+        if (!parent.isDirectory) return false
+        val linkPath = link.toPath()
+        val realPath = realRg.toPath().toAbsolutePath().normalize()
+
+        if (Files.isSymbolicLink(linkPath)) {
+            val target = try {
+                Files.readSymbolicLink(linkPath)
+            } catch (e: Exception) {
+                Log.w(TAG, "Cannot read ripgrep symlink $link: ${e.message}")
+                null
+            }
+            if (target != null) {
+                val resolved = try {
+                    if (target.isAbsolute) target.normalize()
+                    else parent.toPath().resolve(target).normalize()
+                } catch (_: Exception) {
+                    null
+                }
+                val pointsAtReal = resolved != null && resolved == realPath
+                // /data/user/0/... and /data/data/... are the same file; compare
+                // inode identity as well as the textual path.
+                val sameFile = try {
+                    Files.exists(linkPath) && Files.isSameFile(linkPath, realPath)
+                } catch (_: Exception) {
+                    false
+                }
+                if (pointsAtReal || sameFile) return false
+            }
+        } else if (link.exists()) {
+            // A real binary is already present (some packages copy rg instead
+            // of symlinking).  Just make sure it is executable.
+            if (!link.canExecute()) link.setExecutable(true, false)
+            return false
+        }
+
+        return try {
+            Files.deleteIfExists(linkPath)
+            Files.createSymbolicLink(linkPath, realPath)
+            Log.i(TAG, "ripgrep: relinked $link -> $realPath")
+            true
+        } catch (e: Exception) {
+            Log.w(TAG, "Cannot relink $link (${e.message}); copying rg instead")
+            try {
+                Files.deleteIfExists(linkPath)
+                Files.copy(realPath, linkPath, StandardCopyOption.REPLACE_EXISTING)
+                link.setExecutable(true, false)
+                link.setReadable(true, false)
+                true
+            } catch (e2: Exception) {
+                Log.e(TAG, "Cannot repair ripgrep path $link", e2)
+                false
+            }
+        }
+    }
+
+    /** Log `rg --version` after a repair; failures must not abort startup. */
+    private fun verifyRipgrep(realRg: File) {
+        try {
+            val process = ProcessBuilder(realRg.absolutePath, "--version")
+                .redirectErrorStream(true)
+                .start()
+            val output = BufferedReader(InputStreamReader(process.inputStream)).use { it.readText() }
+            val finished = process.waitFor(5, TimeUnit.SECONDS)
+            if (!finished) process.destroyForcibly()
+            val firstLine = output.lineSequence().firstOrNull().orEmpty()
+            if (finished && process.exitValue() == 0) {
+                Log.i(TAG, "rg --version OK: $firstLine")
+            } else {
+                Log.w(TAG, "rg --version failed: $firstLine")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "rg --version could not run: ${e.message}")
+        }
+    }
+
+    /**
+     * Adds `NODE_OPTIONS=--require .../android-as-linux.js` so code-server sees
+     * platform linux and stops treating Android as target platform "web".
+     * Enabled by default; the kill switch is
+     * $HOME/.amcode/disable-platform-shim or AMCODE_ANDROID_PLATFORM_SHIM=0.
+     * The shim script only changes the main code-server process and the
+     * extension host; the integrated terminal, npm, file watcher and pty host
+     * keep reporting android.  VS Code strips NODE_OPTIONS from the extension
+     * host environment, so the shim also forwards itself through
+     * process.execArgv (code-server passes execArgv to forked children).
+     */
+    private fun configurePlatformShim(env: MutableMap<String, String>) {
+        if (!isPlatformShimEnabled(env)) {
+            env[PLATFORM_SHIM_ENV] = "0"
+            Log.i(
+                TAG,
+                "Android-as-Linux platform shim disabled; kill switch is " +
+                    "${File(TermuxManager.homeDir, PLATFORM_SHIM_DISABLE_FILE)} " +
+                    "(or $PLATFORM_SHIM_ENV=0)"
+            )
+            return
+        }
+
+        val shim = installPlatformShimAsset()
+        if (shim == null) {
+            env[PLATFORM_SHIM_ENV] = "0"
+            Log.w(TAG, "Platform shim requested but could not be installed; keeping android platform")
+            return
+        }
+
+        env[PLATFORM_SHIM_ENV] = "1"
+        val existing = env["NODE_OPTIONS"]?.trim().orEmpty()
+        val nodeOptions = if (existing.isEmpty()) {
+            "--require ${shim.absolutePath}"
+        } else {
+            "$existing --require ${shim.absolutePath}"
+        }
+        env["NODE_OPTIONS"] = nodeOptions
+        Log.i(TAG, "Android-as-Linux platform shim enabled: NODE_OPTIONS=$nodeOptions")
+    }
+
+    private fun isPlatformShimEnabled(env: Map<String, String>): Boolean {
+        val appFiles = App.instance.filesDir
+        val home = TermuxManager.homeDir
+
+        // Explicit opt-out always wins.
+        val disabled = File(home, PLATFORM_SHIM_DISABLE_FILE).exists() ||
+            File(appFiles, PLATFORM_SHIM_APP_DISABLE_FILE).exists()
+        if (disabled) return false
+
+        val requested = (env[PLATFORM_SHIM_ENV] ?: System.getenv(PLATFORM_SHIM_ENV))
+            ?.trim()
+            ?.lowercase()
+        when (requested) {
+            "0", "false", "off", "no" -> return false
+            "1", "true", "on", "yes" -> return true
+        }
+
+        return PLATFORM_SHIM_DEFAULT_ENABLED
+    }
+
+    private fun installPlatformShimAsset(): File? {
+        val dest = File(TermuxManager.usrDir, PLATFORM_SHIM_PATH)
+        val parent = dest.parentFile ?: return null
+        return try {
+            parent.mkdirs()
+            // Temp file + rename so a killed process cannot leave a truncated
+            // require() target behind.
+            val tmp = File(parent, "${dest.name}.tmp")
+            App.instance.assets.open(PLATFORM_SHIM_ASSET).use { input ->
+                FileOutputStream(tmp).use { output -> input.copyTo(output) }
+            }
+            tmp.setReadable(true, false)
+            if (!tmp.renameTo(dest)) {
+                dest.delete()
+                if (!tmp.renameTo(dest)) {
+                    tmp.delete()
+                    Log.w(TAG, "Cannot install platform shim at $dest")
+                    return null
+                }
+            }
+            dest.setReadable(true, false)
+            dest
+        } catch (e: Exception) {
+            Log.e(TAG, "Cannot install platform shim from assets", e)
+            null
         }
     }
 

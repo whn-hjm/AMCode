@@ -2,27 +2,38 @@
 <androidx.constraintlayout.widget.ConstraintLayout
     xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:id="@+id/root"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:background="@color/background_dark"
     android:fitsSystemWindows="false">
 
-    <!-- WebView: loads code-server (hidden behind overlay until ready) -->
+    <!-- WebView: loads code-server (hidden behind overlay until ready).
+         It must be the only view that can own focus/IME; see the overlay's
+         descendantFocusability below. -->
     <WebView
         android:id="@+id/webview"
         android:layout_width="0dp"
         android:layout_height="0dp"
+        android:clickable="true"
+        android:focusable="true"
+        android:focusableInTouchMode="true"
         app:layout_constraintTop_toTopOf="parent"
         app:layout_constraintBottom_toBottomOf="parent"
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toEndOf="parent" />
 
-    <!-- Loading overlay -->
+    <!-- Loading overlay. It is only a progress/log surface: never let it (or
+         its selectable log TextView) take Android focus or the IME away from
+         the WebView. -->
     <androidx.constraintlayout.widget.ConstraintLayout
         android:id="@+id/loading_overlay"
         android:layout_width="0dp"
         android:layout_height="0dp"
         android:background="@color/background_dark"
+        android:descendantFocusability="blocksDescendants"
+        android:focusable="false"
+        android:focusableInTouchMode="false"
         android:visibility="visible"
         app:layout_constraintTop_toTopOf="parent"
         app:layout_constraintBottom_toBottomOf="parent"
@@ -102,6 +113,8 @@
             android:layout_marginEnd="16dp"
             android:layout_marginBottom="8dp"
             android:background="@color/surface_dark"
+            android:focusable="false"
+            android:focusableInTouchMode="false"
             android:padding="12dp"
             android:scrollbars="vertical"
             android:fadeScrollbars="false"
@@ -114,6 +127,8 @@
                 android:id="@+id/terminal_output"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
+                android:focusable="false"
+                android:focusableInTouchMode="false"
                 android:textColor="@color/accent_green"
                 android:textSize="11sp"
                 android:fontFamily="monospace"

@@ -17,6 +17,7 @@ import android.os.IBinder
 import android.provider.Settings
 import android.util.Log
 import android.view.KeyEvent
+import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
 import android.webkit.CookieManager
@@ -35,6 +36,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.constraintlayout.widget.ConstraintLayout
 import androidx.core.content.ContextCompat
+import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
@@ -65,6 +67,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private lateinit var webView: WebView
+    private lateinit var rootLayout: ConstraintLayout
     private lateinit var loadingOverlay: ConstraintLayout
     private lateinit var progressBar: ProgressBar
     private lateinit var statusText: TextView
@@ -198,12 +201,21 @@ class MainActivity : AppCompatActivity() {
 
             // Initialize views FIRST — before anything that touches them
             webView = findViewById(R.id.webview)
+            rootLayout = findViewById(R.id.root)
             loadingOverlay = findViewById(R.id.loading_overlay)
             progressBar = findViewById(R.id.progress_bar)
             statusText = findViewById(R.id.status_text)
             progressText = findViewById(R.id.progress_text)
             terminalOutput = findViewById(R.id.terminal_output)
             terminalScroll = findViewById(R.id.terminal_scroll)
+
+            // Never let the startup log/overlay become the IME-served view.
+            loadingOverlay.descendantFocusability =
+                android.view.ViewGroup.FOCUS_BLOCK_DESCENDANTS
+            terminalScroll.isFocusable = false
+            terminalScroll.isFocusableInTouchMode = false
+            terminalOutput.isFocusable = false
+            terminalOutput.isFocusableInTouchMode = false
 
             // Observe terminal output from TermuxManager
             lifecycleScope.launch {
@@ -218,6 +230,7 @@ class MainActivity : AppCompatActivity() {
             hideSystemBars()
 
             setupWebView()
+            setupImeInsets()
 
             // Handle back button in WebView
             onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
@@ -425,7 +438,7 @@ class MainActivity : AppCompatActivity() {
 
     // ─── WebView ──────────────────────────────────────────────
 
-    @SuppressLint("SetJavaScriptEnabled")
+    @SuppressLint("SetJavaScriptEnabled", "ClickableViewAccessibility")
     private fun setupWebView() {
         // Debugging bridge only in debug builds. Release must never expose
         // chrome://inspect to the local code-server page.
@@ -462,6 +475,24 @@ class MainActivity : AppCompatActivity() {
             builtInZoomControls = true
             displayZoomControls = false
             textZoom = 100
+        }
+
+        // The WebView must be the view that owns Android focus (and therefore
+        // the IME). The loading overlay's log TextView used to be focusable
+        // and ended up as the IME-served view, so every showSoftInput() from
+        // code-server was ignored with "view is not served".
+        webView.isFocusable = true
+        webView.isFocusableInTouchMode = true
+        webView.isClickable = true
+        webView.setOnTouchListener { _, event ->
+            // As a last-resort native fallback: move Android focus to the
+            // WebView as soon as the user touches it, before Chromium handles
+            // the event and asks for the keyboard. Returning false keeps all
+            // normal WebView touch/gesture behaviour intact.
+            if (event.actionMasked == MotionEvent.ACTION_DOWN && !webView.hasFocus()) {
+                webView.requestFocusFromTouch()
+            }
+            false
         }
 
         // Accept cookies for code-server session
@@ -521,20 +552,13 @@ class MainActivity : AppCompatActivity() {
                 progressBar.visibility = View.VISIBLE
                 progressText.text = ""
                 loadingOverlay.visibility = View.GONE
-                Log.i(TAG, "WebView page loaded: $url")
+                Log.i(TAG, "WebView page loaded: $url (wasReady=$wasReady)")
 
-                if (!wasReady) {
-                    // Inject mobile touch fix: prevent 300ms tap delay
-                    view?.evaluateJavascript("""
-                        (function(){
-                            if(window.__amc_touch) return;
-                            window.__amc_touch=true;
-                            var s=document.createElement('style');
-                            s.textContent='body,input,textarea,select,button{ touch-action: manipulation; }';
-                            document.head.appendChild(s);
-                        })();
-                    """.trimIndent(), null)
-                }
+                // The overlay is gone: the WebView must be the Android-focused
+                // view now, otherwise the IME stays bound to the hidden log
+                // TextView and ignores the first input taps.
+                webView.post { ensureWebViewFocus() }
+                injectFocusShim()
             }
 
             override fun onReceivedError(
@@ -616,6 +640,173 @@ class MainActivity : AppCompatActivity() {
                 return true
             }
         }
+    }
+
+    /**
+     * Edge-to-edge is enabled (WindowCompat.setDecorFitsSystemWindows(false)),
+     * so the legacy adjustResize semantics no longer resize the window on
+     * API 30+. Apply the IME inset ourselves by shrinking the WebView's
+     * bottom margin by the keyboard height. Chromium then reports a smaller
+     * viewport to code-server, so the editor/terminal reflows above the
+     * keyboard instead of being covered by it.
+     */
+    private fun setupImeInsets() {
+        ViewCompat.setOnApplyWindowInsetsListener(rootLayout) { _, insets ->
+            val imeBottom = insets.getInsets(WindowInsetsCompat.Type.ime()).bottom
+            val params = webView.layoutParams as? ConstraintLayout.LayoutParams
+            if (params != null && params.bottomMargin != imeBottom) {
+                params.bottomMargin = imeBottom
+                webView.layoutParams = params
+                webView.requestLayout()
+            }
+            // On API < 30 WindowInsetsCompat.CONSUMED has no platform
+            // WindowInsets object; returning it can break ViewGroup insets
+            // dispatch. There the window's adjustResize path is still active,
+            // so simply pass the insets through.
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                WindowInsetsCompat.CONSUMED
+            } else {
+                insets
+            }
+        }
+        ViewCompat.requestApplyInsets(rootLayout)
+    }
+
+    /**
+     * Move Android focus (and therefore the IME) from the hidden loading
+     * overlay to the WebView once code-server is visible.
+     */
+    private fun ensureWebViewFocus() {
+        if (isFinishing || isDestroyed) return
+        if (!::webView.isInitialized || !::loadingOverlay.isInitialized) return
+        if (loadingOverlay.visibility == View.VISIBLE) return
+        try {
+            loadingOverlay.clearFocus()
+            terminalScroll.clearFocus()
+            terminalOutput.clearFocus()
+            webView.isFocusable = true
+            webView.isFocusableInTouchMode = true
+            if (!webView.hasFocus()) {
+                webView.requestFocusFromTouch()
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not move focus to WebView", e)
+        }
+    }
+
+    /**
+     * Conservative JS fallback for inputs whose DOM focus is lost by the
+     * page itself. This is NOT a replacement for the native focus handling
+     * above: it only re-focuses an input/textarea/contenteditable (or the
+     * xterm helper textarea) after a tap, never buttons/links.
+     */
+    private fun injectFocusShim() {
+        webView.evaluateJavascript(
+            """
+            (function () {
+              if (window.__amcFocusShim) return 'already-installed';
+              window.__amcFocusShim = true;
+
+              if (!document.getElementById('amc-touch-style')) {
+                var style = document.createElement('style');
+                style.id = 'amc-touch-style';
+                style.textContent = 'body,input,textarea,select,button,[contenteditable]{touch-action:manipulation}';
+                (document.head || document.documentElement).appendChild(style);
+              }
+
+              function deepActiveElement() {
+                var active = document.activeElement;
+                while (active && active.shadowRoot && active.shadowRoot.activeElement) {
+                  active = active.shadowRoot.activeElement;
+                }
+                return active;
+              }
+
+              function editableFor(el) {
+                if (!el || el.nodeType !== 1) return null;
+                var tag = el.tagName;
+                if (tag === 'TEXTAREA') return el;
+                if (tag === 'INPUT') {
+                  var type = (el.getAttribute('type') || 'text').toLowerCase();
+                  if (type === 'text' || type === 'search' || type === 'email' ||
+                      type === 'url' || type === 'tel' || type === 'password' ||
+                      type === 'number') {
+                    return el;
+                  }
+                  return null;
+                }
+                if (el.isContentEditable) return el;
+                return null;
+              }
+
+              function targetForEvent(ev) {
+                var path = ev.composedPath ? ev.composedPath() : [ev.target];
+                for (var k = 0; k < path.length; k++) {
+                  var candidate = path[k];
+                  if (candidate && candidate.nodeType === 1 &&
+                      (candidate.tagName === 'BUTTON' || candidate.tagName === 'A')) {
+                    return null;
+                  }
+                }
+                for (var i = 0; i < path.length; i++) {
+                  var el = path[i];
+                  if (!el || el.nodeType !== 1) continue;
+                  var editable = editableFor(el);
+                  if (editable && !editable.disabled && !editable.readOnly) return editable;
+                }
+                for (var j = 0; j < path.length; j++) {
+                  var node = path[j];
+                  if (!node || node.nodeType !== 1) continue;
+                  if (node.classList && node.classList.contains('xterm')) {
+                    var textarea = node.querySelector('textarea.xterm-helper-textarea');
+                    if (textarea && !textarea.disabled && !textarea.readOnly) return textarea;
+                  }
+                }
+                return null;
+              }
+
+              function applyFocus(ev) {
+                var target = targetForEvent(ev);
+                if (!target) return;
+                if (deepActiveElement() === target) return;
+                setTimeout(function () {
+                  if (deepActiveElement() === target) return;
+                  if (target.disabled || target.readOnly) return;
+                  try { target.focus(); } catch (e) {}
+                }, 0);
+              }
+
+              var touchStart = null;
+              document.addEventListener('touchstart', function (ev) {
+                if (ev.touches && ev.touches.length === 1) {
+                  touchStart = { x: ev.touches[0].clientX, y: ev.touches[0].clientY, t: Date.now() };
+                } else {
+                  touchStart = null;
+                }
+              }, { capture: true, passive: true });
+
+              document.addEventListener('touchend', function (ev) {
+                if (!touchStart) return;
+                var start = touchStart;
+                touchStart = null;
+                if (!ev.changedTouches || ev.changedTouches.length !== 1) return;
+                var dx = ev.changedTouches[0].clientX - start.x;
+                var dy = ev.changedTouches[0].clientY - start.y;
+                if (Date.now() - start.t > 500) return;
+                if (dx * dx + dy * dy > 100) return;
+                applyFocus(ev);
+              }, { capture: true, passive: true });
+
+              document.addEventListener('click', function (ev) {
+                if (ev.detail === 0) return;
+                applyFocus(ev);
+              }, true);
+
+              return 'installed';
+            })();
+            """.trimIndent(),
+            null
+        )
     }
 
     private fun isLocalServerUri(uri: Uri): Boolean {
@@ -790,7 +981,16 @@ class MainActivity : AppCompatActivity() {
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
-        if (hasFocus) hideSystemBars()
+        if (hasFocus) {
+            hideSystemBars()
+            if (webViewReady && ::loadingOverlay.isInitialized &&
+                loadingOverlay.visibility != View.VISIBLE
+            ) {
+                // Returning from the IME/another window can leave Android
+                // focus on the WebView's window but not on the WebView view.
+                webView.post { ensureWebViewFocus() }
+            }
+        }
     }
 
     // ─── Service management ──────────────────────────────────
@@ -912,6 +1112,12 @@ class MainActivity : AppCompatActivity() {
         // If WebView was already loaded but server died, reload
         if (webViewReady && webView.url == null) {
             webView.loadUrl(serverUrl)
+        }
+        if (webViewReady && ::loadingOverlay.isInitialized &&
+            loadingOverlay.visibility != View.VISIBLE &&
+            !webView.url.isNullOrBlank()
+        ) {
+            webView.post { ensureWebViewFocus() }
         }
     }
 
