@@ -302,6 +302,8 @@ rg --version
 
 ## 7. 计划了但还没完成的任务
 
+> 更完整的重任务/候选池见 [AMCODE_ROADMAP.md](AMCODE_ROADMAP.md)；本节只列已经在主线计划里的项。
+
 按优先级，均建议在现有基线上增量，不要重做已修部分。
 
 ### P0/P1
@@ -353,6 +355,7 @@ rg --version
 
 ## 9. 参考文档
 
+- [AMCODE_ROADMAP.md](AMCODE_ROADMAP.md)：扩展路线图/重任务池（proot、自编译 code-server、16KB、离线 SDK、工具链等，按 P0–P3/难度排列）。
 - [AMCODE_FIXES_2026-10-24.md](AMCODE_FIXES_2026-10-24.md)：三轮修复的详细根因、日志、验证。
 - [AMCODE_REVIEW_2026-10-24.md](AMCODE_REVIEW_2026-10-24.md)：全量审计报告（P0/P1/P2）。
 - [AMCODE_NEXT_BATCH_PLAN.md](AMCODE_NEXT_BATCH_PLAN.md)：下一批计划（已执行 A/B/C，残余见本文第 7 节）。
