@@ -179,7 +179,8 @@ clang --version
 
 - `activity_main.xml`：根布局加 `@id/root`；WebView `focusable/focusableInTouchMode/clickable`；overlay `descendantFocusability=blocksDescendants` 且不可聚焦；日志 TextView/ScrollView 不可聚焦。
 - `MainActivity.kt`：`ensureWebViewFocus()` 在 `onPageFinished`/`onWindowFocusChanged`/`onResume`/`ACTION_DOWN` 时把 Android focus 和 IME served view 拉到 WebView；IME bottom inset 转成 WebView bottom margin，键盘弹出时 WebView 从 `0,0-1600,1200` 缩到 `0,0-1600,551`；JS focus shim 仅处理 input/textarea/contenteditable/xterm helper textarea，不抢按钮/链接。
-- **实测**：冷启动 `mServedView=WebView`；扩展搜索框一次点击 `mInputShown=true`，键盘出现，WebView 缩到 551；不再出现 “Ignoring showSoftInput”。截图：[`review-assets/batch2-focus.png`](review-assets/batch2-focus.png)。
+- **实测**：冷启动 `mServedView=WebView`；扩展搜索框一次点击 `mInputShown=true`，键盘出现，WebView 缩到 `0,0-1600,551`，IME frame `[0,551][1600,1200]`；不再出现 “Ignoring showSoftInput ... is not served”。截图：[`review-assets/batch2-focus.png`](review-assets/batch2-focus.png)、[`review-assets/focus-search4.png`](review-assets/focus-search4.png)。
+- 注：扩展搜索框一次点击已验证；终端 xterm 使用同一套 WebView focus/IME 修复，建议用户再顺手试一次终端输入。
 
 ### 6.2 首次安装网络
 
@@ -189,9 +190,18 @@ clang --version
 
 - 默认 APK：apt 解析 TUR 依赖后，用 Kotlin **8 连接 HTTP Range** 下载大 deb，支持断点续传、SHA256、进度/错误回显，失败回退 apt；默认 APK 不增大。
 - opt-in `-PofflineBundle=true`：把 code-server 4.143.1 + nodejs-24 24.18.0 两个大 deb 打包进 APK（+127MB，APK 约 199MB），首次只从快速主镜像拉 ~18MB 依赖，完全不访问 TUR。
-- **实测**：清空 app 数据后首次启动，日志出现
+- **实测（默认在线）**：清空 app 数据后首次启动，日志出现
   `[net] Downloading 16 package(s) with HTTP Range (up to 8 connections)...`，
-  随后 `[net] Downloaded nodejs-24...`；速度明显高于单连接。完整 139MB 下载/安装仍需几分钟；离线 bundle 可彻底去掉 TUR 依赖。
+  随后 `[net] Downloaded nodejs-24...`；但 TUR/GitHub 对每个连接限速，8 条连接合计仍只有几十 KB/s，139MB 的 code-server 下载仍需很久。**默认在线路径没有真正解决慢网，只是比单连接快。**
+- **实测（opt-in bundle）**：用 host 代理预下载两个 deb 到 `D:\amcode-debs`，构建
+  `-PofflineBundle=true -PofflineBundleArch=x86_64 -PofflineBundleSourceDir=D:\amcode-debs`，得到 189.75MB APK；清空 app 数据安装后首次启动日志：
+  ```
+  [offline] Using bundled TUR packages (120 MB): nodejs-24 24.18.0, code-server 4.143.1
+  [offline] Bundled packages installed without TUR download.
+  [done] All packages installed from bundled debs.
+  ```
+  只从主镜像拉了 14.7MB 依赖，约 39 秒进入 code-server，**完全不需要 TUR/代理**。截图：[`review-assets/offline-result.png`](review-assets/offline-result.png)、[`review-assets/offline-vscode.png`](review-assets/offline-vscode.png)。
+  - 注意：bundle 安装时 dpkg 的 postinst 路径出现双重嵌套（`$PREFIX/data/data/...`），`[dpkg] exit=1; continuing`，但 code-server 文件/启动正常；`pkg` 数据库一致性需后续修。
 - 新增 `ensureLibCpp30()`：检测 `libc++_shared.so` 是否含 `_ZNSt6__ndk113__hash_memoryEPKvm`，缺失则 `apt install -y libc++`，实测把 29 升到 30；`spdlog`/`@parcel/watcher` 错误消失。
 
 ### 6.3 扩展兼容
@@ -203,7 +213,9 @@ clang --version
 
 ### 6.4 残余
 
-- 默认在线路径完整安装仍需数分钟（TUR/GitHub 限速不是代码能完全消除的）；真正“无 TUR”用 opt-in bundle。
-- 运行时的 Range 下载、bundle 首次安装路径仍需更多网络环境验证；本次已看到并行下载启动和 nodejs 完成。
+- 默认在线路径完整安装仍需数分钟（TUR/GitHub 限速不是代码能完全消除的）；真正“无 TUR”用 opt-in bundle（189.75MB debug，arm64 类似）。
+- bundle 的 dpkg postinst 双重路径问题会导致 `dpkg exit=1`，虽然 code-server 可用，但依赖包配置/数据库不完美；需要把 bundle 安装路径的 `--root`/move 逻辑再对齐。
+- 运行时的 Range 下载、bundle 首次安装路径仍需更多网络环境验证；本次已看到默认并行下载启动、nodejs 完成，以及 x86_64 bundle 完整首次安装。
 - Linux/glibc native 扩展仍然不可用；需要 proot/glibc 用户态或 VHEditor 式 patched code-server。
 - Workspace Trust、Git 未安装、API 26–29、孤儿进程、8 秒 setup 等仍在 backlog。
+- **当前默认 app-debug.apk 已重新 clean 构建回 68.74MB，不含 offline-debs**；189.75MB 的 bundle 样例保存在 `D:\amcode-offline-x86_64-debug.apk`（未 commit）。
