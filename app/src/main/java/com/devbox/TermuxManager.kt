@@ -94,17 +94,32 @@ object TermuxManager {
     // Environment variables for process spawning
     // dpkg needs /usr/bin:/usr/sbin:/sbin:/bin for maintainer scripts
     val environment: Map<String, String>
-        get() = mapOf(
-            "PREFIX" to usrDir.absolutePath,
-            "PATH" to "${binDir.absolutePath}:/system/bin:/system/xbin:/usr/bin:/usr/sbin:/sbin:/bin",
-            "LD_LIBRARY_PATH" to File(usrDir, "lib").absolutePath,
-            "HOME" to homeDir.absolutePath,
-            "TMPDIR" to tmpDir.absolutePath,
-            "TERM" to "xterm-256color",
-            "LANG" to "en_US.UTF-8",
-            "ANDROID_DATA" to "/data",
-            "ANDROID_ROOT" to "/system"
-        )
+        get() {
+            val env = linkedMapOf(
+                "PREFIX" to usrDir.absolutePath,
+                // termux-exec/libtermux-exec.so uses TERMUX__PREFIX (and many
+                // Termux scripts use TERMUX_PREFIX) to rewrite standard shebangs.
+                "TERMUX__PREFIX" to usrDir.absolutePath,
+                "TERMUX_PREFIX" to usrDir.absolutePath,
+                "PATH" to "${binDir.absolutePath}:/system/bin:/system/xbin:/usr/bin:/usr/sbin:/sbin:/bin",
+                "LD_LIBRARY_PATH" to File(usrDir, "lib").absolutePath,
+                "HOME" to homeDir.absolutePath,
+                "TMPDIR" to tmpDir.absolutePath,
+                "TERM" to "xterm-256color",
+                "LANG" to "en_US.UTF-8",
+                "ANDROID_DATA" to "/data",
+                "ANDROID_ROOT" to "/system"
+            )
+            // termux-exec rewrites standard shebangs (#!/usr/bin/env ...,
+            // #!/bin/sh) to the Termux prefix. Only preload it once the
+            // bootstrap symlink exists, otherwise every child process fails
+            // with "CANNOT LINK EXECUTABLE".
+            val termuxExec = File(usrDir, "lib/libtermux-exec.so")
+            if (termuxExec.exists()) {
+                env["LD_PRELOAD"] = termuxExec.absolutePath
+            }
+            return env
+        }
 
     /**
      * Initialize Termux environment. Call once from background thread.
@@ -112,6 +127,18 @@ object TermuxManager {
      */
     suspend fun initialize(context: Context): Result<Unit> = withContext(Dispatchers.IO) {
         filesDir = context.filesDir
+
+        // Existing installations (including an APK installed over an older data
+        // directory) must also get the keyring/SYMLINKS/pkg/dpkg repairs. This
+        // is idempotent and does not touch code-server or re-download anything.
+        if (File(binDir, "bash").exists()) {
+            ensurePkgSetup(context)
+            // Migrate an older installation that already has code-server but
+            // predates the completion marker: do not reinstall it.
+            if (isBootstrapReady() && File(binDir, "code-server").exists()) {
+                File(filesDir, ".amcode-ready").writeText("1")
+            }
+        }
 
         if (isReady()) {
             Log.i(TAG, "Termux environment already initialized")
@@ -172,6 +199,11 @@ object TermuxManager {
             emitOutput("[5/6] Testing mirrors + configuring apt...\n")
             setupAptSources()
 
+            // Keep the known-good bootstrap install path unchanged: package
+            // keys/SYMLINKS/the dpkg wrapper are repaired after the initial
+            // `dpkg --root` install below finishes. On an existing install the
+            // repair has already run at the top of initialize().
+
             // Step 6: Install packages — retry until successful
             emitOutput("[6/6] Installing packages (nodejs, code-server)...\n")
             var ok = false
@@ -193,7 +225,13 @@ object TermuxManager {
                 return@withContext Result.failure(RuntimeException("Package installation failed"))
             }
 
+            // The initial install uses `dpkg --root` and moves the com.termux
+            // tree into place by hand. Migrate the resulting dpkg database
+            // paths so later `pkg install` runs see a consistent package DB.
+            ensurePkgSetup(context)
+
             _setupState.value = SetupProgress(State.READY, "Environment ready", 100)
+            File(filesDir, ".amcode-ready").writeText("1")
             Log.i(TAG, "Termux environment initialized successfully")
             Result.success(Unit)
 
@@ -205,6 +243,14 @@ object TermuxManager {
     }
 
     fun isReady(): Boolean {
+        if (!this::filesDir.isInitialized) return false
+        return File(filesDir, ".amcode-ready").exists() &&
+               isBootstrapReady() &&
+               File(binDir, "code-server").exists()
+    }
+
+    /** Bootstrap is extracted and patched; packages may still be missing. */
+    private fun isBootstrapReady(): Boolean {
         return File(binDir, "bash").exists() &&
                File(binDir, "apt").exists() &&
                File(usrDir, "lib").isDirectory
@@ -536,13 +582,112 @@ object TermuxManager {
     }
 
     /**
+     * Idempotently repair the package-manager layer.
+     *
+     * Works both for a fresh install (after the bootstrap has been extracted)
+     * and for an APK installed over an existing data directory. It:
+     *  - installs the bundled Termux/TUR GPG keys into etc/apt/trusted.gpg.d
+     *    (replacing the broken absolute com.termux symlinks),
+     *  - recreates bootstrap symlinks from SYMLINKS.txt, including
+     *    lib/libtermux-exec.so and the applet links,
+     *  - fixes the cache paths hardcoded in bin/pkg,
+     *  - points apt's Dir::Bin::dpkg at a wrapper that rewrites Termux .deb
+     *    prefixes to com.devbox before invoking the real dpkg,
+     *  - switches the TUR source to signed once its key is available,
+     *  - migrates dpkg database paths left by the initial `dpkg --root`
+     *    bootstrap install from com.termux to com.devbox.
+     *
+     * The actual work lives in app/src/main/assets/amcode-pkg-setup.sh so it can
+     * be tested in a real Termux prefix. This method only syncs the assets and
+     * streams the script log to Logcat.
+     */
+    private fun ensurePkgSetup(context: Context): Boolean {
+        return try {
+            val setupDir = File(usrDir, "libexec/amcode")
+            setupDir.mkdirs()
+
+            val assets = listOf(
+                "amcode-dpkg-wrapper.sh" to File(setupDir, "dpkg"),
+                "amcode-pkg-setup.sh" to File(setupDir, "pkg-setup.sh"),
+                "tur.gpg" to File(setupDir, "tur.gpg")
+            )
+            var copied = 0
+            for ((assetName, dest) in assets) {
+                if (copyAsset(context, assetName, dest)) copied++
+            }
+            File(setupDir, "dpkg").setExecutable(true, false)
+            File(setupDir, "pkg-setup.sh").setExecutable(true, false)
+            File(setupDir, "dpkg").setReadable(true, false)
+            File(setupDir, "pkg-setup.sh").setReadable(true, false)
+
+            val bash = File(binDir, "bash")
+            val setupScript = File(setupDir, "pkg-setup.sh")
+            if (!bash.exists() || !setupScript.exists()) {
+                Log.w(TAG, "ensurePkgSetup skipped (bash=$bash exists=${bash.exists()})")
+                return false
+            }
+
+            val process = execCommand(
+                bash.absolutePath,
+                listOf(setupScript.absolutePath),
+                usrDir
+            )
+            var warnings = 0
+            val reader = process.inputStream.bufferedReader()
+            var line: String?
+            while (reader.readLine().also { line = it } != null) {
+                val text = line!!
+                if (text.isBlank()) continue
+                Log.i(TAG, text)
+                if (text.contains("WARN")) {
+                    warnings++
+                    // Surface real problems in the setup UI, but keep the
+                    // normal existing-install launch path quiet.
+                    if (_setupState.value.state != State.READY) emitOutput("$text\n")
+                }
+            }
+            val exitCode = process.waitFor()
+            Log.i(TAG, "ensurePkgSetup done: exit=$exitCode assets=$copied warnings=$warnings")
+            exitCode == 0
+        } catch (e: Exception) {
+            Log.e(TAG, "ensurePkgSetup failed", e)
+            false
+        }
+    }
+
+    private fun copyAsset(context: Context, assetName: String, dest: File): Boolean {
+        return try {
+            dest.parentFile?.mkdirs()
+            // Write to a sibling temp file first: a process kill mid-copy must
+            // not leave a truncated dpkg wrapper/setup script behind.
+            val tmp = File(dest.parentFile, "${dest.name}.amcode-tmp")
+            context.assets.open(assetName).use { input ->
+                FileOutputStream(tmp).use { output -> input.copyTo(output) }
+            }
+            tmp.setReadable(true, false)
+            if (!tmp.renameTo(dest)) {
+                dest.delete()
+                if (!tmp.renameTo(dest)) {
+                    tmp.delete()
+                    Log.w(TAG, "Could not install asset $assetName at $dest")
+                    return false
+                }
+            }
+            true
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not copy asset $assetName: ${e.message}")
+            false
+        }
+    }
+
+    /**
      * Install nodejs and code-server from Termux repos.
      * Uses dpkg directly for reliable installation.
      */
     fun installPackages(): Boolean = tryInstall(0)
 
     private fun tryInstall(attempt: Int): Boolean {
-        if (!isReady()) return false
+        if (!isBootstrapReady()) return false
         val retrying = attempt > 0
 
         _setupState.value = SetupProgress(State.INSTALLING_PACKAGES,

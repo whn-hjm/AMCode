@@ -7,10 +7,18 @@ import android.os.Binder
 import android.os.IBinder
 import android.util.Log
 import androidx.core.app.NotificationCompat
-import kotlinx.coroutines.*
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 
 /**
  * Foreground Service that manages the code-server process lifecycle.
@@ -18,8 +26,11 @@ import kotlinx.coroutines.flow.asStateFlow
  * Responsibilities:
  * - Start/stop code-server
  * - Keep process alive via foreground notification
- * - Auto-restart on crash
+ * - Auto-restart on crash (bounded)
  * - Report status to bound activities
+ *
+ * Initialization is single-flight: repeated onStartCommand() calls cannot run
+ * two concurrent bootstrap/apt/server starts.
  */
 class CodeServerService : Service() {
 
@@ -37,6 +48,9 @@ class CodeServerService : Service() {
     companion object {
         const val TAG = "CodeServerService"
         const val ACTION_STOP = "com.devbox.action.STOP"
+        private const val HEALTH_INTERVAL_MS = 10_000L
+        private const val RESTART_DELAY_MS = 2_000L
+        private const val MAX_RESTARTS = 10
     }
 
     data class ServiceStatus(
@@ -50,8 +64,15 @@ class CodeServerService : Service() {
     val serviceStatus: StateFlow<ServiceStatus> = _serviceStatus.asStateFlow()
 
     private val binder = LocalBinder()
-    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    private var initJob: Job? = null
+
+    @Volatile
     private var healthCheckJob: Job? = null
+
+    @Volatile
+    private var restartCount = 0
 
     inner class LocalBinder : Binder() {
         fun getService(): CodeServerService = this@CodeServerService
@@ -67,14 +88,33 @@ class CodeServerService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_STOP -> {
-                stopServer()
+                Log.i(TAG, "ACTION_STOP received")
+                stopEverything()
                 return START_NOT_STICKY
             }
             else -> {
+                // Never enter a second initialization pipeline.
+                if (initJob?.isActive == true) {
+                    Log.i(TAG, "Initialization already active; ignoring duplicate start")
+                    return START_STICKY
+                }
+
+                val state = _serviceStatus.value.state
                 startForeground(
                     App.NOTIFICATION_ID,
-                    createNotification("Starting VS Code...", "Initializing environment")
+                    if (state == ServiceState.RUNNING) {
+                        createNotification("VS Code is running", "Server is ready")
+                    } else {
+                        createNotification("Starting VS Code...", "Initializing environment")
+                    }
                 )
+
+                if (state == ServiceState.RUNNING) {
+                    Log.i(TAG, "Service already running; ensuring health checks")
+                    startHealthChecks()
+                    return START_STICKY
+                }
+
                 initializeAndStart()
                 return START_STICKY
             }
@@ -82,18 +122,46 @@ class CodeServerService : Service() {
     }
 
     override fun onDestroy() {
-        stopServer()
+        Log.i(TAG, "Service destroying")
+        initJob?.cancel()
+        initJob = null
+        healthCheckJob?.cancel()
+        healthCheckJob = null
+        // Non-blocking: the launcher kills the process on its own IO scope even
+        // after this service (and its scope) is gone.
+        CodeServerLauncher.stop()
+        _serviceStatus.value = ServiceStatus(ServiceState.STOPPED, "Stopped", 0)
+        stopForeground(STOP_FOREGROUND_REMOVE)
         scope.cancel()
         super.onDestroy()
         Log.i(TAG, "Service destroyed")
     }
 
     /**
-     * Full initialization pipeline: setup Termux env → download code-server → start
+     * Full initialization pipeline: restore HOME → setup Termux env → start
+     * code-server. Guarded by initJob so only one pipeline can run at a time.
      */
     private fun initializeAndStart() {
-        scope.launch {
+        if (initJob?.isActive == true) {
+            Log.i(TAG, "initializeAndStart ignored: already active")
+            return
+        }
+        // A previous health-check loop must not race this initialization.
+        healthCheckJob?.cancel()
+        healthCheckJob = null
+
+        initJob = scope.launch {
             try {
+                _serviceStatus.value = ServiceStatus(
+                    ServiceState.INITIALIZING, "Initializing...", 0
+                )
+
+                // Restore the persisted HOME before anything spawns code-server
+                // or creates Termux directories. This also covers START_STICKY
+                // restarts that arrive with a null Intent.
+                HomePrefs.restoreHomeDir(this@CodeServerService)
+                Log.i(TAG, "Initialization HOME=${TermuxManager.homeDir.absolutePath}")
+
                 // Launch a collector to update UI from TermuxManager progress
                 val envCollector = launch {
                     TermuxManager.setupState.collect { progress ->
@@ -109,9 +177,7 @@ class CodeServerService : Service() {
                                 )
                                 updateNotification(progress.message, "${progress.percent}%")
                             }
-                            TermuxManager.State.READY -> { /* handled below */ }
-                            TermuxManager.State.FAILED -> { /* handled via Result */ }
-                            else -> { /* ignore */ }
+                            else -> { /* READY/FAILED handled by Result below */ }
                         }
                     }
                 }
@@ -122,13 +188,15 @@ class CodeServerService : Service() {
                 )
                 updateNotification("Setting up development environment...", "Extracting packages")
 
-                val envResult = TermuxManager.initialize(this@CodeServerService)
-                envCollector.cancel()
-                if (envResult.isFailure) {
-                    throw envResult.exceptionOrNull()!!
+                val envResult = try {
+                    TermuxManager.initialize(this@CodeServerService)
+                } finally {
+                    envCollector.cancel()
                 }
-
-                // Packages are verified by initialize() — no separate retry needed
+                if (envResult.isFailure) {
+                    throw envResult.exceptionOrNull()
+                        ?: RuntimeException("Environment setup failed")
+                }
 
                 // Launch a collector for code-server status
                 val serverCollector = launch {
@@ -141,14 +209,20 @@ class CodeServerService : Service() {
                                 )
                                 updateNotification("VS Code is ready", serverStatus.url)
                             }
-                            CodeServerLauncher.ServerState.ERROR -> { /* handled via Result */ }
+                            CodeServerLauncher.ServerState.ERROR,
+                            CodeServerLauncher.ServerState.STOPPED,
+                            CodeServerLauncher.ServerState.STOPPING -> Unit
                             else -> {
                                 _serviceStatus.value = ServiceStatus(
                                     ServiceState.STARTING_SERVER,
                                     serverStatus.message,
-                                    60
+                                    60,
+                                    serverStatus.url
                                 )
-                                updateNotification(serverStatus.message, "Starting...")
+                                updateNotification(
+                                    serverStatus.message.ifBlank { "Starting code-server..." },
+                                    "Starting..."
+                                )
                             }
                         }
                     }
@@ -160,69 +234,143 @@ class CodeServerService : Service() {
                 )
                 updateNotification("Starting code-server...", "Launching VS Code")
 
-                val serverResult = CodeServerLauncher.prepareAndStart()
-                serverCollector.cancel()
+                val serverResult = try {
+                    CodeServerLauncher.prepareAndStart()
+                } finally {
+                    serverCollector.cancel()
+                }
                 if (serverResult.isFailure) {
-                    throw serverResult.exceptionOrNull()!!
+                    throw serverResult.exceptionOrNull()
+                        ?: RuntimeException("code-server failed to start")
                 }
 
                 // Phase 3: Start health checks
+                restartCount = 0
+                _serviceStatus.value = ServiceStatus(
+                    ServiceState.RUNNING,
+                    "VS Code is running",
+                    100,
+                    CodeServerLauncher.status.value.url
+                )
+                updateNotification(
+                    "VS Code is ready",
+                    CodeServerLauncher.status.value.url
+                )
                 startHealthChecks()
 
                 Log.i(TAG, "Service fully initialized and running")
-
+            } catch (e: CancellationException) {
+                Log.i(TAG, "Initialization cancelled")
+                throw e
             } catch (e: Exception) {
                 Log.e(TAG, "Service initialization failed", e)
                 _serviceStatus.value = ServiceStatus(
                     ServiceState.ERROR, "Failed: ${e.message}", 0
                 )
                 updateNotification("VS Code failed to start", e.message ?: "Unknown error")
+                healthCheckJob?.cancel()
+                healthCheckJob = null
+                CodeServerLauncher.stop()
+                stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()
             }
         }
     }
 
-    private var restartCount = 0
-
     private fun startHealthChecks() {
+        if (healthCheckJob?.isActive == true) {
+            Log.d(TAG, "Health check already running")
+            return
+        }
         healthCheckJob = scope.launch {
             while (isActive) {
-                delay(10000)  // Check every 10 seconds
-                val healthy = CodeServerLauncher.healthCheck()
-                if (!healthy && _serviceStatus.value.state == ServiceState.RUNNING) {
-                    Log.w(TAG, "Health check failed, restarting...")
-                    restartCount++
-                    if (restartCount > 10) {
-                        Log.e(TAG, "Too many restarts, giving up")
-                        _serviceStatus.value = ServiceStatus(ServiceState.ERROR, "Too many crashes")
-                        stopSelf()
-                        return@launch
-                    }
-                    CodeServerLauncher.stop()
-                    delay(2000)  // Wait for port to free
-                    val restartResult = CodeServerLauncher.prepareAndStart()
-                    if (restartResult.isFailure) {
-                        Log.e(TAG, "Restart failed", restartResult.exceptionOrNull())
-                    } else {
-                        _serviceStatus.value = ServiceStatus(ServiceState.RUNNING, "VS Code restarted", 100,
-                            CodeServerLauncher.status.value.url)
-                        updateNotification("VS Code restarted", "Recovered from crash")
-                    }
+                delay(HEALTH_INTERVAL_MS)
+
+                val healthy = try {
+                    CodeServerLauncher.healthCheck()
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    Log.w(TAG, "Health check error", e)
+                    false
                 }
-                if (healthy && _serviceStatus.value.state != ServiceState.RUNNING) {
+
+                if (healthy) {
+                    if (restartCount != 0) restartCount = 0
+                    continue
+                }
+
+                restartCount++
+                Log.w(TAG, "Health check failed; restart attempt $restartCount/$MAX_RESTARTS")
+                if (restartCount > MAX_RESTARTS) {
+                    Log.e(TAG, "Too many restarts, giving up")
+                    _serviceStatus.value = ServiceStatus(
+                        ServiceState.ERROR, "VS Code crashed too many times", 0
+                    )
+                    updateNotification("VS Code failed", "Too many restarts")
+                    CodeServerLauncher.stop()
+                    stopForeground(STOP_FOREGROUND_REMOVE)
+                    stopSelf()
+                    return@launch
+                }
+
+                _serviceStatus.value = ServiceStatus(
+                    ServiceState.STARTING_SERVER,
+                    "Restarting VS Code...",
+                    80,
+                    CodeServerLauncher.status.value.url
+                )
+                updateNotification("Restarting VS Code...", "Recovering from crash")
+
+                CodeServerLauncher.stop()
+                delay(RESTART_DELAY_MS)
+
+                var restarted = false
+                try {
+                    restarted = CodeServerLauncher.prepareAndStart().isSuccess
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    Log.e(TAG, "Restart threw", e)
+                }
+
+                if (restarted) {
+                    // Reset only after a successful restart.
                     restartCount = 0
-                    _serviceStatus.value = ServiceStatus(ServiceState.RUNNING, "VS Code is running", 100,
-                        CodeServerLauncher.status.value.url)
+                    _serviceStatus.value = ServiceStatus(
+                        ServiceState.RUNNING,
+                        "VS Code restarted",
+                        100,
+                        CodeServerLauncher.status.value.url
+                    )
+                    updateNotification("VS Code restarted", "Recovered from crash")
+                } else {
+                    Log.e(TAG, "Restart failed")
+                    _serviceStatus.value = ServiceStatus(
+                        ServiceState.ERROR, "Restart failed", 0
+                    )
                 }
             }
         }
     }
 
-    private fun stopServer() {
+    /**
+     * ACTION_STOP: cancel initialization, kill the server, remove the
+     * notification and actually stop the service.
+     */
+    private fun stopEverything() {
+        Log.i(TAG, "Stopping service")
+        initJob?.cancel()
+        initJob = null
         healthCheckJob?.cancel()
+        healthCheckJob = null
+        restartCount = 0
+
+        // stop() is asynchronous; no waitFor() on the main thread.
         CodeServerLauncher.stop()
         _serviceStatus.value = ServiceStatus(ServiceState.STOPPED, "Stopped", 0)
         stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
     }
 
     // ─── Notification helpers ─────────────────────────────────

@@ -16,7 +16,11 @@
     <!-- Notifications: required for foreground service on Android 13+ -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
-    <!-- Storage: access project files and /sdcard -->
+    <!-- Storage: access project files and /sdcard.
+         API 26-29: READ/WRITE are requested at runtime before /sdcard/AMCode
+         is used. API 30+: MANAGE_EXTERNAL_STORAGE is requested via the
+         all-files settings screen. If access is denied the app falls back to
+         its private files/home directory. -->
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
         android:maxSdkVersion="32" />
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
@@ -31,6 +35,7 @@
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
         android:networkSecurityConfig="@xml/network_security_config"
+        android:requestLegacyExternalStorage="true"
         android:supportsRtl="true"
         android:theme="@style/Theme.VSBoxed"
         android:usesCleartextTraffic="true"

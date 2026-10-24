@@ -1,0 +1,175 @@
+# AMCode 本轮修复记录（2026-10-24）
+
+> 基线：`2d9b486`（原评测报告见 [AMCODE_REVIEW_2026-10-24.md](AMCODE_REVIEW_2026-10-24.md)）  
+> 本轮目标：先把用户实际遇到的 `pkg install clang` 修好，同时修掉启动/权限/Service/WebView 的 P0/P1，并换成横屏平板模拟器。  
+> 当前状态：**debug APK 已构建并安装在平板 AVD `emulator-5558` 上；release APK 已构建但未安装。改动未 commit。**
+
+---
+
+## 1. 结果摘要
+
+| 问题 | 状态 | 证据 |
+|---|---|---|
+| `pkg install clang` 报 NO_PUBKEY / unsigned repo | **已修复** | 主仓 + TUR 均签名通过；`pkg install -y clang` exit 0；`clang 21.1.8` 可编译运行 |
+| `pkg install hello/tree` 因 dpkg 写 `/data/data/com.termux` 失败 | **已修复** | wrapper 改写 `.deb` 路径；hello/tree/clang 均落到 `$PREFIX`，`dpkg --audit` 空 |
+| 首启双初始化、apt 抢锁 | **已修复** | 最终日志只有一次 `Initialization HOME=`、一次 `ensurePkgSetup`、一次 code-server |
+| 失败后 `isReady()` 永久 brick | **已修复** | `.amcode-ready` 完成标记；`isReady()` 同时要求 code-server；已安装环境重启不再报 `code-server not installed` |
+| code-server 监听 `0.0.0.0` | **已修复（部分）** | `--bind-addr 127.0.0.1:<动态端口>`；`--auth none` 仍未改，同机其他 app 仍可访问 loopback |
+| Android 8–10 存储权限未申请 | **已修代码，未测旧系统** | API 26–29 已走 `RequestMultiplePermissions`；失败回退内部 HOME |
+| HOME 选择不持久化 / START_STICKY 用错目录 | **已修复** | `HomePrefs` SharedPreferences；日志 `persisted home mode=external` |
+| Stop 不停 Service / 主线程 waitFor / 固定 8080 | **已修代码** | ACTION_STOP 取消 init/health + 异步 stop + stopSelf；动态端口 40457/33847 |
+| WebView 调试常开 / URL 前缀绕过 / JS bridge 过宽 | **已修复** | debug 用 `FLAG_DEBUGGABLE`，release 关闭；精确 host+port；bridge 不再注册 |
+| 平板比例不适合 code-server | **已解决** | `AMCode_Tablet_API34`，1600×1200、4:3 横屏 |
+
+---
+
+## 2. 代码改动
+
+`git diff --stat`（7 个文件，+1384/−289）：
+
+```text
+ AndroidManifest.xml                   |   7 +-
+ App.kt                                | 120 ++++
+ CodeServerLauncher.kt                 | 281 ++++++--
+ CodeServerService.kt                  | 246 +++++--
+ MainActivity.kt                       | 793 ++++++++++++++++-----
+ TermuxManager.kt                      | 169 ++++-
+ WebViewInterface.kt                   |  57 +-
+```
+
+新增 assets：
+
+- `app/src/main/assets/amcode-dpkg-wrapper.sh`
+- `app/src/main/assets/amcode-pkg-setup.sh`
+- `app/src/main/assets/tur.gpg`（TUR 公钥，fingerprint `43EEC3A2934343315717FF6F6A5C550C260667D1`）
+
+### 2.1 pkg / apt / dpkg
+
+- **GPG**：`trusted.gpg.d` 原先是坏掉的绝对 symlink（指向 `/data/data/com.termux/...`）。改为复制 `share/termux-keyring/*.gpg` 为普通文件；额外打包 TUR key，`pkg` 不再依赖 `trusted=yes`。主仓 key：`termux-autobuilds.gpg`。
+- **SYMLINKS**：`amcode-pkg-setup.sh` 解析 bootstrap `SYMLINKS.txt`，补齐约 1092 个缺失链接（含 `libtermux-exec.so`），保留已有 1163 个。
+- **pkg 源/缓存**：修复 `bin/pkg` 的 `/data/data/com.termux/cache/apt` 缓存路径；TUR 源从 `trusted=yes` 升级为签名源；主仓在 dpkg DB 建立后才移除 bootstrap 的 trusted fallback。
+- **dpkg prefix**：apt `Dir::Bin::dpkg` 指向 `$PREFIX/libexec/amcode/dpkg`。wrapper 在 `--unpack`/`--recursive` 时把 `.deb` 的 `data/data/com.termux` 改写为 `data/data/com.devbox`，同步改写文本/ELF/绝对 symlink，重建 `.deb`；带 `--root` 的初始安装直接透传。
+- **DB 迁移**：`status`、`status-old`、`info/*`、`alternatives/*` 里的 `com.termux` 路径迁移为 `com.devbox`，备份 `status.amcode-bak`。
+- **termux-exec**：环境变量增加 `TERMUX__PREFIX` / `TERMUX_PREFIX`；`LD_PRELOAD` 指向 `libtermux-exec.so`。实测 `#!/usr/bin/env sh` 在带这些变量时可执行。
+
+### 2.2 启动 / 权限 / Service / WebView
+
+- **单次启动**：`MainActivity` 的 `startupStarted` / `storageResolved` / `serviceStartRequested`；`beginStartup()` 是唯一入口，先存 HOME，再处理通知权限，最后只 start 一次。
+- **存储**：
+  - API 30+：`MANAGE_EXTERNAL_STORAGE` 设置页，带 `ActivityNotFoundException` fallback。
+  - API 26–29：`RequestMultiplePermissions` 请求 READ/WRITE，拒绝或不可写回退内部 HOME。
+  - `HomePrefs` 持久化，Service 在 code-server 启动前恢复；`isExternalWritable()` 做实际写 probe。
+- **Service**：`initJob` 单飞；`ACTION_STOP` 取消 init/health、异步 stop、`stopForeground(REMOVE)`、`stopSelf`；`onDestroy` 不再主线程 waitFor；`restartCount` 成功后归零。
+- **code-server**：`127.0.0.1` + `ServerSocket(0)` 动态端口；健康检查校验进程存活 + 端口；`generation` 防止旧进程状态覆盖新进程。
+- **WebView**：`setWebContentsDebuggingEnabled(isDebuggableBuild())`；精确 `Uri.host/port`；不注册 JS bridge；`allowFileAccess=false` / `allowContentAccess=false` / 不开 universal file access；`onReceivedError` 新签名只处理主框架，带 3 次自动重试 + 可点击 Retry；`onRenderProcessGone` 重建 WebView。
+- **完成标记**：`TermuxManager` 写 `files/.amcode-ready`；`isReady()` 要求 marker + bash/apt/lib + `bin/code-server`；`tryInstall()` 改用 `isBootstrapReady()`。这样半安装不会被误判为 ready。
+
+---
+
+## 3. 实测结果
+
+### 3.1 最终 debug APK（平板 emulator-5558）
+
+安装覆盖测试环境后启动日志：
+
+```text
+MainActivity: Startup: persisted home mode=external
+MainActivity: HOME set to external storage: /storage/emulated/0/AMCode
+MainActivity: CodeServerService start+bind requested
+CodeServerService: Initialization HOME=/storage/emulated/0/AMCode
+TermuxManager: [amcode-pkg] keyring: 10 key files installed / TUR key present
+TermuxManager: [amcode-pkg] symlinks: created=0 kept=1163 target-missing=0
+TermuxManager: [amcode-pkg] dpkg db: migrated_files=0
+TermuxManager: ensurePkgSetup done: exit=0 assets=3 warnings=0
+TermuxManager: Termux environment already initialized
+CodeServerLauncher: code-server PID=4624 bound to 127.0.0.1:40457
+MainActivity: code-server ready, loading http://127.0.0.1:40457
+MainActivity: WebView page loaded: http://127.0.0.1:40457/?folder=/storage/emulated/0/AMCode
+```
+
+- 只有一次初始化（没有双 `=== VSBoxed Environment Setup ===`）。
+- 动态端口 40457，只监听 `127.0.0.1`（日志明确）。
+- code-server 4.143.1 正常，VS Code 页面加载；截图：[`review-assets/final-tablet4.png`](review-assets/final-tablet4.png)、[`review-assets/final-tablet5.png`](review-assets/final-tablet5.png)。
+
+### 3.2 pkg 实测
+
+在 **emulator-5558** 上（修复后的环境）：
+
+```text
+pkg install -y hello  -> hello is already the newest version (2.12.3-1), rc=0
+pkg install -y clang  -> clang is already the newest version (21.1.8-3), rc=0
+clang --version       -> clang version 21.1.8 / Target: x86_64-unknown-linux-android24
+tree --version        -> tree v2.3.2
+dpkg --audit          -> 无包错误（仅 $HOME/.dpkg.cfg 权限 warning）
+```
+
+A 在修复过程中还完成了真正的首次安装验证：
+
+- `pkg install -y hello` exit 0，`hello` 输出 `Hello, world!`；
+- `pkg install -y tree` exit 0；
+- `pkg install -y clang` exit 0，安装 clang/llvm/lld/ndk-sysroot 等，并编译运行了一个 C 程序；
+- `dpkg --audit` 空；`code-server --version` 仍是 4.143.1；`.amcode-ready` 保留。
+
+这直接覆盖了用户截图里的 `pkg install clang` 场景。
+
+### 3.3 模拟器
+
+- 当前只保留平板 AVD：`AMCode_Tablet_API34`，1600×1200、4:3 横屏、240dpi，端口 5558。
+- 手机 AVD `AMCode_Pixel6_API34` 已关闭，且明确要求子代理不得再启动。
+- 桌面快捷方式/`run-emulator.bat` 已改为平板。
+- 平板主页截图：[`review-assets/tablet-home.png`](review-assets/tablet-home.png)；code-server 截图：[`review-assets/tablet-vscode.png`](review-assets/tablet-vscode.png)。
+
+---
+
+## 4. 仍未解决 / 残余风险
+
+1. **`--auth none` 仍在**：已只 bind `127.0.0.1`，LAN 暴露消除；但 Android loopback 不隔离 app，同机其他有 INTERNET 权限的 app 仍可访问 code-server 终端。要彻底解决需随机 token / 认证代理。
+2. **扩展/native 模块**：运行日志仍有 `spdlog.node` 的 libc++ 符号错误、`ripgrep-universal/.../rg ENOENT`。UI 可用，但 extension host/搜索功能不完整；这是 TUR code-server 的 native 模块与 bootstrap ABI/绝对 symlink 问题，不是本次 pkg 修复能覆盖的。
+3. **`/sdcard` 工作区**：默认仍是外部 `/sdcard/AMCode`；Git/编译产物/noexec 的官方限制仍在（`HomePrefs` 允许内部，但没有 UI 切换）。
+4. **键盘 IME**：按“不要过度扩展”要求未做 inset/padding 重构，键盘遮挡仍可能。
+5. **孤儿 code-server**：硬杀 app 进程仍可能留下旧进程；动态端口避免误判，但没有 PID 文件/进程树清理。
+6. **API 26–29 未实测**：代码已加运行时权限和 fallback，但需要在 API 28/29 模拟器上验证 grant/deny。
+7. **启动耗时**：`ensurePkgSetup` 每次启动约 8 秒（扫描 1163 symlink + DB），可后续加版本 marker/轻量检查优化。
+8. **release APK 未安装**：release 已构建（64.48MB），debug 已验证；release 签名与 debug 不同，不能直接覆盖安装。
+9. **`$HOME/.dpkg.cfg` warning**：`dpkg --audit` 会提示 `/storage/emulated/0/AMCode/.dpkg.cfg` 权限不足；不影响安装，但外部 HOME 的副作用仍在。
+
+---
+
+## 5. 产物与使用
+
+| 产物 | 路径 |
+|---|---|
+| debug APK（已安装平板） | `app/build/outputs/apk/debug/app-debug.apk`（68.75MB） |
+| release APK（已构建未安装） | `app/build/outputs/apk/release/app-release.apk`（64.48MB） |
+| 平板 AVD | `AMCode_Tablet_API34`，adb `emulator-5558` |
+| 启动脚本 | [run-emulator.bat](run-emulator.bat) |
+| 评测报告 | [AMCODE_REVIEW_2026-10-24.md](AMCODE_REVIEW_2026-10-24.md) |
+| 本轮截图 | [review-assets](review-assets) |
+
+常用命令：
+
+```powershell
+# 启动平板
+D:\Android\Sdk\emulator\emulator.exe -avd AMCode_Tablet_API34 -gpu auto -no-audio -port 5558
+
+# 安装/覆盖 debug
+adb -s emulator-5558 install -r app\build\outputs\apk\debug\app-debug.apk
+
+# 看日志
+adb -s emulator-5558 logcat -s TermuxManager:I CodeServerService:I CodeServerLauncher:I MainActivity:I
+
+# pkg 验证（在 app 终端或 run-as 脚本里）
+pkg install -y clang
+clang --version
+```
+
+---
+
+## 6. 建议下一步
+
+1. 在 API 28/29 AVD 上跑存储授权/拒绝回归。
+2. 给 `ensurePkgSetup` 加版本 marker，避免每次启动 8 秒。
+3. 解决 extension host 的 `spdlog`/`ripgrep` native 问题（TUR 包 ABI 或补 symlink）。
+4. 加 code-server token/auth，彻底解决同机 loopback 访问。
+5. 决定 `/sdcard` 与内部 HOME 的产品策略；把 Git/编译推荐路径写进 UI。
+6. 把本轮改动 commit（当前未提交），再打 release tag；release APK 安装前需卸载 debug（签名不同）。
