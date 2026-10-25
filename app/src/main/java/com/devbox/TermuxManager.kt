@@ -51,6 +51,15 @@ object TermuxManager {
     private const val MAX_RANGE_CONNECTIONS = 8
 
     /**
+     * Self-hosted mirror for the pinned TUR debs (GitHub release assets of
+     * this repository). TUR has no mirrors and 302s to rate-limited GitHub
+     * assets; our own release of the SAME files (MIT-licensed rebuilds) is
+     * tried first, with the original TUR URL kept as fallback.
+     */
+    private const val DEB_MIRROR_BASE =
+        "https://github.com/whn-hjm/AMCode/releases/download/amcode-debs-1"
+
+    /**
      * libc++ 30 added this symbol; libc++ 29 lacks it. TUR code-server native
      * modules (spdlog / @parcel/watcher) fail to load without it.
      */
@@ -2253,7 +2262,18 @@ object TermuxManager {
         val filename: String,
         val size: Long,
         val sha256: String?
-    )
+    ) {
+        /** Self-hosted mirror first for TUR-hosted files, original otherwise. */
+        fun candidateUrls(): List<String> {
+            val isTur = url.contains("tur.kcubeterm.com") ||
+                url.contains("termux-user-repository")
+            return if (isTur) {
+                listOf("$DEB_MIRROR_BASE/$filename", url)
+            } else {
+                listOf(url)
+            }
+        }
+    }
 
     /**
      * Ask apt for the exact URLs of everything code-server needs without
@@ -2370,8 +2390,45 @@ object TermuxManager {
         onProgress: (Long, Long) -> Unit
     ): Boolean {
         if (dest.exists() && !isCompleteDeb(dest, spec)) dest.delete()
-        val size = if (spec.size > 0) spec.size else contentLength(spec.url)
-        if (size <= 0) return downloadSingle(spec, dest, null, onProgress)
+        var lastError: Exception? = null
+        for (url in spec.candidateUrls()) {
+            val attempted = try {
+                downloadOneFrom(spec, url, dest, onProgress)
+            } catch (e: RangeUnsupportedException) {
+                // Range handled inside; propagate to keep single-stream logic.
+                downloadOneFallback(spec, url, dest, onProgress)
+                return true
+            } catch (e: Exception) {
+                Log.w(TAG, "Download from $url failed: ${e.message}")
+                lastError = e
+                false
+            }
+            if (attempted) return true
+            // Clean partial state before the next candidate (different host,
+            // same target file: parts are byte-range addressed and resumable,
+            // but a failed host may have left nothing useful).
+        }
+        lastError?.let { throw it }
+        return false
+    }
+
+    private fun downloadOneFallback(
+        spec: DownloadSpec,
+        url: String,
+        dest: File,
+        onProgress: (Long, Long) -> Unit
+    ): Boolean {
+        return downloadOneFrom(spec, url, dest, onProgress)
+    }
+
+    private fun downloadOneFrom(
+        spec: DownloadSpec,
+        url: String,
+        dest: File,
+        onProgress: (Long, Long) -> Unit
+    ): Boolean {
+        val size = if (spec.size > 0) spec.size else contentLength(url)
+        if (size <= 0) return downloadSingle(spec, url, dest, null, onProgress)
 
         val connections = when {
             size >= 32L * 1024 * 1024 -> MAX_RANGE_CONNECTIONS
@@ -2379,19 +2436,20 @@ object TermuxManager {
             size >= 2L * 1024 * 1024 -> 4
             else -> 1
         }
-        if (connections <= 1) return downloadSingle(spec, dest, size, onProgress)
+        if (connections <= 1) return downloadSingle(spec, url, dest, size, onProgress)
 
         return try {
-            downloadRanged(spec, dest, size, connections, onProgress)
+            downloadRanged(spec, url, dest, size, connections, onProgress)
         } catch (e: RangeUnsupportedException) {
             Log.i(TAG, "Range not supported for ${spec.filename}; using single stream")
             cleanupPartialDownloads(listOf(spec))
-            downloadSingle(spec, dest, size, onProgress)
+            downloadSingle(spec, url, dest, size, onProgress)
         }
     }
 
     private fun downloadRanged(
         spec: DownloadSpec,
+        url: String,
         dest: File,
         size: Long,
         connections: Int,
@@ -2399,7 +2457,7 @@ object TermuxManager {
     ): Boolean {
         val segments = minOf(connections, ((size + 4L * 1024 * 1024 - 1) / (4L * 1024 * 1024)).toInt())
             .coerceAtLeast(1)
-        if (segments <= 1) return downloadSingle(spec, dest, size, onProgress)
+        if (segments <= 1) return downloadSingle(spec, url, dest, size, onProgress)
         val segmentSize = (size + segments - 1) / segments
         val downloaded = AtomicLong(0L)
         val abort = AtomicBoolean(false)
@@ -2425,7 +2483,7 @@ object TermuxManager {
                     val start = index.toLong() * segmentSize
                     val end = minOf(size - 1, start + segmentSize - 1)
                     downloadSegment(
-                        spec.url, dest, index, start, end,
+                        url, dest, index, start, end,
                         downloaded, abort, onProgress, size
                     )
                 }
@@ -2581,6 +2639,7 @@ object TermuxManager {
 
     private fun downloadSingle(
         spec: DownloadSpec,
+        url: String,
         dest: File,
         knownSize: Long?,
         onProgress: (Long, Long) -> Unit
@@ -2595,7 +2654,7 @@ object TermuxManager {
             }
             var conn: HttpURLConnection? = null
             try {
-                conn = openHttp(spec.url)
+                conn = openHttp(url)
                 if (have > 0) conn.setRequestProperty("Range", "bytes=$have-")
                 var code = conn.responseCode
                 if (code == HttpURLConnection.HTTP_OK && have > 0) {

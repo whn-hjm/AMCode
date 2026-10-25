@@ -1,8 +1,31 @@
+import java.io.EOFException
+import java.util.zip.GZIPInputStream
+import org.tukaani.xz.XZInputStream
 import java.io.FileOutputStream
+import java.io.InputStream
+import java.io.OutputStream
 import java.net.HttpURLConnection
 import java.net.URL
 import java.security.MessageDigest
 import java.util.Properties
+
+import org.apache.commons.compress.archivers.tar.TarArchiveEntry
+import org.apache.commons.compress.archivers.tar.TarArchiveInputStream
+import org.apache.commons.compress.archivers.tar.TarArchiveOutputStream
+import org.apache.commons.compress.compressors.CompressorStreamFactory
+
+buildscript {
+    repositories {
+        mavenCentral()
+    }
+    dependencies {
+        // XZ for Java: needed by Gradle's tarTree() to unpack the pinned
+        // .debs' data.tar.xz during the offline-bundle build. Only tukaani
+        // is declared here — commons-compress must NOT be re-declared
+        // because the Gradle distribution shadows it with its own version.
+        classpath("org.tukaani:xz:1.9")
+    }
+}
 
 plugins {
     id("com.android.application")
@@ -312,6 +335,192 @@ fun offlineSha256(file: File): String {
     return digest.digest().joinToString("") { "%02x".format(it.toInt() and 0xff) }
 }
 
+// Dead-weight payload prefixes per target ABI (16KB audit, 2026-10-25):
+// npm prebuilds for other architectures that can never load on-device.
+val offlineDeadPrefixes = mapOf(
+    "aarch64" to listOf(
+        "lib/code-server/lib/vscode/extensions/microsoft-authentication/dist/libmsalruntime.so",
+        "lib/code-server/lib/vscode/extensions/microsoft-authentication/dist/msal-node-runtime.node",
+        "lib/code-server/lib/vscode/node_modules/@github/copilot-sdk-linux-x64/",
+        "lib/code-server/lib/vscode/node_modules/@koromix/koffi-linux-x64/",
+        "lib/code-server/lib/vscode/node_modules/@parcel/watcher-linux-x64-glibc/",
+        "lib/code-server/lib/vscode/node_modules/@parcel/watcher-linux-x64-musl/",
+        "lib/code-server/lib/vscode/node_modules/@vscode/sandbox-runtime/vendor/seccomp/x64/apply-seccomp",
+        "lib/code-server/node_modules/argon2/prebuilds/freebsd-x64/",
+        "lib/code-server/node_modules/argon2/prebuilds/linux-x64/",
+        "lib/code-server/node_modules/argon2/prebuilds/linux-arm/"
+    ),
+    "x86_64" to listOf(
+        "lib/code-server/node_modules/argon2/prebuilds/freebsd-arm64/",
+        "lib/code-server/node_modules/argon2/prebuilds/linux-arm64/",
+        "lib/code-server/node_modules/argon2/prebuilds/linux-arm/"
+    )
+)
+
+/**
+ * Rewrite a Termux .deb without its foreign-arch payload entries. The deb is
+ * an ar archive of [debian-binary, control.tar.*, data.tar.*]; only data.tar
+ * changes: foreign payload files are deleted, so dpkg never sees them and the
+ * on-device .list stays consistent automatically.
+ *
+ * Implemented with Gradle-native machinery only (manual ar container +
+ * project.tarTree/ant.tar for the tar layer) so the build does not depend on
+ * whichever commons-compress version the Gradle distribution shadows.
+ * data.tar is re-emitted as gzip (dpkg accepts tar.gz/xz alike).
+ */
+fun stripForeignArchFromDeb(project: Project, original: File, dest: File, arch: String) {
+    val prefixes = offlineDeadPrefixes[arch]
+        ?: throw GradleException("No dead-prefix list for offline arch $arch")
+    val dataPrefix = "data/data/com.termux/files/usr/"
+    val work = File.createTempFile("amcode-deb", ".work").let {
+        it.delete()
+        it.mkdirs()
+        it
+    }
+    try {
+        // 1. Split the ar members into files.
+        val debianBinary = File(work, "debian-binary")
+        var controlFile: File? = null
+        var controlName: String = "control.tar.gz"
+        var dataFile: File? = null
+        try {
+        original.inputStream().buffered().use { input ->
+            val magic = ByteArray(8)
+            var magicOff = 0
+            while (magicOff < magic.size) {
+                val read = input.read(magic, magicOff, magic.size - magicOff)
+                if (read < 0) throw EOFException("unexpected end of ar archive")
+                magicOff += read
+            }
+            if (String(magic, Charsets.US_ASCII) != "!<arch>\n") {
+                throw GradleException("Not an ar archive: " + original.name)
+            }
+            while (true) {
+                val headerBytes = ByteArray(60)
+                var off = 0
+                while (off < headerBytes.size) {
+                    val read = input.read(headerBytes, off, headerBytes.size - off)
+                    if (read < 0) throw EOFException("unexpected end of ar archive")
+                    off += read
+                }
+                val header = String(headerBytes, Charsets.US_ASCII)
+                val name = header.substring(0, 16).trim().trimEnd('/')
+                val size = header.substring(48, 58).trim().toLong()
+                val member = File(work, name.replace('/', '_'))
+                member.outputStream().use { memberOut ->
+                    copyExactly(input, memberOut, size)
+                }
+                if (size % 2 == 1L) input.read()
+                when {
+                    name == "debian-binary" -> { }
+                    name.startsWith("control.tar") -> {
+                        controlFile = member
+                        controlName = name
+                    }
+                    name.startsWith("data.tar") -> dataFile = member
+                }
+            }
+        }
+        } catch (_: java.io.EOFException) {
+            // trailing padding after the last member
+        }
+        val controlResolved = controlFile
+            ?: throw GradleException("No control.tar member in ${original.name}")
+        val dataResolved = dataFile
+            ?: throw GradleException("No data.tar member in ${original.name}")
+
+        // 2. Decompress data.tar.xz ourselves (Gradle's tarTree cannot see
+        // the xz library across classloaders) and expand the plain tar.
+        val dataTarPlain = File(work, "data.tar")
+        when {
+            dataResolved.name.endsWith(".xz") ->
+                XZInputStream(dataResolved.inputStream().buffered()).use { xz ->
+                    dataTarPlain.outputStream().buffered().use { out -> xz.copyTo(out, 1024 * 1024) }
+                }
+            dataResolved.name.endsWith(".gz") ->
+                GZIPInputStream(dataResolved.inputStream().buffered()).use { gz ->
+                    dataTarPlain.outputStream().buffered().use { out -> gz.copyTo(out, 1024 * 1024) }
+                }
+            else -> dataResolved.copyTo(dataTarPlain, overwrite = true)
+        }
+        val payload = File(work, "payload").apply { mkdirs() }
+        project.copy {
+            from(project.tarTree(dataTarPlain))
+            into(payload)
+        }
+
+        // 3. Delete foreign-arch payload files.
+        var dropped = 0
+        for (rel in prefixes) {
+            val target = File(payload, dataPrefix + rel)
+            if (target.isDirectory) {
+                target.walkTopDown().forEach { if (it.isFile) dropped++ }
+                target.deleteRecursively()
+            } else if (target.isFile) {
+                dropped++
+                target.delete()
+            }
+        }
+
+        // 4. Re-pack data.tar with plain tar, then xz-compress it via tukaani
+        // (same archive shape as the original Termux deb).
+        val dataTar = File(work, "data.tar")
+        project.ant.invokeMethod(
+            "tar",
+            mapOf(
+                "destfile" to dataTar.absolutePath,
+                "basedir" to payload.absolutePath,
+                "longfile" to "gnu"
+            )
+        )
+        val dataGz = File(work, "data.tar.xz")
+        org.tukaani.xz.XZOutputStream(dataGz.outputStream().buffered(), org.tukaani.xz.LZMA2Options()).use { xz ->
+            dataTar.inputStream().buffered().use { it.copyTo(xz, 1024 * 1024) }
+        }
+        dataTar.delete()
+
+        // 5. Reassemble the ar archive.
+        dest.outputStream().buffered().use { output ->
+            output.write("!<arch>\n".toByteArray(Charsets.US_ASCII))
+            output.writeArMember("debian-binary", debianBinary.readBytes())
+            output.writeArMember(controlName, controlResolved.readBytes())
+            output.writeArMember("data.tar.xz", dataGz.readBytes())
+        }
+        println("  stripped $dropped foreign-arch file(s) from ${dest.name}")
+    } finally {
+        work.deleteRecursively()
+    }
+}
+
+/** Write one ar member with the standard 60-byte header. */
+/** Copy exactly [size] bytes (ar members are 2-byte aligned by the caller). */
+fun copyExactly(input: InputStream, output: OutputStream, size: Long) {
+    val buffer = ByteArray(64 * 1024)
+    var remaining = size
+    while (remaining > 0) {
+        val read = input.read(buffer, 0, minOf(buffer.size.toLong(), remaining).toInt())
+        if (read < 0) throw EOFException("unexpected end of ar member")
+        output.write(buffer, 0, read)
+        remaining -= read
+    }
+}
+
+fun OutputStream.writeArMember(name: String, content: ByteArray) {
+    val b = ByteArray(60)
+    val sb = StringBuilder(name)
+    while (sb.length < 16) sb.append(' ')
+    sb.append("0"); while (sb.length < 28) sb.append(' ')
+    sb.append("0"); while (sb.length < 34) sb.append(' ')
+    sb.append("0"); while (sb.length < 40) sb.append(' ')
+    sb.append("100644"); while (sb.length < 48) sb.append(' ')
+    sb.append(content.size); while (sb.length < 58) sb.append(' ')
+    sb.append("`\n")
+    System.arraycopy(sb.toString().toByteArray(Charsets.US_ASCII), 0, b, 0, 60)
+    write(b)
+    write(content)
+    if (content.size % 2 == 1) write(0)
+}
+
 fun downloadOfflineDeb(urlText: String, dest: File, expectedSize: Long) {
     val partial = File(dest.parentFile, "${dest.name}.part")
     var conn: HttpURLConnection? = null
@@ -397,38 +606,72 @@ val downloadOfflineBundle = tasks.register("downloadOfflineBundle") {
         val outDir = offlineAssetsRoot.get().asFile.resolve("offline-debs/$arch")
         outDir.mkdirs()
 
+        // Original pinned debs are cached OUTSIDE the assets source dir:
+        // everything under offlineAssetsRoot ships inside the APK.
+        val originalDir = File(offlineAssetsRoot.get().asFile.parentFile, "offline-originals/$arch").apply { mkdirs() }
+        // Stale assets from previous builds must never ship: drop any file in
+        // the assets dir that is not part of the current pinned set.
+        val keep = debs.map { it.filename }.toSet()
+        outDir.listFiles()?.forEach {
+            if (it.isFile && it.name !in keep && !it.name.endsWith(".stripped.sha256")) it.delete()
+        }
+        val strippedFiles = mutableListOf<OfflineDeb>()
         for (deb in debs) {
             val dest = File(outDir, deb.filename)
-            if (dest.isFile && dest.length() == deb.size &&
-                offlineSha256(dest).equals(deb.sha256, ignoreCase = true)
+            val sidecar = File(outDir, "${deb.filename}.stripped.sha256")
+            // Sidecar content: "<stripper revision>\n<sha256>"; bump the
+            // revision whenever the stripping code changes so cached outputs
+            // from a buggy revision are rebuilt.
+            if (dest.isFile && sidecar.isFile &&
+                sidecar.readText().trim().startsWith("3\n") &&
+                offlineSha256(dest).equals(sidecar.readText().trim().substringAfter('\n'), ignoreCase = true)
             ) {
                 File(outDir, "${deb.filename}.part").delete()
-                println("Cached ${deb.filename}")
+                println("Cached stripped ${deb.filename}")
                 continue
             }
             dest.delete()
-            val source = offlineBundleSourceDir?.let { File(it, deb.filename) }
-            if (source != null) {
-                if (!source.isFile) {
-                    throw GradleException("offlineBundleSourceDir does not contain ${deb.filename}")
-                }
-                println("Copying ${deb.filename} from ${source.absolutePath}")
-                source.copyTo(dest, overwrite = true)
-            } else {
-                println("Downloading ${deb.filename} (${deb.size / (1024 * 1024)} MB) from TUR...")
-                downloadOfflineDeb(deb.url, dest, deb.size)
-            }
-            if (dest.length() != deb.size ||
-                !offlineSha256(dest).equals(deb.sha256, ignoreCase = true)
+            // 1. Obtain the ORIGINAL pinned deb (cache, source dir or TUR).
+            val original = File(originalDir, deb.filename)
+            if (!(original.isFile && original.length() == deb.size &&
+                    offlineSha256(original).equals(deb.sha256, ignoreCase = true))
             ) {
-                val actualSize = dest.length()
-                val actual = if (dest.isFile) offlineSha256(dest) else "<missing>"
-                dest.delete()
-                throw GradleException(
-                    "Checksum mismatch for ${deb.filename}: size=$actualSize sha256=$actual"
-                )
+                original.delete()
+                val source = offlineBundleSourceDir?.let { File(it, deb.filename) }
+                if (source != null) {
+                    if (!source.isFile) {
+                        throw GradleException("offlineBundleSourceDir does not contain ${deb.filename}")
+                    }
+                    println("Copying ${deb.filename} from ${source.absolutePath}")
+                    source.copyTo(original, overwrite = true)
+                } else {
+                    println("Downloading ${deb.filename} (${deb.size / (1024 * 1024)} MB) from TUR...")
+                    downloadOfflineDeb(deb.url, original, deb.size)
+                }
+                if (original.length() != deb.size ||
+                    !offlineSha256(original).equals(deb.sha256, ignoreCase = true)
+                ) {
+                    val actualSize = original.length()
+                    val actual = if (original.isFile) offlineSha256(original) else "<missing>"
+                    original.delete()
+                    throw GradleException(
+                        "Checksum mismatch for ${deb.filename}: size=$actualSize sha256=$actual"
+                    )
+                }
             }
+            // 2. Strip foreign-arch payloads (dead weight on the target ABI).
+            println("Stripping foreign-arch payloads from ${deb.filename}...")
+            stripForeignArchFromDeb(project, original, dest, arch)
             File(outDir, "${deb.filename}.part").delete()
+            sidecar.writeText("3\n" + offlineSha256(dest))
+            strippedFiles += OfflineDeb(
+                deb.name, deb.version, deb.filename,
+                dest.length(), offlineSha256(dest), deb.url, deb.aptDeps
+            )
+            println(
+                "Stripped ${deb.filename}: ${deb.size / (1024 * 1024)} MB -> " +
+                    "${dest.length() / (1024 * 1024)} MB"
+            )
         }
 
         // git is a main-repo package (not TUR), so it is resolved + downloaded
@@ -444,13 +687,13 @@ val downloadOfflineBundle = tasks.register("downloadOfflineBundle") {
             append(aptDeps.joinToString(", ") { "\"$it\"" })
             append("],\n")
             append("  \"packages\": [\n")
-            debs.forEachIndexed { index, deb ->
+            strippedFiles.forEachIndexed { index, deb ->
                 append("    {\"name\": \"").append(deb.name).append("\", ")
                 append("\"version\": \"").append(deb.version).append("\", ")
                 append("\"filename\": \"").append(deb.filename).append("\", ")
                 append("\"size\": ").append(deb.size).append(", ")
                 append("\"sha256\": \"").append(deb.sha256).append("\"}")
-                if (index != debs.lastIndex) append(",")
+                if (index != strippedFiles.lastIndex) append(",")
                 append("\n")
             }
             append("  ]\n}\n")
