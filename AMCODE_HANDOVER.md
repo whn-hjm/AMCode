@@ -318,6 +318,7 @@ curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' http://127.0.0.1:<PORT>
 | 外部 HOME 下 git/编译失败 | /sdcard FUSE noexec | Storage action 切回 internal HOME |
 | 通知栏没有进度更新 | 系统限流（已节流 2/s） | 正常；看 logcat |
 | `run-as: package not debuggable` | release 构建 | 从 logcat `code-server PID=... bound to 127.0.0.1:<port>` 拿端口 |
+| 搜不到中文语言包/中文关键词扩展 | Open VSX 搜索索引不匹配中文关键词（包描述是英文） | 搜英文 `Simplified` / `zh-hans`（认准 Chinese (Simplified)，别选 zh-hant 繁体）；或 open-vsx.org 下载 .vsix → Install from VSIX。装后 Configure Display Language 切中文 |
 
 **紧急恢复**：`pm clear com.devbox` 会清掉 internal HOME 的用户文件（含 `~/` 下项目）——清前先确认文件在 `/sdcard/AMCode` 或已备份。卸载重装同样清 data。
 
@@ -342,6 +343,7 @@ curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' http://127.0.0.1:<PORT>
 ## 11. 变更记录（每批次一条，倒序；新改动加在最上面）
 
 ### 2026-10-25 下午 · 产品口径：主线不做 proot
+- （运维补充）Open VSX 搜索对中文关键词无效：语言包等搜英文关键词或 VSIX 安装（§9 已记）。
 - 用户拍板：proot 性能不可接受，主线坚持 native bionic；glibc 兼容主线路径改为自编译/patched code-server（§13 P1-2）。
 - §13 P1-1 降级为"未来独立 proot 版本"候选备忘；§0/§6.11/§7 同步更正。README/ARCHITECTURE 的 "no proot" 卖点描述不受影响。
 
