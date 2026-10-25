@@ -4,6 +4,8 @@
   <strong>One APK. Open it and you're in VS Code. No Termux, no root.</strong>
 </p>
 
+<p align="center">English | <a href="README_zh.md">简体中文</a></p>
+
 <p align="center">
   v1.1.0 (versionCode 2) · code-server 4.143.1 · Node.js 24.18.0 · Android 8.0+
 </p>
@@ -20,10 +22,11 @@ Big thanks to **[Termux](https://github.com/termux/termux-app)** for the ARM64/x
 |---|---|---|
 | APK size | ~64 MB | ~162 MB (arm64-only) |
 | code-server + Node.js | downloaded on first launch from TUR | bundled inside the APK |
-| First-launch download | ≈127 MB from TUR + ~18 MB dependencies | ~18 MB dependencies only (never touches TUR) |
+| First-launch download | ≈127 MB from TUR + ~23 MB dependencies | ~23 MB dependencies from the main mirror only (never touches TUR) |
+| git included at first launch | no (`pkg install git`) | **yes** |
 | Best for | any network that can reach `tur.kcubeterm.com` | slow/unreachable TUR, reproducible installs |
 
-Both variants are otherwise identical. The offline APK embeds the same pinned, SHA-256-verified `code-server` and `nodejs-24` `.deb`s that the online variant downloads; on first launch it only pulls the ~18 MB of small dependencies from the main Termux repository.
+Both variants are otherwise identical. The offline APK embeds the same pinned, SHA-256-verified `code-server` and `nodejs-24` `.deb`s that the online variant downloads; on first launch it pulls the small dependencies **plus git** from the main Termux repository, so it works as a self-sufficient offline dev environment.
 
 ## Installation & First Launch
 
@@ -47,10 +50,10 @@ A persistent notification keeps the server alive. It has two actions: **Stop** a
 
 Press `` Ctrl+` `` for a real **bash** shell running on Android's bionic libc — no proot, no emulation.
 
-`pkg` works just like in Termux (same repositories, thousands of packages). For example, `git` is *not* preinstalled — add it yourself:
+`pkg` works just like in Termux (same repositories, thousands of packages). The **offline variant ships with git**; on the online variant install it yourself:
 
 ```bash
-pkg install git          # Git (not bundled — install it yourself)
+pkg install git          # online variant only (offline ships with git)
 pkg install clang make cmake   # C / C++
 pkg install python             # Python
 pkg install rust               # Rust
@@ -67,6 +70,7 @@ Notes:
 ## Extensions
 
 - The marketplace is **[Open VSX](https://open-vsx.org)** (code-server's default), not the Microsoft Marketplace — Microsoft's marketplace may only be used by official VS Code products.
+- **Searching with non-English keywords finds little** (Open VSX's search index matches English text): for language packs search `Simplified` / `zh-hans` / `Japanese`, or download the `.vsix` from open-vsx.org and use *Install from VSIX*.
 - Pure-JS extensions and language packs install and run. **glibc-native extension binaries do not work** (the runtime is bionic), so extensions that ship prebuilt `.node` binaries compiled against glibc won't load.
 - A platform shim (`android-as-linux.js`) is injected into the extension host so extensions see a Linux-ish platform (`fileWatcher`, `ptyHost`, terminal stay Android-native). Kill switches: create `$HOME/.amcode/disable-platform-shim` or set `AMCODE_ANDROID_PLATFORM_SHIM=0`.
 - VS Code **Workspace Trust** is not bypassed. On first load you get a one-time hint explaining trust; restricted mode and the trust prompt behave exactly as upstream. Only trust folders you control.
