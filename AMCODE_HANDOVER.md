@@ -241,7 +241,7 @@ curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' http://127.0.0.1:<PORT>
 7. **32 位 ARM 不支持**：`bootstrapAsset()` 对 armeabi-v7a 落到 aarch64 zip，装得上跑不起来且报错含糊。应显式 fail-fast 或文档声明。
 8. **多用户/work profile 路径视图**：dpkg DB 与 shell 脚本用 `/data/data/com.devbox` 字面路径，secondary user（`/data/user/10/...`）下 DB 记录与实际路径不一致（可运行，`dpkg -V` 错位）。声明不支持即可。
 9. **i18n 双轨制**：新 UI 全部走 `isChinese()` 硬编码双语，strings.xml/服务端消息仍仅英文；非中英文 locale 全英文。
-10. **mint-key 探测的潜在副作用**：每次启动 POST /mint-key 可能铸造并遗留一个 API key（未验证 4.143.1 语义；若确认有副作用，换无副作用需认证端点）。
+10. ~~**mint-key 探测的潜在副作用**~~ **已核实无问题（2026-10-25，主 agent 查 v4.143.1 源码）**：`POST /mint-key`（src/node/routes/vscode.ts:213，ensureAuthenticated 保护）只是惰性创建/读取 user-data-dir 下一个 32 字节 `serve-web-key-half` 文件（模块级缓存，缺失才写一次，跨启动复用）——不是会累积的 API key，保留现用法。`GET /healthz` 确认免认证（routes/index.ts:156 独立挂载）。
 11. **glibc native 扩展不可用**（bionic 限制）：纯 JS/语言包可用；完整兼容需 proot/glibc（CodeFA 路线）或 VHEditor 式 patched code-server——见 §13。
 12. **AOSP 无 WebView 的设备**：现已给出明确报错对话框（未在真机复测；API26 AOSP 镜像实测触发该路径）。极旧 WebView 版本无版本门槛提示（P3 池）。
 13. **默认在线 TUR 仍慢**：TUR 无镜像，8 连接受 GitHub 限速；offline 版是解决方案（已实现）。
@@ -270,7 +270,7 @@ curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' http://127.0.0.1:<PORT>
 - [ ] **[T-G1]** resolv.conf 不再覆盖用户定制（TermuxManager，子代理1）
 - [ ] **[T-E1]** i18n 迁移 values-zh（MainActivity 对话框/Toast + strings.xml + values-zh，子代理3）
 - [ ] **[T-E2]** WebView 版本门槛检查（MainActivity，子代理3）
-- [ ] **[T-F]** mint-key 语义调研（读 code-server 4.143.1 源码；有副作用则换探测端点，子代理4，只读）
+- [ ] **[T-F]** ~~mint-key 语义调研~~ **已完成（主 agent 直查 v4.143.1 源码）：无副作用问题，保留现用法**（结论见 §6.10）。
 - [ ] **[T-G2]** D2D dataExtractionRules 显式排除 cache 域（res/xml，主 agent 顺带）
 - [ ] `~/storage/shared` 无 MANAGE 时的按需授权/拒绝/重试 UI 全回归（已部分覆盖）
 
