@@ -19,6 +19,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * Foreground Service that manages the code-server process lifecycle.
@@ -191,7 +192,15 @@ class CodeServerService : Service() {
             try {
                 if (waitFor != null) {
                     try {
-                        waitFor.join()
+                        // The cancelled pipeline's blocking sections (apt/dpkg)
+                        // do not observe coroutine cancellation promptly; do
+                        // not let this pipeline (and its UI) wait on them
+                        // forever — e.g. when the user switches HOME while the
+                        // first install is still downloading.
+                        withTimeoutOrNull(15_000) { waitFor.join() }
+                        if (waitFor.isActive) {
+                            Log.w(TAG, "Previous pipeline still unwinding; starting anyway")
+                        }
                     } catch (e: CancellationException) {
                         throw e
                     }

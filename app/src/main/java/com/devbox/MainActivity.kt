@@ -108,6 +108,19 @@ class MainActivity : AppCompatActivity() {
     private var lastHandledSharedFolder: String? = null
     private var pendingHomeSettingsDialog = false
 
+    // File chooser for <input type=file> (extension uploads, VS Code webviews).
+    private var filePathCallback: android.webkit.ValueCallback<Array<Uri>>? = null
+    private val fileChooserLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        val callback = filePathCallback ?: return@registerForActivityResult
+        filePathCallback = null
+        val uris = result.data?.let {
+            android.webkit.WebChromeClient.FileChooserParams.parseResult(result.resultCode, it)
+        }
+        callback.onReceiveValue(uris)
+    }
+
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
             val binder = service as? CodeServerService.LocalBinder
@@ -630,7 +643,7 @@ class MainActivity : AppCompatActivity() {
             Log.w(TAG, "All-files settings not available", e)
         }
         pendingStoragePurpose = StoragePurpose.NONE
-        if (purpose == StoragePurpose.ON_DEMAND_SHARED) {
+        if (purpose == StoragePurpose.ON_DEMAND_SHARED || purpose == StoragePurpose.SWITCH_EXTERNAL) {
             Toast.makeText(
                 this,
                 if (isChinese()) "无法打开存储设置" else "Cannot open storage settings",
@@ -654,7 +667,7 @@ class MainActivity : AppCompatActivity() {
         } catch (e: Exception) {
             Log.e(TAG, "Cannot request storage permissions", e)
             pendingStoragePurpose = StoragePurpose.NONE
-            if (purpose == StoragePurpose.ON_DEMAND_SHARED) {
+            if (purpose == StoragePurpose.ON_DEMAND_SHARED || purpose == StoragePurpose.SWITCH_EXTERNAL) {
                 Toast.makeText(
                     this,
                     if (isChinese()) "无法申请存储权限" else "Cannot request storage permission",
@@ -798,9 +811,11 @@ class MainActivity : AppCompatActivity() {
             false
         }
 
-        // Accept cookies for code-server session
+        // Accept cookies for code-server session. Third-party cookies are not
+        // needed: the page and all its iframes are served from 127.0.0.1, and
+        // a workspace page must not read cookies of cross-origin frames.
         CookieManager.getInstance().setAcceptCookie(true)
-        CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true)
+        CookieManager.getInstance().setAcceptThirdPartyCookies(webView, false)
 
         // Clear any cached data that might interfere
         webView.clearCache(false)
@@ -819,6 +834,12 @@ class MainActivity : AppCompatActivity() {
                 val uri = request?.url ?: return false
                 // Only the exact local code-server origin stays in the WebView.
                 if (isLocalServerUri(uri)) {
+                    return false
+                }
+                // about:blank & friends are same-page navigations used by
+                // window.open() popups; blocking them silently breaks those
+                // flows without any security gain.
+                if (uri.scheme?.lowercase(Locale.US) == "about") {
                     return false
                 }
                 if (isExternalSchemeAllowed(uri)) {
@@ -921,6 +942,23 @@ class MainActivity : AppCompatActivity() {
                 scheduleWebViewAutoRetry()
             }
 
+            override fun onReceivedHttpError(
+                view: WebView?,
+                request: WebResourceRequest?,
+                errorResponse: android.webkit.WebResourceResponse?
+            ) {
+                super.onReceivedHttpError(view, request, errorResponse)
+                // Main-frame HTTP errors (e.g. code-server 5xx) do not go
+                // through onReceivedError; log them so the cause is visible
+                // in bug reports. Retry logic stays with onReceivedError.
+                if (request?.isForMainFrame == true) {
+                    Log.w(
+                        TAG,
+                        "WebView HTTP ${errorResponse?.statusCode} for ${request.url}"
+                    )
+                }
+            }
+
             override fun onRenderProcessGone(
                 view: WebView?,
                 detail: RenderProcessGoneDetail?
@@ -956,6 +994,29 @@ class MainActivity : AppCompatActivity() {
             override fun onProgressChanged(view: WebView?, newProgress: Int) {
                 if (newProgress < 100 && loadingOverlay.visibility == View.VISIBLE) {
                     progressBar.progress = newProgress
+                }
+            }
+
+            override fun onShowFileChooser(
+                view: WebView?,
+                callback: android.webkit.ValueCallback<Array<Uri>>?,
+                params: android.webkit.WebChromeClient.FileChooserParams?
+            ): Boolean {
+                if (callback == null || params == null) return false
+                // Cancel any pending picker first so the WebView never waits on
+                // two callbacks.
+                filePathCallback?.onReceiveValue(null)
+                filePathCallback = null
+                return try {
+                    fileChooserLauncher.launch(Intent.createChooser(params.createIntent(), null))
+                    filePathCallback = callback
+                    true
+                } catch (e: ActivityNotFoundException) {
+                    Log.w(TAG, "No file chooser available", e)
+                    false
+                } catch (e: Exception) {
+                    Log.w(TAG, "Cannot launch file chooser", e)
+                    false
                 }
             }
 
@@ -1377,10 +1438,9 @@ class MainActivity : AppCompatActivity() {
         if (HomePrefs.wasInternalTrustHintShown(this)) return
         val internal = HomePrefs.internalHomeDir(this).absolutePath
         if (TermuxManager.homeDir.absolutePath != internal) return
-        HomePrefs.markInternalTrustHintShown(this)
 
         val isZh = isChinese()
-        AlertDialog.Builder(this)
+        val dialog = AlertDialog.Builder(this)
             .setTitle(if (isZh) "启用扩展：信任工作区" else "Enable extensions: trust the workspace")
             .setMessage(
                 if (isZh)
@@ -1395,7 +1455,11 @@ class MainActivity : AppCompatActivity() {
                         "AMCode never trusts a folder automatically on your behalf."
             )
             .setPositiveButton(if (isZh) "我知道了" else "Got it", null)
-            .show()
+            .create()
+        // Mark only once the dialog is actually on screen: an exception or
+        // a finishing Activity must not permanently consume the hint.
+        dialog.setOnShowListener { HomePrefs.markInternalTrustHintShown(this) }
+        dialog.show()
     }
 
     private fun maybeShowPendingHomeSettingsDialog() {
@@ -1792,11 +1856,16 @@ class MainActivity : AppCompatActivity() {
             } else {
                 startService(intent)
             }
-            bindService(
-                intent,
-                serviceConnection,
-                Context.BIND_AUTO_CREATE or Context.BIND_IMPORTANT
-            )
+            // bindService must pair with onDestroy's unbindService: binding
+            // again on every retry (retryService resets serviceStartRequested)
+            // would stack connections that are only unbound once.
+            if (!serviceBound) {
+                bindService(
+                    intent,
+                    serviceConnection,
+                    Context.BIND_AUTO_CREATE or Context.BIND_IMPORTANT
+                )
+            }
             Log.i(TAG, "CodeServerService start+bind requested")
         } catch (e: Exception) {
             serviceStartRequested = false
@@ -1872,6 +1941,9 @@ class MainActivity : AppCompatActivity() {
     // ─── UI helpers ───────────────────────────────────────────
 
     private fun updateProgress(message: String, progress: Int) {
+        // Progress text may still carry a tap-to-retry listener from an error
+        // state; never let a random tap on the progress line restart things.
+        clearErrorClicks()
         statusText.text = message
         progressBar.visibility = View.VISIBLE
         progressBar.progress = progress

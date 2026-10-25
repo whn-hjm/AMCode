@@ -251,11 +251,13 @@ object HomePrefs {
     fun applyExternalHome(context: Context): Boolean {
         val dir = externalHomeDir()
         return try {
-            TermuxManager.setHomeDir(dir)
+            // Validate before touching the global HOME: on failure the app
+            // must keep running with the previous (working) directory.
             if (!dir.isDirectory || !dir.canWrite()) {
                 Log.w(TAG, "External HOME is not writable: ${dir.absolutePath}")
                 return false
             }
+            TermuxManager.setHomeDir(dir)
             setMode(context, MODE_EXTERNAL)
             Log.i(TAG, "Applied external HOME: ${dir.absolutePath}")
             true

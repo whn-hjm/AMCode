@@ -28,7 +28,6 @@ android {
         versionName = "1.1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
-        vectorDrawables.useSupportLibrary = true
     }
 
     lint {
@@ -51,6 +50,16 @@ android {
         val storePassword = cred("storePassword", "AMCODE_STORE_PASSWORD")
         val keyAlias = cred("keyAlias", "AMCODE_KEY_ALIAS")
         val keyPassword = cred("keyPassword", "AMCODE_KEY_PASSWORD")
+        if (propsFile.isFile && (storeFile == null || storePassword == null ||
+                keyAlias == null || keyPassword == null)
+        ) {
+            // A half-filled keystore.properties would silently produce an
+            // unsigned release; a local config mistake must fail loudly.
+            throw GradleException(
+                "app/keystore.properties is incomplete: needs storeFile, " +
+                    "storePassword, keyAlias and keyPassword"
+            )
+        }
         if (storeFile != null && storePassword != null && keyAlias != null && keyPassword != null) {
             SigningCreds(storeFile, storePassword, keyAlias, keyPassword)
         } else {
@@ -93,22 +102,18 @@ android {
         jvmTarget = "17"
     }
 
-
-    buildFeatures {
-        viewBinding = true
-    }
-
     packaging {
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
         }
-        jniLibs {
-            useLegacyPackaging = true
-        }
     }
-    // Prevent AAPT from compressing/decompressing large asset files
+    // Prevent AAPT from compressing/decompressing large asset files. The
+    // bootstrap zips MUST stay uncompressed (TermuxManager reads them with
+    // AssetFileDescriptor.openFd, which cannot span compressed entries); the
+    // offline .debs are xz archives already, so deflate would only waste
+    // packaging time.
     aaptOptions {
-        noCompress += listOf("zip", "gz", "pkg")
+        noCompress += listOf("zip", "gz", "pkg", "deb")
     }
 }
 
@@ -131,6 +136,9 @@ val bootstrapArchives = mapOf(
 tasks.register("downloadBootstrap") {
     group = "setup"
     description = "Download Termux bootstrap zips for bundling in APK assets"
+    // Declared pins/outputs let cached builds skip re-hashing 2x32MB assets.
+    inputs.property("bootstrapArchives", bootstrapArchives.map { (name, pin) -> "$name=${pin.first}:${pin.second}" })
+    outputs.files(bootstrapArchives.keys.map { File(bootstrapDir, it) })
 
     doLast {
         for ((name, pinned) in bootstrapArchives) {
@@ -148,7 +156,8 @@ tasks.register("downloadBootstrap") {
             bootstrapDir.mkdirs()
             val urls = listOf(
                 "https://github.com/termux/termux-packages/releases/download/$bootstrapTag/$name",
-                "https://ghproxy.com/https://github.com/termux/termux-packages/releases/download/$bootstrapTag/$name"
+                "https://ghproxy.com/https://github.com/termux/termux-packages/releases/download/$bootstrapTag/$name",
+                "https://gh-proxy.com/https://github.com/termux/termux-packages/releases/download/$bootstrapTag/$name"
             )
             var downloaded = false
             for (url in urls) {
@@ -429,19 +438,10 @@ dependencies {
     implementation("androidx.appcompat:appcompat:1.6.1")
     implementation("androidx.constraintlayout:constraintlayout:2.1.4")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.6.2")
-    implementation("androidx.lifecycle:lifecycle-service:2.6.2")
-
-    // WebView
-    implementation("androidx.webkit:webkit:1.8.0")
-
-    // Material Design
-    implementation("com.google.android.material:material:1.10.0")
 
     // Coroutines
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
 
     // Testing
     testImplementation("junit:junit:4.13.2")
-    androidTestImplementation("androidx.test.ext:junit:1.1.5")
-    androidTestImplementation("androidx.test.espresso:espresso-core:3.5.1")
 }

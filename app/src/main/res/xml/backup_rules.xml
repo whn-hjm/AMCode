@@ -5,7 +5,9 @@
     <exclude domain="root" path="files/code-server" />
     <exclude domain="root" path="files/.code-server-data" />
     <exclude domain="root" path="files/.code-server-extensions" />
-    <!-- 32MB bootstrap cache and per-launch runtime files are re-creatable -->
+    <!-- 32MB bootstrap caches and per-launch runtime files are re-creatable -->
     <exclude domain="root" path="files/bootstrap-aarch64.zip" />
+    <exclude domain="root" path="files/bootstrap-x86_64.zip" />
+    <exclude domain="root" path="files/bootstrap-i686.zip" />
     <exclude domain="root" path="files/run" />
 </full-backup-content>

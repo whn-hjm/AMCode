@@ -386,6 +386,12 @@ object CodeServerLauncher {
             val watcher = doc.optJSONObject("files.watcherExclude")
             if (watcher?.has(watcherKey) == true) return
             if (watcher == null) {
+                if (doc.has("files.watcherExclude")) {
+                    // Present but not an object: a deliberate user value that
+                    // must never be overwritten by the seeding logic.
+                    Log.i(TAG, "files.watcherExclude has a non-object value; leaving it untouched")
+                    return
+                }
                 doc.put("files.watcherExclude", JSONObject())
             }
             doc.getJSONObject("files.watcherExclude").put(watcherKey, true)

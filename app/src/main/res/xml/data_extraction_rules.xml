@@ -10,6 +10,8 @@
         <exclude domain="root" path="files/.code-server-data" />
         <exclude domain="root" path="files/.code-server-extensions" />
         <exclude domain="root" path="files/bootstrap-aarch64.zip" />
+        <exclude domain="root" path="files/bootstrap-x86_64.zip" />
+        <exclude domain="root" path="files/bootstrap-i686.zip" />
         <exclude domain="root" path="files/run" />
     </cloud-backup>
     <device-transfer>
@@ -18,6 +20,8 @@
         <exclude domain="root" path="files/.code-server-data" />
         <exclude domain="root" path="files/.code-server-extensions" />
         <exclude domain="root" path="files/bootstrap-aarch64.zip" />
+        <exclude domain="root" path="files/bootstrap-x86_64.zip" />
+        <exclude domain="root" path="files/bootstrap-i686.zip" />
         <exclude domain="root" path="files/run" />
     </device-transfer>
 </data-extraction-rules>
