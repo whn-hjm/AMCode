@@ -516,6 +516,30 @@ fun stripForeignArchFromDeb(project: Project, original: File, dest: File, arch: 
             output.writeArMember("data.tar.xz", dataGz.readBytes())
         }
         println("  stripped $dropped foreign-arch file(s) from ${dest.name}")
+
+        // 6. Self-check: the main code-server entry point MUST keep its
+        // execute bit — a stripped deb that lost Unix modes produces an app
+        // that fails with error=13 on real devices only (found the hard way).
+        val csEntry = "data/data/com.termux/files/usr/bin/code-server"
+        var modeOk = false
+        val dataMember = File(work, "data.tar.xz")
+        GZIPInputStream(dataMember.inputStream().buffered()).use { gz ->
+            TarArchiveInputStream(gz).use { tarIn ->
+                while (true) {
+                    val te = tarIn.nextTarEntry ?: break
+                    if (te.name.removePrefix("./") == csEntry) {
+                        modeOk = te.isFile && (te.mode and 0b001000000) != 0 // owner-execute
+                        break
+                    }
+                }
+            }
+        }
+        if (!modeOk) {
+            throw GradleException(
+                "Stripped deb lost the execute bit on bin/code-server — " +
+                    "the tar rewrite is dropping Unix modes"
+            )
+        }
     } finally {
         work.deleteRecursively()
     }

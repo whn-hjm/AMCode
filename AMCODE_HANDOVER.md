@@ -356,6 +356,7 @@ curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' http://127.0.0.1:<PORT>
 - **修复**：剥离器改为逐条目重写 data.tar（commons-compress 内嵌 1.25 API），原样保留 mode/uid/gid/mtime/linkname，只删异架构条目；xz 解压拆成两阶段（xz→裸 tar→重写→再 xz），规避嵌套 XZ 流提前 EOF。
 - **验证**：本地确认重建 deb 里 code-server=0700；真机卸载重装后 fresh 安装成功、VS Code 正常进入（用户确认）。离线 arm64 debug 125MB / release 109MB 不变。
 - 经验：**凡动包管理产物必须真机验证**——模拟器路径存在系统性盲区（安装源不同）。
+- **跟进修复**：release 变体同步重建（此前只重建了 debug，GitHub 上的 release 资产仍是坏包）；构建脚本加**永久自检**——剥离后解析 data.tar 断言 `bin/code-server` 保留 owner-execute 位，此类错误今后在构建期即失败。v1.1.0 资产与 SHA 已同步（988aabae…，108.6MB）。online 变体确认不受影响（下载原始 deb，运行时剔重只删文件不重写 tar）。
 
 ### 2026-10-25 傍晚 · 自建下载源 + 构建期剔重（T-O/T-P）
 - **T-O**：TermuxManager 下载器 URL 重写（TUR 域名→自建镜像优先+回退）；Release `amcode-debs-1` 承载 4 个 pinned deb；在线 fresh 40-75min → **~5min**。
