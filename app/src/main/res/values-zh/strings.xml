@@ -101,4 +101,15 @@
     <string name="dialog_webview_outdated_title">WebView 版本过旧</string>
     <string name="dialog_webview_outdated_message">当前 Android System WebView 版本（%1$s）过低，部分 VS Code 功能可能无法正常使用。请在此设备的应用商店中更新“Android System WebView”。</string>
     <string name="dialog_webview_outdated_ok">知道了</string>
+    <!-- Keys kept English-only by the initial conservative migration; now
+         properly localized to silence MissingTranslation. -->
+    <string name="app_name">AMCode</string>
+    <string name="logo">{ } AMCode</string>
+    <string name="initializing">正在初始化开发环境…</string>
+    <string name="vscode_ready">VS Code 已就绪，正在启动…</string>
+    <string name="error_occurred">发生错误</string>
+    <string name="service_notification_title">VS Code 服务</string>
+    <string name="service_notification_text">VS Code 正在后台运行</string>
+    <string name="toast_app_crashed">应用已崩溃：%1$s。请查看崩溃日志。</string>
+    <string name="toast_cannot_start_vscode">无法启动 VS Code：%1$s</string>
 </resources>

@@ -3,7 +3,14 @@ name: Android CI
 on:
   push:
     branches: [main]
+    paths-ignore:
+      # Docs-only pushes do not affect the build; skip CI (and its emails).
+      - '**.md'
+      - 'docs/**'
   pull_request:
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
 
 jobs:
   build:
