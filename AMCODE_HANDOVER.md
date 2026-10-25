@@ -16,7 +16,7 @@
 你是 AMCode 的接手开发者。工作区：D:\Code\code-server\vsboxed，代码基线 c229683（v1.1.0）。
 本地 main 领先 origin/main 多个 commit（含 2026-10-24/25 的六批修复），push 前不需要再处理 keystore（签名已走 gitignored keystore.properties，jks 从未入库）。
 
-先完整阅读 AMCODE_HANDOVER.md（本文件，交接+运维双用途）。历史审计见 AMCODE_REVIEW_2026-10-24.md（旧基线，很多问题已修）；本轮评审结论已并入本文件 §10。
+先完整阅读 AMCODE_HANDOVER.md（本文件——**项目唯一权威文档**：交接+运维+任务板+变更记录）。docs/history/ 是只读存档，不要更新；本轮评审结论已并入本文件 §10。
 不要重做已修项（pkg/keyring/internal HOME/auth/并发修复等）；只从 §7 任务池按优先级做增量。
 
 环境约束：
@@ -115,7 +115,7 @@ CodeServerLauncher
 
 | 时间 | 事件 |
 |---|---|
-| 白天 | 全量审计（4 子代理）→ `AMCODE_REVIEW_2026-10-24.md` |
+| 白天 | 全量审计（4 子代理）→ `docs/history/AMCODE_REVIEW_2026-10-24.md` |
 | 21:57 | `6f44555` 第一轮：pkg/keyring/dpkg wrapper/启动单次化/安全/动态端口 |
 | 22:34 | `a9971e9` 第二轮：focus/IME、ripgrep、shim、libc++30、offline bundle |
 | 23:44 | `ef2b56c` 第三轮：internal HOME、auth token、PID 清理、快路径、offline dpkg |
@@ -242,7 +242,7 @@ curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' http://127.0.0.1:<PORT>
 8. **多用户/work profile 路径视图**：dpkg DB 与 shell 脚本用 `/data/data/com.devbox` 字面路径，secondary user（`/data/user/10/...`）下 DB 记录与实际路径不一致（可运行，`dpkg -V` 错位）。声明不支持即可。
 9. **i18n 双轨制**：新 UI 全部走 `isChinese()` 硬编码双语，strings.xml/服务端消息仍仅英文；非中英文 locale 全英文。
 10. **mint-key 探测的潜在副作用**：每次启动 POST /mint-key 可能铸造并遗留一个 API key（未验证 4.143.1 语义；若确认有副作用，换无副作用需认证端点）。
-11. **glibc native 扩展不可用**（bionic 限制）：纯 JS/语言包可用；完整兼容需 proot/glibc（CodeFA 路线）或 VHEditor 式 patched code-server——见 AMCODE_ROADMAP.md。
+11. **glibc native 扩展不可用**（bionic 限制）：纯 JS/语言包可用；完整兼容需 proot/glibc（CodeFA 路线）或 VHEditor 式 patched code-server——见 §13。
 12. **AOSP 无 WebView 的设备**：现已给出明确报错对话框（未在真机复测；API26 AOSP 镜像实测触发该路径）。极旧 WebView 版本无版本门槛提示（P3 池）。
 13. **默认在线 TUR 仍慢**：TUR 无镜像，8 连接受 GitHub 限速；offline 版是解决方案（已实现）。
 14. **auth 使用 SHA-256 hashed-password** 是 code-server 4.143.1 legacy 路径；升级 code-server 必须重新验证。
@@ -253,6 +253,7 @@ curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' http://127.0.0.1:<PORT>
 ## 7. 任务池（按优先级；做完一项更新一项；新发现随时追加）
 
 > 本节是**活任务板**：完成打勾并写 commit 号；子代理/后续维护者从这里领任务。文件独占约定见括号。
+> 重任务候选池（proot/自编译 code-server/16KB 等 XL 级）的完整展开见附录 §13（原 docs/history/AMCODE_ROADMAP.md 的活跃摘要）。
 
 ### P1（发布前）
 
@@ -276,11 +277,11 @@ curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' http://127.0.0.1:<PORT>
 ### P3（体验/工程）
 
 - [ ] **[T-G3]** terminal 输出持久化到文件（TermuxManager.emitOutput → 轮转日志，子代理1）
-- [ ] UI/UX：extra-keys、virtual mouse（见 AMCODE_ROADMAP.md P1-8）。
+- [ ] UI/UX：extra-keys、virtual mouse（见 §13 P1-8）。
 
 ### 长期
 
-- proot/glibc 兼容模式、自编译 Android-native code-server、16KB page、TUR 镜像/CDN——全部见 [AMCODE_ROADMAP.md](AMCODE_ROADMAP.md)。
+- proot/glibc 兼容模式、自编译 Android-native code-server、16KB page、TUR 镜像/CDN——展开见 §13。
 
 ---
 
@@ -356,15 +357,44 @@ curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' http://127.0.0.1:<PORT>
 
 ---
 
-## 12. 参考文档
+## 12. 文档地图与治理（2026-10-25 整合后：唯一项目文档 = 本文件）
 
-- [AMCODE_ROADMAP.md](AMCODE_ROADMAP.md)：重任务池（proot、自编译 code-server、16KB 等，P0–P3/难度评分）。
-- [AMCODE_FIXES_2026-10-24.md](AMCODE_FIXES_2026-10-24.md)：10-24 三轮修复详情（历史）。
-- [AMCODE_REVIEW_2026-10-24.md](AMCODE_REVIEW_2026-10-24.md)：10-24 全量审计（**基线 2d9b486，多数问题已修，仅作历史参考**）。
-- [AMCODE_NEXT_BATCH_PLAN.md](AMCODE_NEXT_BATCH_PLAN.md)：10-24 批次计划（已执行完毕，历史）。
-- `README.md` / `ARCHITECTURE.md`：2026-10-25 已重写为 v1.1.0 现状，可对外。
-- `DEVELOPMENT.md`（gitignored 本地）：v1.0 时代过程记录，"方案总结"表两行过时（dpkg wrapper、动态端口）。
-- `review-assets/`：验证截图/日志（本地证据，不入库）。
+**规则：项目内的计划/任务/评审/运维/变更记录只写进本文件；`docs/history/` 是只读存档，不再更新；README/ARCHITECTURE 面向用户与外部架构说明，随对外行为变化才改。**
+
+| 文件 | 地位 |
+|---|---|
+| `AMCODE_HANDOVER.md`（本文件） | **唯一权威**：交接、运维手册、任务板（§7）、评审汇总（§10）、变更记录（§11）、重任务池摘要（§13） |
+| `README.md` / `ARCHITECTURE.md` | 对外用户文档 / 架构说明（v1.1.0 现状） |
+| `docs/history/AMCODE_REVIEW_2026-10-24.md` | 存档：10-24 全量审计（基线 2d9b486，多数已修） |
+| `docs/history/AMCODE_FIXES_2026-10-24.md` | 存档：10-24 三轮修复详情 |
+| `docs/history/AMCODE_NEXT_BATCH_PLAN.md` | 存档：10-24 批次计划（已执行完毕） |
+| `docs/history/AMCODE_ROADMAP.md` | 存档：重任务池完整版（活跃摘要在本文件 §13） |
+| `DEVELOPMENT.md`（gitignored 本地） | v1.0 过程记录，历史参考 |
+
+---
+
+## 13. 附录：重任务池摘要（原 AMCODE_ROADMAP.md 活跃部分；展开细节见 docs/history/）
+
+评分：P0=发布前必须 / P1=高价值 / P2=体验工程 / P3=研究型；难度 S(<半天)/M(1-2天)/L(3-7天)/XL(1-3周+)。
+
+### P1 重任务（按价值排序）
+
+| ID | 任务 | 难度 | 一句话说明 | 验收 |
+|---|---|---|---|---|
+| P1-1 | **Proot/glibc 兼容模式** | XL | App 内可选跑 Debian arm64 rootfs + proot，让 glibc native 扩展可用；rootfs 300-800MB、性能损耗需评估 | 装上并运行一个 glibc native 扩展；冷启动/内存可接受 |
+| P1-2 | **自编译 Android-native code-server** | XL | 用 Termux clang/NDK 编译 spdlog/watcher/node-pty/ripgrep，摆脱 TUR 包与 libc++ ABI 问题 | 扩展宿主无 ABI 错误；包体积 < TUR 的 120MB |
+| P1-3 | **16KB page-size 重建** | L/XL | Android 15/16 的 16KB 设备硬门槛；重链 `-Wl,-z,max-page-size=16384` | 16KB AVD 可启动、pkg 正常 |
+| P1-4 | **离线 SDK/自定义 bootstrap** | L/XL | 把 git/clang/python 等预打进可选 asset pack，首装 <1-2 分钟零网络 | fresh 安装 <2 分钟 |
+| P1-5 | TUR 镜像/CDN + 断点差分 | L | 自建 GitHub Releases/R2 缓存固定版本 deb | 无代理下载明显提速 |
+| P1-6/7 | clangd/rust-analyzer/LLDB 预编译 | L | 各语言工具链 optional 安装 | 补全/调试可用 |
+| P1-8 | 移动端 UI 分叉（extra-keys/virtual mouse） | L | fork code-server web UI 或 CSS/JS 注入 | 触屏可用性明显提升 |
+| P1-9 | CI 完整化（双 APK + emulator smoke） | L | 当前 CI 只有 debug+lint+unsigned release | PR 产出 online/offline + 测试报告 |
+
+### 执行建议（原路线图结论）
+
+- 顺序：清完 §7 P1 → 并行 proot（P1-1）与自编译（P1-2）两条重线 → 16KB/离线 SDK 第三线。不要五条全开。
+- 决策门：proot 性能可接受才考虑默认（否则 optional compat mode）；自编译包体积/维护成本优于 TUR 才替换；16KB 失败即 P0。
+- 禁忌：不要在没有基准时把 proot 设为默认；不要同时改 pkg 修复与 proot rootfs 路径（先抽象 prefix/root）；不要用 Microsoft Marketplace；不要为 16KB 直接换 bootstrap 不跑全回归；不要把 500MB 资产塞进默认 APK。
 
 ---
 
