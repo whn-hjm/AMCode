@@ -1,6 +1,7 @@
 import java.io.EOFException
 import java.util.zip.GZIPInputStream
 import org.tukaani.xz.XZInputStream
+import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.InputStream
 import java.io.OutputStream
@@ -323,6 +324,18 @@ val offlineBundleArch = providers.gradleProperty("offlineBundleArch").getOrElse(
 val offlineBundleSourceDir = providers.gradleProperty("offlineBundleSourceDir").orNull
 val offlineAssetsRoot = layout.buildDirectory.dir("generated/offline-assets/$offlineBundleArch")
 
+/** Copy exactly [size] bytes between streams. */
+fun IOUtilscopy(input: InputStream, output: OutputStream, size: Long) {
+    val buffer = ByteArray(64 * 1024)
+    var remaining = size
+    while (remaining > 0) {
+        val read = input.read(buffer, 0, minOf(buffer.size.toLong(), remaining).toInt())
+        if (read < 0) throw EOFException("unexpected end of tar entry")
+        output.write(buffer, 0, read)
+        remaining -= read
+    }
+}
+
 fun offlineSha256(file: File): String {
     val digest = MessageDigest.getInstance("SHA-256")
     file.inputStream().use { input ->
@@ -371,6 +384,11 @@ val offlineDeadPrefixes = mapOf(
 fun stripForeignArchFromDeb(project: Project, original: File, dest: File, arch: String) {
     val prefixes = offlineDeadPrefixes[arch]
         ?: throw GradleException("No dead-prefix list for offline arch $arch")
+    if (!original.isFile || original.length() == 0L) {
+        throw GradleException(
+            "Original deb missing or empty before stripping: ${original.absolutePath}"
+        )
+    }
     val dataPrefix = "data/data/com.termux/files/usr/"
     val work = File.createTempFile("amcode-deb", ".work").let {
         it.delete()
@@ -407,6 +425,7 @@ fun stripForeignArchFromDeb(project: Project, original: File, dest: File, arch: 
                 val name = header.substring(0, 16).trim().trimEnd('/')
                 val size = header.substring(48, 58).trim().toLong()
                 val member = File(work, name.replace('/', '_'))
+                println("  [diag] ar member: $name size=$size file=${member.absolutePath}")
                 member.outputStream().use { memberOut ->
                     copyExactly(input, memberOut, size)
                 }
@@ -429,55 +448,67 @@ fun stripForeignArchFromDeb(project: Project, original: File, dest: File, arch: 
         val dataResolved = dataFile
             ?: throw GradleException("No data.tar member in ${original.name}")
 
-        // 2. Decompress data.tar.xz ourselves (Gradle's tarTree cannot see
-        // the xz library across classloaders) and expand the plain tar.
-        val dataTarPlain = File(work, "data.tar")
-        when {
-            dataResolved.name.endsWith(".xz") ->
-                XZInputStream(dataResolved.inputStream().buffered()).use { xz ->
-                    dataTarPlain.outputStream().buffered().use { out -> xz.copyTo(out, 1024 * 1024) }
-                }
-            dataResolved.name.endsWith(".gz") ->
-                GZIPInputStream(dataResolved.inputStream().buffered()).use { gz ->
-                    dataTarPlain.outputStream().buffered().use { out -> gz.copyTo(out, 1024 * 1024) }
-                }
-            else -> dataResolved.copyTo(dataTarPlain, overwrite = true)
-        }
-        val payload = File(work, "payload").apply { mkdirs() }
-        project.copy {
-            from(project.tarTree(dataTarPlain))
-            into(payload)
-        }
-
-        // 3. Delete foreign-arch payload files.
         var dropped = 0
-        for (rel in prefixes) {
-            val target = File(payload, dataPrefix + rel)
-            if (target.isDirectory) {
-                target.walkTopDown().forEach { if (it.isFile) dropped++ }
-                target.deleteRecursively()
-            } else if (target.isFile) {
-                dropped++
-                target.delete()
+
+        // 4. Rewrite the ORIGINAL tar entry-by-entry (dropping only the dead
+        // files): Unix modes/uids/mtimes survive because entries are copied,
+        // not re-created from the filesystem (ant.tar flattened every mode
+        // to 600 and broke the app on real devices).
+        val dataGz = File(work, "data.tar.xz")
+        val dataPlain = File(work, "data.tar")
+        // Two-phase: fully decompress xz -> plain tar first. If the xz layer
+        // is the EOF source it fails here, isolated from the tar rewrite.
+        org.tukaani.xz.XZInputStream(dataResolved.inputStream().buffered()).use { xz ->
+            dataPlain.outputStream().buffered().use { out -> xz.copyTo(out, 1024 * 1024) }
+        }
+        println("  [diag] plain tar len=${dataPlain.length()}")
+        FileInputStream(dataPlain).buffered().use { plainIn ->
+            org.tukaani.xz.XZOutputStream(dataGz.outputStream().buffered(), org.tukaani.xz.LZMA2Options()).use { out ->
+                TarArchiveInputStream(plainIn).use { tarIn ->
+                    TarArchiveOutputStream(out, 512 * 1024).use { tarOut ->
+                        tarOut.setLongFileMode(TarArchiveOutputStream.LONGFILE_GNU)
+                        
+                        while (true) {
+                            val te = tarIn.nextTarEntry ?: break
+                            val rel = te.name.removePrefix("./")
+                            if (te.isFile &&
+                                prefixes.any { rel.startsWith(dataPrefix + it) }
+                            ) {
+                                dropped++
+                                continue
+                            }
+                            // Re-emit the entry with its original metadata.
+                            val copy = TarArchiveEntry(te.name)
+                            copy.setSize(te.size)
+                            copy.mode = te.mode
+                            copy.userId = te.userId
+                            copy.userName = te.userName
+                            copy.groupId = te.groupId
+                            copy.groupName = te.groupName
+                            copy.modTime = te.modTime
+                            copy.linkName = te.linkName
+                            if (te.isDirectory) copy.size = 0
+                            tarOut.putArchiveEntry(copy)
+                            if (te.isFile && te.size > 0) {
+                                // Reading through tarIn itself keeps the entry
+                                // boundary (its read() never crosses entries);
+                                // mixing a separate exact-size copy was what
+                                // desynced the stream.
+                                val buf = ByteArray(64 * 1024)
+                                var left = te.size
+                                while (left > 0) {
+                                    val n = tarIn.read(buf, 0, minOf(buf.size.toLong(), left).toInt())
+                                    if (n < 0) throw EOFException("tar entry ended early")
+                                    tarOut.write(buf, 0, n)
+                                    left -= n
+                                }
+                            }
+                            tarOut.closeArchiveEntry()
+                        }
+                    }
+                }
             }
         }
-
-        // 4. Re-pack data.tar with plain tar, then xz-compress it via tukaani
-        // (same archive shape as the original Termux deb).
-        val dataTar = File(work, "data.tar")
-        project.ant.invokeMethod(
-            "tar",
-            mapOf(
-                "destfile" to dataTar.absolutePath,
-                "basedir" to payload.absolutePath,
-                "longfile" to "gnu"
-            )
-        )
-        val dataGz = File(work, "data.tar.xz")
-        org.tukaani.xz.XZOutputStream(dataGz.outputStream().buffered(), org.tukaani.xz.LZMA2Options()).use { xz ->
-            dataTar.inputStream().buffered().use { it.copyTo(xz, 1024 * 1024) }
-        }
-        dataTar.delete()
 
         // 5. Reassemble the ar archive.
         dest.outputStream().buffered().use { output ->
