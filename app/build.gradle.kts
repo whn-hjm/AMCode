@@ -431,7 +431,11 @@ val downloadOfflineBundle = tasks.register("downloadOfflineBundle") {
             File(outDir, "${deb.filename}.part").delete()
         }
 
-        val aptDeps = (debs.flatMap { it.aptDeps }.distinct() + "termux-keyring")
+        // git is a main-repo package (not TUR), so it is resolved + downloaded
+        // from the fast main mirror during the bundled first launch instead of
+        // being pinned here: the offline APK stays the same size, never touches
+        // TUR, and ships a working Source Control out of the box.
+        val aptDeps = (debs.flatMap { it.aptDeps }.distinct() + "termux-keyring" + "git")
         val manifest = buildString {
             append("{\n")
             append("  \"schema\": 1,\n")

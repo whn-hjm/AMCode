@@ -1446,11 +1446,11 @@ object TermuxManager {
      * bundle exists but could not be installed (caller then uses the online
      * path), true on success.
      *
-     * The bundle deliberately contains only code-server and nodejs-24: both
-     * are TUR-only and account for ~127 of the ~145 MB first install. Their
-     * dependencies all exist on the fast main Termux mirror and are resolved
-     * by apt normally, so only the two large immutable GitHub-hosted TUR debs
-     * are pinned.
+     * The bundle deliberately pins only code-server and nodejs-24: both are
+     * TUR-only and account for ~127 of the ~145 MB first install. git is not
+     * pinned but is added to the dependency list by the build script, so the
+     * bundled first launch also pulls it (with its deps) from the fast main
+     * mirror and the offline APK works as a self-sufficient dev environment.
      */
     private fun tryOfflineBundleInstall(): Boolean? {
         val bundle = readOfflineBundle() ?: return null

@@ -79,8 +79,24 @@ rewrite_one_deb() {
 
     tmp="$PREFIX/tmp/amcode-deb.$$.$RANDOM"
     rm -rf "$tmp"
-    if ! mkdir -p "$tmp/pkg"; then
+    if ! mkdir -p "$tmp"; then
         log "cannot create temp dir $tmp"
+        return 1
+    fi
+
+    # Rewriting a large .deb temporarily costs roughly 5-6x its size
+    # (extracted tree + repacked archive). Run out of space mid-way and dpkg
+    # fails with a confusing ENOSPC on a half-written environment, so fail
+    # loudly before touching anything.
+    deb_kb=$(( ( $(stat -c '%s' "$deb" 2>/dev/null || echo 0) + 1023 ) / 1024 ))
+    free_kb="$(df -k "$PREFIX/tmp" 2>/dev/null | awk 'NR==2 {print $4}')"
+    case "$free_kb" in
+        ''|*[!0-9]*) free_kb=0 ;;
+    esac
+    needed_kb=$(( deb_kb * 6 + 102400 ))
+    if [ "$free_kb" -gt 0 ] && [ "$free_kb" -lt "$needed_kb" ]; then
+        log "not enough space to rewrite $(basename "$deb") (need ~$((needed_kb / 1024))MB, have $((free_kb / 1024))MB)"
+        rm -rf "$tmp"
         return 1
     fi
 

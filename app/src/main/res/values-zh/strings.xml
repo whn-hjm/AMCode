@@ -112,4 +112,29 @@
     <string name="service_notification_text">VS Code 正在后台运行</string>
     <string name="toast_app_crashed">应用已崩溃：%1$s。请查看崩溃日志。</string>
     <string name="toast_cannot_start_vscode">无法启动 VS Code：%1$s</string>
+    <!-- 前台服务通知 / 状态文案 -->
+    <string name="notification_restarting">正在重启 VS Code…</string>
+    <string name="notification_applying_storage">正在应用工作区存储设置</string>
+    <string name="notification_running">VS Code 正在运行</string>
+    <string name="notification_server_ready_short">服务已就绪</string>
+    <string name="notification_starting">正在启动 VS Code…</string>
+    <string name="notification_initializing_env">正在初始化环境</string>
+    <string name="notification_start_failed">VS Code 启动失败</string>
+    <string name="notification_stopped">已停止</string>
+    <string name="notification_external_unavailable">外部工作区不可用</string>
+    <string name="notification_external_fallback">本次使用内部 HOME</string>
+    <string name="ui_status_setting_up">正在配置环境…</string>
+    <string name="notification_setting_up">正在配置开发环境…</string>
+    <string name="notification_extracting">正在解包软件包</string>
+    <string name="notification_starting_codeserver">正在启动 code-server…</string>
+    <string name="notification_launching_vscode">正在启动 VS Code</string>
+    <string name="notification_starting_ellipsis">启动中…</string>
+    <string name="notification_recovering">正在从崩溃中恢复</string>
+    <string name="notification_failed">VS Code 出现故障</string>
+    <string name="notification_too_many_restarts">重启次数过多</string>
+    <string name="notification_restart_failed">重启失败</string>
+    <string name="notification_restarted">VS Code 已重启</string>
+    <string name="notification_recovered">已从崩溃中恢复</string>
+    <string name="ui_crashed_too_many">VS Code 崩溃次数过多</string>
+    <string name="ui_failed_with_reason">失败：%1$s</string>
 </resources>

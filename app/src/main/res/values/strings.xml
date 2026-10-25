@@ -111,4 +111,29 @@
     <string name="dialog_webview_outdated_title">WebView version is outdated</string>
     <string name="dialog_webview_outdated_message">Your Android System WebView (version %1$s) is quite old; some VS Code features may not work correctly. Please update \"Android System WebView\" via the app store on this device.</string>
     <string name="dialog_webview_outdated_ok">OK</string>
+    <!-- Foreground service notification / status strings -->
+    <string name="notification_restarting">Restarting VS Code…</string>
+    <string name="notification_applying_storage">Applying workspace storage</string>
+    <string name="notification_running">VS Code is running</string>
+    <string name="notification_server_ready_short">Server is ready</string>
+    <string name="notification_starting">Starting VS Code…</string>
+    <string name="notification_initializing_env">Initializing environment</string>
+    <string name="notification_start_failed">VS Code failed to start</string>
+    <string name="notification_stopped">Stopped</string>
+    <string name="notification_external_unavailable">External workspace unavailable</string>
+    <string name="notification_external_fallback">Using internal HOME for this launch</string>
+    <string name="ui_status_setting_up">Setting up environment…</string>
+    <string name="notification_setting_up">Setting up development environment…</string>
+    <string name="notification_extracting">Extracting packages</string>
+    <string name="notification_starting_codeserver">Starting code-server…</string>
+    <string name="notification_launching_vscode">Launching VS Code</string>
+    <string name="notification_starting_ellipsis">Starting…</string>
+    <string name="notification_recovering">Recovering from crash</string>
+    <string name="notification_failed">VS Code failed</string>
+    <string name="notification_too_many_restarts">Too many restarts</string>
+    <string name="notification_restart_failed">Restart failed</string>
+    <string name="notification_restarted">VS Code restarted</string>
+    <string name="notification_recovered">Recovered from crash</string>
+    <string name="ui_crashed_too_many">VS Code crashed too many times</string>
+    <string name="ui_failed_with_reason">Failed: %1$s</string>
 </resources>
