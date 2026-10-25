@@ -425,7 +425,6 @@ fun stripForeignArchFromDeb(project: Project, original: File, dest: File, arch: 
                 val name = header.substring(0, 16).trim().trimEnd('/')
                 val size = header.substring(48, 58).trim().toLong()
                 val member = File(work, name.replace('/', '_'))
-                println("  [diag] ar member: $name size=$size file=${member.absolutePath}")
                 member.outputStream().use { memberOut ->
                     copyExactly(input, memberOut, size)
                 }
@@ -461,7 +460,6 @@ fun stripForeignArchFromDeb(project: Project, original: File, dest: File, arch: 
         org.tukaani.xz.XZInputStream(dataResolved.inputStream().buffered()).use { xz ->
             dataPlain.outputStream().buffered().use { out -> xz.copyTo(out, 1024 * 1024) }
         }
-        println("  [diag] plain tar len=${dataPlain.length()}")
         FileInputStream(dataPlain).buffered().use { plainIn ->
             org.tukaani.xz.XZOutputStream(dataGz.outputStream().buffered(), org.tukaani.xz.LZMA2Options()).use { out ->
                 TarArchiveInputStream(plainIn).use { tarIn ->
