@@ -26,7 +26,7 @@
 - Gradle 会清理 build/outputs 额外文件，成品 APK 构建后立即复制到 D:\。
 - 改代码前 git status；每次构建后更新本文件 §11；不要提交 review-assets/。
 
-下一优先级（详见 §7）：单 ABI bootstrap 减包 → push + GitHub Release（双 APK）→ P2/P3 池。
+v1.1.0 已发布：https://github.com/whn-hjm/AMCode/releases/tag/v1.1.0（online 通用 + offline arm64，附 SHA-256）。下一优先级（§7）：P2 剩余项 → P3 → §13 重任务池。
 ```
 
 ---
@@ -240,7 +240,7 @@ curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' http://127.0.0.1:<PORT>
 6. **旧安装的 code-server/node 未补登记 dpkg DB**（早于 marker 机制的安装）；fresh/offline 已正确登记。
 7. **32 位 ARM 不支持**：`bootstrapAsset()` 对 armeabi-v7a 落到 aarch64 zip，装得上跑不起来且报错含糊。应显式 fail-fast 或文档声明。
 8. **多用户/work profile 路径视图**：dpkg DB 与 shell 脚本用 `/data/data/com.devbox` 字面路径，secondary user（`/data/user/10/...`）下 DB 记录与实际路径不一致（可运行，`dpkg -V` 错位）。声明不支持即可。
-9. **i18n 双轨制**：新 UI 全部走 `isChinese()` 硬编码双语，strings.xml/服务端消息仍仅英文；非中英文 locale 全英文。
+9. **i18n 残余**：MainActivity 对话框/Toast 已全量迁移 values-zh（021cda3）；CodeServerService 的通知文案与 strings.xml 里 initializing/error_occurred 等旧键仍仅英文（中文回落英文）。
 10. ~~**mint-key 探测的潜在副作用**~~ **已核实无问题（2026-10-25，主 agent 查 v4.143.1 源码）**：`POST /mint-key`（src/node/routes/vscode.ts:213，ensureAuthenticated 保护）只是惰性创建/读取 user-data-dir 下一个 32 字节 `serve-web-key-half` 文件（模块级缓存，缺失才写一次，跨启动复用）——不是会累积的 API key，保留现用法。`GET /healthz` 确认免认证（routes/index.ts:156 独立挂载）。
 11. **glibc native 扩展不可用**（bionic 限制）：纯 JS/语言包可用；完整兼容需 proot/glibc（CodeFA 路线）或 VHEditor 式 patched code-server——见 §13。
 12. **AOSP 无 WebView 的设备**：现已给出明确报错对话框（未在真机复测；API26 AOSP 镜像实测触发该路径）。极旧 WebView 版本无版本门槛提示（P3 池）。
@@ -258,7 +258,7 @@ curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' http://127.0.0.1:<PORT>
 ### P1（发布前）
 
 - [x] **单 ABI bootstrap 减包**：`-PbootstrapArch=<abi>`（缓存移至 `bootstrap-cache/`，staged 到 generated assets；默认仍双 ABI 通用包）。产物：online 通用 64MB；offline arm64 单架构 **161.8MB（原 194.7MB）**。（2026-10-25 主 agent）
-- [ ] **push + GitHub Release**：commit 已就绪；发布 online（通用）+ offline arm64（单架构）双 APK 及 SHA-256。CI 首跑需确认。
+- [x] **push + GitHub Release**：v1.1.0 已发布 https://github.com/whn-hjm/AMCode/releases/tag/v1.1.0 （online 63.8MB 通用 + offline arm64 154.3MB，SHA-256 见 release notes；CI 绿）。
 - [x] **amcode-dpkg-wrapper 与 pkg-setup 的 dpkg lock**：repair 前 bounded 等待残留 apt/dpkg/pkg 退出（`b4907fd`；5558 实测 full repair warnings=0）
 
 ### P2
@@ -271,8 +271,8 @@ curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' http://127.0.0.1:<PORT>
 - [x] **[T-F]** mint-key 语义调研：v4.143.1 源码证实无副作用，保留现用法（见 §6.10）
 - [x] **[T-G2]** D2D cache 域——CI lint 证伪：cacheDir 本就不参与备份，改为注释说明（`3c89736`）
 - [x] **[T-G3]** terminal 输出持久化到 files/logs/setup.log（1MB 轮转）（`558efcf`）
-- [ ] **[T-E1]** i18n 迁移 values-zh（子代理3 进行中）
-- [ ] **[T-E2]** WebView 版本门槛检查（子代理3 进行中）
+- [x] **[T-E1]** i18n 迁移 values-zh：72 键全量迁移、isChinese() 删除、zh-CN per-app locale 实测（021cda3；CodeServerService 通知文案留英文，见 §6.9）
+- [x] **[T-E2]** WebView 版本门槛：provider major < 70 弹非阻塞过旧警告（021cda3；模拟器 WebView 均 ≥70，逻辑评审验证）
 - [ ] `~/storage/shared` 无 MANAGE 时的按需授权/拒绝/重试 UI 全回归（已部分覆盖）
 - [ ] **[T-H]** dpkg wrapper 对大 deb 的 ~6 倍磁盘峰值：空间预检或流式评估（tmp 残留已清，见 §6.2 相邻风险）
 
@@ -338,6 +338,12 @@ curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' http://127.0.0.1:<PORT>
 ---
 
 ## 11. 变更记录（每批次一条，倒序；新改动加在最上面）
+
+### 2026-10-25 中午 · `021cda3` i18n + WebView 门槛 + **GitHub Release v1.1.0**
+- MainActivity 72 个 string 键全量迁移 values/values-zh，isChinese() 删除；zh-CN per-app locale 实测（存储对话框参数化渲染正确）。
+- WebView provider major<70 非阻塞过旧警告。
+- **发布**：clean 重建双 APK（online 63.8MB 通用 / offline arm64 154.3MB 单架构）→ GitHub Release v1.1.0（含 SHA-256 与 highlights）。CI 全绿链路持续验证（compile+lint）。
+- 残余记录：CodeServerService 通知文案英文（P3）；release 变体今日早些时候已做 fresh 回归（R8 验证），后续增量均逐项验证。
 
 ### 2026-10-25 上午（续）· `558efcf`+`3c89736` 任务板批次（T-A~T-H）
 - **T-A** `-PbootstrapArch` 单架构打包（bootstrap-cache/，arm64 offline 194.7→161.8MB，5560 单架构 fresh 45s 全绿）。
