@@ -145,4 +145,12 @@
     <string name="cd_key_right">Arrow right</string>
     <string name="cd_key_collapse">Collapse extra keys</string>
     <string name="cd_key_expand">Show extra keys</string>
+    <string name="cd_key_ctrl">Ctrl modifier: tap to arm the next key, long-press to lock</string>
+    <string name="cd_key_alt">Alt modifier: tap to arm the next key, long-press to lock</string>
+    <string name="cd_combo_ctrl_c">Ctrl+C</string>
+    <string name="cd_combo_ctrl_d">Ctrl+D</string>
+    <string name="cd_combo_ctrl_l">Ctrl+L</string>
+    <string name="cd_combo_ctrl_u">Ctrl+U</string>
+    <string name="cd_combo_ctrl_s">Ctrl+S</string>
+    <string name="cd_combo_ctrl_grave">Ctrl+backtick (toggle terminal)</string>
 </resources>

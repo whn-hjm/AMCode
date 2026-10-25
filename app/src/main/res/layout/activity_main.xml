@@ -26,79 +26,128 @@
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toEndOf="parent" />
 
-    <!-- Extra-keys row: terminal/editor keys that on-screen keyboards lack
-         (Esc/Tab/arrows). Shown only once the VS Code page is ready and the
-         IME is closed; buttons never take focus (the WebView keeps the IME).
-         See MainActivity for the key dispatch. -->
+    <!-- Extra-keys toolbar (two rows, collapsible):
+         row 1 — Esc/Tab/arrows plus the sticky Ctrl/Alt toggles and the
+                 collapse button;
+         row 2 — one-tap Ctrl chords for soft keyboards (which cannot deliver
+                 modifier+letter).
+         Shown only once the VS Code page is ready and the IME is closed;
+         buttons never take focus (the WebView keeps the IME). -->
     <LinearLayout
         android:id="@+id/key_toolbar"
         android:layout_width="0dp"
         android:layout_height="wrap_content"
         android:background="@color/surface_dark"
-        android:orientation="horizontal"
+        android:orientation="vertical"
         android:visibility="gone"
         app:layout_constraintBottom_toBottomOf="parent"
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toEndOf="parent">
 
-        <Button
-            android:id="@+id/key_esc"
-            style="@style/ExtraKeyButton"
-            android:contentDescription="@string/cd_key_esc"
-            android:text="Esc" />
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal">
 
-        <Button
-            android:id="@+id/key_tab"
-            style="@style/ExtraKeyButton"
-            android:contentDescription="@string/cd_key_tab"
-            android:text="Tab" />
+            <Button
+                android:id="@+id/key_esc"
+                style="@style/ExtraKeyButton"
+                android:contentDescription="@string/cd_key_esc"
+                android:text="Esc" />
 
-        <Button
-            android:id="@+id/key_up"
-            style="@style/ExtraKeyButton"
-            android:contentDescription="@string/cd_key_up"
-            android:text="↑" />
+            <Button
+                android:id="@+id/key_tab"
+                style="@style/ExtraKeyButton"
+                android:contentDescription="@string/cd_key_tab"
+                android:text="Tab" />
 
-        <Button
-            android:id="@+id/key_down"
-            style="@style/ExtraKeyButton"
-            android:contentDescription="@string/cd_key_down"
-            android:text="↓" />
+            <Button
+                android:id="@+id/key_up"
+                style="@style/ExtraKeyButton"
+                android:contentDescription="@string/cd_key_up"
+                android:text="↑" />
 
-        <Button
-            android:id="@+id/key_left"
-            style="@style/ExtraKeyButton"
-            android:contentDescription="@string/cd_key_left"
-            android:text="←" />
+            <Button
+                android:id="@+id/key_down"
+                style="@style/ExtraKeyButton"
+                android:contentDescription="@string/cd_key_down"
+                android:text="↓" />
 
-        <Button
-            android:id="@+id/key_right"
-            style="@style/ExtraKeyButton"
-            android:contentDescription="@string/cd_key_right"
-            android:text="→" />
+            <Button
+                android:id="@+id/key_left"
+                style="@style/ExtraKeyButton"
+                android:contentDescription="@string/cd_key_left"
+                android:text="←" />
 
-        <Button
-            android:id="@+id/key_collapse"
-            style="@style/ExtraKeyButton"
-            android:layout_width="44dp"
-            android:layout_weight="0"
-            android:contentDescription="@string/cd_key_collapse"
-            android:text="▼" />
+            <Button
+                android:id="@+id/key_right"
+                style="@style/ExtraKeyButton"
+                android:contentDescription="@string/cd_key_right"
+                android:text="→" />
+
+            <Button
+                android:id="@+id/key_ctrl"
+                style="@style/ExtraKeyButton"
+                android:contentDescription="@string/cd_key_ctrl"
+                android:text="Ctrl" />
+
+            <Button
+                android:id="@+id/key_alt"
+                style="@style/ExtraKeyButton"
+                android:contentDescription="@string/cd_key_alt"
+                android:text="Alt" />
+
+            <Button
+                android:id="@+id/key_collapse"
+                style="@style/ExtraKeyButton"
+                android:layout_width="44dp"
+                android:layout_weight="0"
+                android:contentDescription="@string/cd_key_collapse"
+                android:text="▼" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal">
+
+            <Button
+                android:id="@+id/key_combo_c"
+                style="@style/ExtraKeyButton"
+                android:contentDescription="@string/cd_combo_ctrl_c"
+                android:text="^C" />
+
+            <Button
+                android:id="@+id/key_combo_d"
+                style="@style/ExtraKeyButton"
+                android:contentDescription="@string/cd_combo_ctrl_d"
+                android:text="^D" />
+
+            <Button
+                android:id="@+id/key_combo_l"
+                style="@style/ExtraKeyButton"
+                android:contentDescription="@string/cd_combo_ctrl_l"
+                android:text="^L" />
+
+            <Button
+                android:id="@+id/key_combo_u"
+                style="@style/ExtraKeyButton"
+                android:contentDescription="@string/cd_combo_ctrl_u"
+                android:text="^U" />
+
+            <Button
+                android:id="@+id/key_combo_s"
+                style="@style/ExtraKeyButton"
+                android:contentDescription="@string/cd_combo_ctrl_s"
+                android:text="^S" />
+
+            <Button
+                android:id="@+id/key_combo_grave"
+                style="@style/ExtraKeyButton"
+                android:contentDescription="@string/cd_combo_ctrl_grave"
+                android:text="^`" />
+        </LinearLayout>
     </LinearLayout>
-
-    <!-- Shown in place of the toolbar when the user collapses it (external
-         keyboard users); taps re-expand and remember the choice. -->
-    <Button
-        android:id="@+id/key_toolbar_handle"
-        style="@style/ExtraKeyButton"
-        android:layout_width="44dp"
-        android:layout_height="32dp"
-        android:background="@color/surface_dark"
-        android:contentDescription="@string/cd_key_expand"
-        android:text="▲"
-        android:visibility="gone"
-        app:layout_constraintBottom_toBottomOf="parent"
-        app:layout_constraintEnd_toEndOf="parent" />
 
     <!-- Loading overlay. It is only a progress/log surface: never let it (or
          its selectable log TextView) take Android focus or the IME away from
@@ -216,5 +265,19 @@
         </ScrollView>
 
     </androidx.constraintlayout.widget.ConstraintLayout>
+
+    <!-- Shown in place of the toolbar when the user collapses it (external
+         keyboard users); taps re-expand and remember the choice. -->
+    <Button
+        android:id="@+id/key_toolbar_handle"
+        style="@style/ExtraKeyButton"
+        android:layout_width="44dp"
+        android:layout_height="32dp"
+        android:background="@color/surface_dark"
+        android:contentDescription="@string/cd_key_expand"
+        android:text="▲"
+        android:visibility="gone"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintEnd_toEndOf="parent" />
 
 </androidx.constraintlayout.widget.ConstraintLayout>

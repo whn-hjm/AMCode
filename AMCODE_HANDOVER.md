@@ -282,7 +282,8 @@ curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' http://127.0.0.1:<PORT>
 ### P3（体验/工程）
 
 - [x] **[T-K] extra-keys 方案A子集（Esc/Tab/↑↓←→）+ 可收起**：行尾 ▼ 收起 / 右下角 ▲ 把手展开，选择持久化（外接键盘用户收一次即永久隐藏）；native 工具栏，dispatchKeyEvent 标准硬件键路径；验证：渲染/布局✓、按钮不抢焦点（点按钮后 mServedView 仍为 WebView）✓、IME 打开时自动隐藏✓；**网页内效果无法用 uiautomator 观察（VS Code a11y 不暴露）**——终端 ↑ 历史回溯请人工确认一次。Ctrl/Alt 粘滞仍留待后续（021cda3 之后的批次）
-- [ ] **[T-K2]** extra-keys Ctrl/Alt 粘滞修饰键（键盘自身工具行可临时顶替；实现注意与 IME/focus 修复联动）
+- [x] **[T-K2]** extra-keys Ctrl/Alt 粘滞键 + 一键组合行（点按=单次武装、长按=锁定、armed 蓝色/locked 绿色；对工具栏键与外接键盘硬件键生效（dispatchKeyEvent meta 注入+one-shot 实测）；**一键组合行 ^C ^D ^L ^U ^S ^`** 覆盖软键盘无法组合的场景（软键盘 commitText 带不上修饰键——此为 Android WebView 平台限制）；5558 实测全状态循环
+- [ ] **[T-K3]** 按键行自定义（长按编辑按键内容/排序；低优先）
 - [x] **[T-M] 剔除错架构死重**：安装时按 ABI 删除 npm 异架构 prebuilds（arm64：copilot-sdk/koffi/watcher-x64/msal/argon2-x64 等约 154MB；x86_64：argon2 arm 系）并同步修剪 code-server.list；5560 fresh 实测剔除执行、dpkg clean、页面正常（8c8b8ae）
 - [ ] **[T-N]** 核验系统 `rg`（ripgrep 包）16KB 对齐（本轮审计未覆盖，下次审计并入）
   - 方案A（native toolbar）：App 层 WebView 下方加一排按钮，把 Esc/Ctrl/Tab/方向键翻译成 `dispatchKeyEvent` 注入 WebView —— 优点：不依赖页面结构、横竖屏布局可控；缺点：Ctrl 组合键状态管理复杂（要自己维护 modifier 粘滞），与 IME 抬起时的 inset 联动要重测（focus 修复同款敏感区）。
@@ -348,6 +349,12 @@ curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' http://127.0.0.1:<PORT>
 ---
 
 ## 11. 变更记录（每批次一条，倒序；新改动加在最上面）
+
+### 2026-10-25 下午（四）· 粘滞键 + 一键组合行（T-K2）
+- **Ctrl/Alt 粘滞**：点按武装（蓝）/长按锁定（绿）/再点取消；armed 时对工具栏键与外接键盘硬件键注入 META（dispatchKeyEvent 拦截重发，one-shot 后复位）——实测全状态循环+一次性消耗。
+- **一键组合行**：^C ^D ^L ^U ^S ^` 直发（软键盘 commitText 无法携带修饰键，组合键是软键盘场景唯一可靠解）。
+- **virtual mouse 砍掉**（用户拍板：触摸保持原生即可）；P1-8 余项仅剩 T-K3 自定义按键行。
+- 布局重写为两行工具栏（上：导航+修饰键+收起；下：组合键）；期间一次布局结构搞坏被整体重写修复。
 
 ### 2026-10-25 下午（三）· `8c8b8ae` 按键行可收起 + T-M 死重剔除
 - **按键行可收起**（用户要求）：行尾 ▼ 收起 → 右下角 ▲ 把手展开；HomePrefs 持久化；实测收起/展开循环与状态记忆，收起态 VS Code 满屏。
@@ -441,7 +448,7 @@ curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' http://127.0.0.1:<PORT>
 | P1-4 | **离线 SDK/自定义 bootstrap** | L/XL | 把 git/clang/python 等预打进可选 asset pack，首装 <1-2 分钟零网络 | fresh 安装 <2 分钟 |
 | P1-5 | TUR 镜像/CDN + 断点差分 | L | 自建 GitHub Releases/R2 缓存固定版本 deb | 无代理下载明显提速 |
 | P1-6/7 | clangd/rust-analyzer/LLDB 预编译 | L | 各语言工具链 optional 安装 | 补全/调试可用 |
-| P1-8 | 移动端 UI 分叉（extra-keys/virtual mouse） | L | fork code-server web UI 或 CSS/JS 注入 | 触屏可用性明显提升 |
+| P1-8 | 移动端 UI 分叉 | L | **2026-10-25 用户拍板：virtual mouse 不做**（触摸保持原生路径，够用）；extra-keys 已在主线落地（§7 T-K/T-K2）。剩余可选项：按键行自定义（T-K3） | 触屏可用性 |
 | P1-9 | CI 完整化（双 APK + emulator smoke） | L | 当前 CI 只有 debug+lint+unsigned release | PR 产出 online/offline + 测试报告 |
 
 ### 执行建议（原路线图结论）

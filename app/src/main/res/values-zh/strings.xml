@@ -146,4 +146,12 @@
     <string name="cd_key_right">方向键 右</string>
     <string name="cd_key_collapse">收起扩展按键行</string>
     <string name="cd_key_expand">显示扩展按键行</string>
+    <string name="cd_key_ctrl">Ctrl 修饰键：点按武装下一个键，长按锁定</string>
+    <string name="cd_key_alt">Alt 修饰键：点按武装下一个键，长按锁定</string>
+    <string name="cd_combo_ctrl_c">Ctrl+C（中断）</string>
+    <string name="cd_combo_ctrl_d">Ctrl+D（EOF）</string>
+    <string name="cd_combo_ctrl_l">Ctrl+L（清屏）</string>
+    <string name="cd_combo_ctrl_u">Ctrl+U（清行）</string>
+    <string name="cd_combo_ctrl_s">Ctrl+S（保存）</string>
+    <string name="cd_combo_ctrl_grave">Ctrl+反引号（切换终端）</string>
 </resources>

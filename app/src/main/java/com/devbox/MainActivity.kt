@@ -83,6 +83,14 @@ class MainActivity : AppCompatActivity() {
     private lateinit var keyToolbar: android.view.View
     private var imeBottomPx = 0
 
+    /** Sticky-modifier states for the extra-keys row. */
+    private enum class ModifierMode { OFF, ARMED, LOCKED }
+
+    private var ctrlMode = ModifierMode.OFF
+    private var altMode = ModifierMode.OFF
+    /** True while this class is dispatching its own combo key events. */
+    private var dispatchingCombo = false
+
     private var codeServerService: CodeServerService? = null
     private var serviceBound = false
     private var statusJob: Job? = null
@@ -1048,6 +1056,45 @@ class MainActivity : AppCompatActivity() {
             button.isFocusableInTouchMode = false
             button.setOnClickListener { dispatchExtraKey(keyCode) }
         }
+        val ctrlButton = findViewById<View>(R.id.key_ctrl)
+        ctrlButton.isFocusable = false
+        ctrlButton.isFocusableInTouchMode = false
+        ctrlButton.setOnClickListener {
+            ctrlMode = if (ctrlMode == ModifierMode.OFF) ModifierMode.ARMED else ModifierMode.OFF
+            refreshCtrlVisual()
+        }
+        // Long-press locks the modifier (stays armed until tapped again).
+        ctrlButton.setOnLongClickListener {
+            ctrlMode = if (ctrlMode == ModifierMode.LOCKED) ModifierMode.OFF else ModifierMode.LOCKED
+            refreshCtrlVisual()
+            true
+        }
+        val altButton = findViewById<View>(R.id.key_alt)
+        altButton.isFocusable = false
+        altButton.isFocusableInTouchMode = false
+        altButton.setOnClickListener {
+            altMode = if (altMode == ModifierMode.OFF) ModifierMode.ARMED else ModifierMode.OFF
+            refreshAltVisual()
+        }
+        altButton.setOnLongClickListener {
+            altMode = if (altMode == ModifierMode.LOCKED) ModifierMode.OFF else ModifierMode.LOCKED
+            refreshAltVisual()
+            true
+        }
+        val combos = mapOf(
+            R.id.key_combo_c to KeyEvent.KEYCODE_C,
+            R.id.key_combo_d to KeyEvent.KEYCODE_D,
+            R.id.key_combo_l to KeyEvent.KEYCODE_L,
+            R.id.key_combo_u to KeyEvent.KEYCODE_U,
+            R.id.key_combo_s to KeyEvent.KEYCODE_S,
+            R.id.key_combo_grave to KeyEvent.KEYCODE_GRAVE
+        )
+        for ((id, keyCode) in combos) {
+            val button = findViewById<View>(id)
+            button.isFocusable = false
+            button.isFocusableInTouchMode = false
+            button.setOnClickListener { dispatchCombo(keyCode) }
+        }
         // Collapsible for hardware-keyboard users; the choice is remembered.
         findViewById<View>(R.id.key_collapse).setOnClickListener {
             HomePrefs.setExtraKeysEnabled(this, false)
@@ -1060,14 +1107,104 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun dispatchExtraKey(keyCode: Int) {
+        dispatchKeyWithStickyMeta(keyCode)
+    }
+
+    private fun dispatchCombo(keyCode: Int) {
         if (!::webView.isInitialized || isFinishing || isDestroyed) return
         try {
             ensureWebViewFocus()
-            webView.dispatchKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, keyCode))
-            webView.dispatchKeyEvent(KeyEvent(KeyEvent.ACTION_UP, keyCode))
+            dispatchingCombo = true
+            dispatchKeyWithStickyMeta(keyCode, KeyEvent.META_CTRL_ON)
+        } finally {
+            dispatchingCombo = false
+        }
+    }
+
+    /** Current armed/locked modifiers as a KeyEvent meta mask. */
+    private fun stickyMeta(): Int {
+        var meta = 0
+        if (ctrlMode != ModifierMode.OFF) meta = meta or KeyEvent.META_CTRL_ON
+        if (altMode != ModifierMode.OFF) meta = meta or KeyEvent.META_ALT_ON
+        return meta
+    }
+
+    private fun clearArmed() {
+        if (ctrlMode == ModifierMode.ARMED) {
+            ctrlMode = ModifierMode.OFF
+            refreshCtrlVisual()
+        }
+        if (altMode == ModifierMode.ARMED) {
+            altMode = ModifierMode.OFF
+            refreshAltVisual()
+        }
+    }
+
+    private fun dispatchKeyWithStickyMeta(keyCode: Int, extraMeta: Int = 0) {
+        if (!::webView.isInitialized || isFinishing || isDestroyed) return
+        try {
+            ensureWebViewFocus()
+            val meta = stickyMeta() or extraMeta
+            val now = System.currentTimeMillis()
+            webView.dispatchKeyEvent(KeyEvent(now, now, KeyEvent.ACTION_DOWN, keyCode, 0, meta))
+            webView.dispatchKeyEvent(KeyEvent(now, now, KeyEvent.ACTION_UP, keyCode, 0, meta))
+            // One-shot: armed modifiers apply to exactly one key.
+            if (extraMeta == 0) clearArmed()
         } catch (e: Exception) {
             Log.w(TAG, "Cannot dispatch extra key $keyCode", e)
         }
+    }
+
+    /**
+     * Hardware keyboards and IME key events flow through here: when a sticky
+     * modifier is armed/locked, re-emit the event with the modifier flags set
+     * so external-keyboard users get full Ctrl/Alt combinations. Plain IME
+     * typing (commitText) bypasses this pipeline — the combo row covers those
+     * cases for soft keyboards.
+     */
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (!dispatchingCombo && stickyMeta() != 0 &&
+            !isModifierKeyCode(event.keyCode)
+        ) {
+            val modified = KeyEvent(
+                event.downTime, event.eventTime, event.action,
+                event.keyCode, event.repeatCount, event.metaState or stickyMeta()
+            )
+            val handled = super.dispatchKeyEvent(modified)
+            if (event.action == KeyEvent.ACTION_DOWN) clearArmed()
+            return handled
+        }
+        return super.dispatchKeyEvent(event)
+    }
+
+    private fun isModifierKeyCode(keyCode: Int): Boolean = when (keyCode) {
+        KeyEvent.KEYCODE_CTRL_LEFT, KeyEvent.KEYCODE_CTRL_RIGHT,
+        KeyEvent.KEYCODE_ALT_LEFT, KeyEvent.KEYCODE_ALT_RIGHT,
+        KeyEvent.KEYCODE_SHIFT_LEFT, KeyEvent.KEYCODE_SHIFT_RIGHT,
+        KeyEvent.KEYCODE_META_LEFT, KeyEvent.KEYCODE_META_RIGHT -> true
+        else -> false
+    }
+
+    private fun refreshCtrlVisual() {
+        if (!::keyToolbar.isInitialized) return
+        findViewById<View>(R.id.key_ctrl).setBackgroundColor(
+            when (ctrlMode) {
+                ModifierMode.ARMED -> ContextCompat.getColor(this, R.color.accent_blue)
+                ModifierMode.LOCKED -> ContextCompat.getColor(this, R.color.accent_green)
+                else -> ContextCompat.getColor(this, android.R.color.transparent)
+            }
+        )
+    }
+
+    private fun refreshAltVisual() {
+        if (!::keyToolbar.isInitialized) return
+        findViewById<View>(R.id.key_alt).setBackgroundColor(
+            when (altMode) {
+                ModifierMode.ARMED -> ContextCompat.getColor(this, R.color.accent_blue)
+                ModifierMode.LOCKED -> ContextCompat.getColor(this, R.color.accent_green)
+                else -> ContextCompat.getColor(this, android.R.color.transparent)
+            }
+        )
     }
 
     /**
