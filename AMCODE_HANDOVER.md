@@ -27,6 +27,8 @@
 - 改代码前 git status；每次构建后更新本文件 §11；不要提交 review-assets/。
 
 v1.1.0 已发布：https://github.com/whn-hjm/AMCode/releases/tag/v1.1.0（online 通用 + offline arm64，附 SHA-256）。下一优先级（§7）：P2 剩余项 → P3 → §13 重任务池。
+
+产品口径（2026-10-25 用户拍板）：**主线不做 proot**——proot 性能不可接受，native bionic 路线是项目立身之本。glibc 兼容在主线上只能走自编译/patched code-server（§13 P1-2）；proot 只允许作为未来一个独立的 proot 版本/分支存在，不进主线 backlog。
 ```
 
 ---
@@ -242,7 +244,7 @@ curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' http://127.0.0.1:<PORT>
 8. **多用户/work profile 路径视图**：dpkg DB 与 shell 脚本用 `/data/data/com.devbox` 字面路径，secondary user（`/data/user/10/...`）下 DB 记录与实际路径不一致（可运行，`dpkg -V` 错位）。声明不支持即可。
 9. **i18n 残余**：MainActivity 对话框/Toast 已全量迁移 values-zh（021cda3）；CodeServerService 的通知文案与 strings.xml 里 initializing/error_occurred 等旧键仍仅英文（中文回落英文）。
 10. ~~**mint-key 探测的潜在副作用**~~ **已核实无问题（2026-10-25，主 agent 查 v4.143.1 源码）**：`POST /mint-key`（src/node/routes/vscode.ts:213，ensureAuthenticated 保护）只是惰性创建/读取 user-data-dir 下一个 32 字节 `serve-web-key-half` 文件（模块级缓存，缺失才写一次，跨启动复用）——不是会累积的 API key，保留现用法。`GET /healthz` 确认免认证（routes/index.ts:156 独立挂载）。
-11. **glibc native 扩展不可用**（bionic 限制）：纯 JS/语言包可用；完整兼容需 proot/glibc（CodeFA 路线）或 VHEditor 式 patched code-server——见 §13。
+11. **glibc native 扩展不可用**（bionic 限制）：纯 JS/语言包可用。主线兼容路径是自编译/patched code-server（§13 P1-2）；**主线不做 proot**（用户拍板：性能差）——proot 只可能以独立版本形态出现在未来。
 12. **AOSP 无 WebView 的设备**：现已给出明确报错对话框（未在真机复测；API26 AOSP 镜像实测触发该路径）。极旧 WebView 版本无版本门槛提示（P3 池）。
 13. **默认在线 TUR 仍慢**：TUR 无镜像，8 连接受 GitHub 限速；offline 版是解决方案（已实现）。
 14. **auth 使用 SHA-256 hashed-password** 是 code-server 4.143.1 legacy 路径；升级 code-server 必须重新验证。
@@ -253,7 +255,7 @@ curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' http://127.0.0.1:<PORT>
 ## 7. 任务池（按优先级；做完一项更新一项；新发现随时追加）
 
 > 本节是**活任务板**：完成打勾并写 commit 号；子代理/后续维护者从这里领任务。文件独占约定见括号。
-> 重任务候选池（proot/自编译 code-server/16KB 等 XL 级）的完整展开见附录 §13（原 docs/history/AMCODE_ROADMAP.md 的活跃摘要）。
+> 重任务候选池（自编译 code-server/16KB/离线 SDK 等 XL 级）的完整展开见附录 §13（原 docs/history/AMCODE_ROADMAP.md 的活跃摘要）。**口径：主线不做 proot**（性能不可接受）；proot 仅为未来独立版本候选。
 
 ### P1（发布前）
 
@@ -282,7 +284,7 @@ curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' http://127.0.0.1:<PORT>
 
 ### 长期
 
-- proot/glibc 兼容模式、自编译 Android-native code-server、16KB page、TUR 镜像/CDN——展开见 §13。
+- 自编译 Android-native code-server（glibc 兼容的主线路径）、16KB page、TUR 镜像/CDN——展开见 §13。proot 已移出主线（独立版本候选，见 §13 P1-1 备注）。
 
 ---
 
@@ -338,6 +340,10 @@ curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' http://127.0.0.1:<PORT>
 ---
 
 ## 11. 变更记录（每批次一条，倒序；新改动加在最上面）
+
+### 2026-10-25 下午 · 产品口径：主线不做 proot
+- 用户拍板：proot 性能不可接受，主线坚持 native bionic；glibc 兼容主线路径改为自编译/patched code-server（§13 P1-2）。
+- §13 P1-1 降级为"未来独立 proot 版本"候选备忘；§0/§6.11/§7 同步更正。README/ARCHITECTURE 的 "no proot" 卖点描述不受影响。
 
 ### 2026-10-25 中午 · `021cda3` i18n + WebView 门槛 + **GitHub Release v1.1.0**
 - MainActivity 72 个 string 键全量迁移 values/values-zh，isChinese() 删除；zh-CN per-app locale 实测（存储对话框参数化渲染正确）。
@@ -403,7 +409,7 @@ curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' http://127.0.0.1:<PORT>
 
 | ID | 任务 | 难度 | 一句话说明 | 验收 |
 |---|---|---|---|---|
-| P1-1 | **Proot/glibc 兼容模式** | XL | App 内可选跑 Debian arm64 rootfs + proot，让 glibc native 扩展可用；rootfs 300-800MB、性能损耗需评估 | 装上并运行一个 glibc native 扩展；冷启动/内存可接受 |
+| P1-1 | Proot/glibc（**已移出主线**） | XL | **2026-10-25 用户拍板：主线不做 proot（性能不可接受，native bionic 是立项根基）**。保留条目仅作为"未来独立 proot 版本"的候选备忘：App 内可选跑 Debian rootfs + proot，与主线并存为独立分支/变体，不并入主线 backlog | 若未来立项独立版：装上并运行一个 glibc native 扩展，且与主线 APK 明确区隔 |
 | P1-2 | **自编译 Android-native code-server** | XL | 用 Termux clang/NDK 编译 spdlog/watcher/node-pty/ripgrep，摆脱 TUR 包与 libc++ ABI 问题 | 扩展宿主无 ABI 错误；包体积 < TUR 的 120MB |
 | P1-3 | **16KB page-size 重建** | L/XL | Android 15/16 的 16KB 设备硬门槛；重链 `-Wl,-z,max-page-size=16384` | 16KB AVD 可启动、pkg 正常 |
 | P1-4 | **离线 SDK/自定义 bootstrap** | L/XL | 把 git/clang/python 等预打进可选 asset pack，首装 <1-2 分钟零网络 | fresh 安装 <2 分钟 |
@@ -414,9 +420,9 @@ curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' http://127.0.0.1:<PORT>
 
 ### 执行建议（原路线图结论）
 
-- 顺序：清完 §7 P1 → 并行 proot（P1-1）与自编译（P1-2）两条重线 → 16KB/离线 SDK 第三线。不要五条全开。
-- 决策门：proot 性能可接受才考虑默认（否则 optional compat mode）；自编译包体积/维护成本优于 TUR 才替换；16KB 失败即 P0。
-- 禁忌：不要在没有基准时把 proot 设为默认；不要同时改 pkg 修复与 proot rootfs 路径（先抽象 prefix/root）；不要用 Microsoft Marketplace；不要为 16KB 直接换 bootstrap 不跑全回归；不要把 500MB 资产塞进默认 APK。
+- 顺序：清完 §7 P1 → 自编译 code-server（P1-2）为主线唯一 glibc 路线 → 16KB/离线 SDK 第二线。不要五条全开。proot（P1-1）不在主线排期。
+- 决策门：自编译包体积/维护成本优于 TUR 才替换；16KB 失败即 P0。
+- 禁忌：不要把 proot 引入主线（若立项独立版，先抽象 prefix/root 再动 pkg 层）；不要用 Microsoft Marketplace；不要为 16KB 直接换 bootstrap 不跑全回归；不要把 500MB 资产塞进默认 APK。
 
 ---
 
