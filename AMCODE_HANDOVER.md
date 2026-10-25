@@ -281,9 +281,9 @@ curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' http://127.0.0.1:<PORT>
 
 ### P3（体验/工程）
 
-- [x] **[T-K] extra-keys 方案A子集（Esc/Tab/↑↓←→）**：native 工具栏，dispatchKeyEvent 标准硬件键路径；验证：渲染/布局✓、按钮不抢焦点（点按钮后 mServedView 仍为 WebView）✓、IME 打开时自动隐藏✓；**网页内效果无法用 uiautomator 观察（VS Code a11y 不暴露）**——终端 ↑ 历史回溯请人工确认一次。Ctrl/Alt 粘滞仍留待后续（021cda3 之后的批次）
+- [x] **[T-K] extra-keys 方案A子集（Esc/Tab/↑↓←→）+ 可收起**：行尾 ▼ 收起 / 右下角 ▲ 把手展开，选择持久化（外接键盘用户收一次即永久隐藏）；native 工具栏，dispatchKeyEvent 标准硬件键路径；验证：渲染/布局✓、按钮不抢焦点（点按钮后 mServedView 仍为 WebView）✓、IME 打开时自动隐藏✓；**网页内效果无法用 uiautomator 观察（VS Code a11y 不暴露）**——终端 ↑ 历史回溯请人工确认一次。Ctrl/Alt 粘滞仍留待后续（021cda3 之后的批次）
 - [ ] **[T-K2]** extra-keys Ctrl/Alt 粘滞修饰键（键盘自身工具行可临时顶替；实现注意与 IME/focus 修复联动）
-- [ ] **[T-M] 剔除 TUR deb 的错架构死重**：code-server 包内 154.3MB x86_64/arm32 预编译（argon2/copilot-sdk/koffi/watcher-x64 等）可在安装时剔除，减解包体积约 30%，不损失 arm64 功能（16KB 审计副产品）；注意 dpkg .list 一致性
+- [x] **[T-M] 剔除错架构死重**：安装时按 ABI 删除 npm 异架构 prebuilds（arm64：copilot-sdk/koffi/watcher-x64/msal/argon2-x64 等约 154MB；x86_64：argon2 arm 系）并同步修剪 code-server.list；5560 fresh 实测剔除执行、dpkg clean、页面正常（8c8b8ae）
 - [ ] **[T-N]** 核验系统 `rg`（ripgrep 包）16KB 对齐（本轮审计未覆盖，下次审计并入）
   - 方案A（native toolbar）：App 层 WebView 下方加一排按钮，把 Esc/Ctrl/Tab/方向键翻译成 `dispatchKeyEvent` 注入 WebView —— 优点：不依赖页面结构、横竖屏布局可控；缺点：Ctrl 组合键状态管理复杂（要自己维护 modifier 粘滞），与 IME 抬起时的 inset 联动要重测（focus 修复同款敏感区）。
   - 方案B（JS 注入）：页面里注入 fixed 定位的按键条，向 xterm textarea 发 KeyboardEvent —— 优点：xterm 原生路径、Ctrl 组合简单；缺点：依赖 code-server DOM 结构（升级可能破）、滚动/全屏布局冲突。
@@ -348,6 +348,11 @@ curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' http://127.0.0.1:<PORT>
 ---
 
 ## 11. 变更记录（每批次一条，倒序；新改动加在最上面）
+
+### 2026-10-25 下午（三）· `8c8b8ae` 按键行可收起 + T-M 死重剔除
+- **按键行可收起**（用户要求）：行尾 ▼ 收起 → 右下角 ▲ 把手展开；HomePrefs 持久化；实测收起/展开循环与状态记忆，收起态 VS Code 满屏。
+- **[T-M]**：安装时按 ABI 剔除 npm 异架构 prebuilds（arm64 约 154MB；x86_64 侧 argon2 arm 系），同步修剪 .list；5560 fresh 实测剔除执行、dpkg clean、code-server 正常。
+- 待人工确认：终端里按 ↑ 的历史回溯效果（a11y 无法自动观察）。
 
 ### 2026-10-25 下午（续）· 16KB 审计关账 + extra-keys 子集 + README 双语
 - **16KB 审计（只读代理）**：code-server/nodejs-24 全量 ELF 扫描（python 解析+llvm-readelf 抽样交叉验证 0 分歧）——**核心链路全部达标，P1-3 关账**；不达标 15 个均为错架构死重；衍生 [T-M]（剔除死重减体积）、[T-N]（rg 补审）。原始数据在代理临时目录（可复核后删）。
