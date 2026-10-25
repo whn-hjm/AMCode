@@ -86,13 +86,17 @@ object TermuxManager {
     @Volatile
     private var lastInstallError: String = ""
 
-    // Bootstrap asset file — selected by architecture at runtime
-    private fun bootstrapAsset(): String {
-        val primary = android.os.Build.SUPPORTED_ABIS.firstOrNull() ?: "arm64-v8a"
+    // Bootstrap asset file — selected by architecture at runtime.
+    // Returns null on ABIs without a bundled bootstrap (armeabi-v7a, i686,
+    // 32-bit x86): the aarch64 binaries cannot execute there, so failing
+    // loudly beats shipping an environment that dies on the first exec.
+    private fun bootstrapAsset(): String? {
+        val primary = android.os.Build.SUPPORTED_ABIS.firstOrNull() ?: return null
         return when {
             primary.startsWith("x86_64") -> "bootstrap-x86_64.zip"
-            primary.startsWith("x86") -> "bootstrap-i686.zip"
-            else -> "bootstrap-aarch64.zip"
+            primary.startsWith("arm64") || primary.startsWith("aarch64") ->
+                "bootstrap-aarch64.zip"
+            else -> null
         }
     }
 
@@ -100,12 +104,38 @@ object TermuxManager {
     private val _terminalOutput = MutableStateFlow("")
     val terminalOutput: StateFlow<String> = _terminalOutput.asStateFlow()
 
+    private var setupLogFile: File? = null
+
+    /**
+     * Persist the setup/terminal log next to the app files so bug reports do
+     * not depend on logcat. One rotation level (setup.log.1), ~1 MB each;
+     * any IO failure is swallowed — logging must never break the setup.
+     */
+    private fun persistSetupLog(line: String) {
+        try {
+            var file = setupLogFile
+            if (file == null) {
+                file = File(App.instance.filesDir, "logs/setup.log")
+                file.parentFile?.mkdirs()
+                setupLogFile = file
+            }
+            if (file.length() > 1_000_000) {
+                val rotated = File(file.parentFile, "setup.log.1")
+                rotated.delete()
+                file.renameTo(rotated)
+            }
+            file.appendText(line)
+        } catch (_: Exception) {
+        }
+    }
+
     fun emitOutput(line: String) {
         val current = _terminalOutput.value
         // Keep last ~5000 chars to avoid memory bloat
         val updated = if (current.length > 5000) current.takeLast(2000) + line else current + line
         _terminalOutput.value = updated
         Log.i(TAG, line.trimEnd())
+        persistSetupLog(line)
     }
 
     // Setup states
@@ -200,6 +230,7 @@ object TermuxManager {
                 // code-server native modules (spdlog/@parcel/watcher) otherwise
                 // fail with "_ZNSt6__ndk113__hash_memoryEPKvm" (libc++ 29).
                 ensureLibCpp30()
+                registerLegacyPackagesInDpkgDb()
                 File(filesDir, ".amcode-ready").writeText("1")
             }
         }
@@ -220,7 +251,15 @@ object TermuxManager {
             _setupState.value = SetupProgress(State.EXTRACTING, "Extracting bootstrap from APK...", 5)
 
             // Step 2: Extract bootstrap from APK (bundled, no network)
-            val bootstrapZip = File(filesDir, bootstrapAsset())
+            val assetName = bootstrapAsset()
+            if (assetName == null) {
+                val abi = android.os.Build.SUPPORTED_ABIS.firstOrNull() ?: "unknown"
+                val message = "32-bit or unsupported ABI ($abi); AMCode requires arm64-v8a or x86_64"
+                emitOutput("[FAILED] $message\n")
+                _setupState.value = SetupProgress(State.FAILED, message, 0)
+                return@withContext Result.failure(IllegalStateException(message))
+            }
+            val bootstrapZip = File(filesDir, assetName)
             if (!bootstrapZip.exists()) {
                 _setupState.value = SetupProgress(State.EXTRACTING, "Extracting environment files...", 8)
                 try {
@@ -228,7 +267,7 @@ object TermuxManager {
                     // rename: a truncated cache zip would otherwise be reused
                     // by every future launch until the user clears app data.
                     val tmp = File(filesDir, "${bootstrapZip.name}.tmp")
-                    context.assets.openFd(bootstrapAsset()).use { fd ->
+                    context.assets.openFd(assetName).use { fd ->
                         fd.createInputStream().use { input ->
                             FileOutputStream(tmp).use { output ->
                                 val buffer = ByteArray(65536)
@@ -421,9 +460,12 @@ object TermuxManager {
         File(etcDir, "group").writeText(
             "root:x:0:root\n"
         )
-        File(etcDir, "resolv.conf").writeText(
-            "nameserver 8.8.8.8\nnameserver 8.8.4.4\n"
-        )
+        // Only seed DNS on first run: a user-provided resolv.conf (custom
+        // resolver, private network) must survive reinstalls and retries.
+        val resolv = File(etcDir, "resolv.conf")
+        if (!resolv.exists()) {
+            resolv.writeText("nameserver 8.8.8.8\nnameserver 8.8.4.4\n")
+        }
     }
 
     private fun extractBootstrap(zipFile: File) {
@@ -1982,6 +2024,97 @@ object TermuxManager {
     fun isNodeInstalled(): Boolean = File(binDir, "node").exists()
     fun isCodeServerInstalled(): Boolean = File(binDir, "code-server").exists()
 
+    /**
+     * Installations created before the dpkg-wrapper flow never registered
+     * code-server/nodejs-24 in the dpkg database (their binaries were moved
+     * into place by hand), so `dpkg -l`, `pkg upgrade` and dependency
+     * resolution treat them as unknown files. Register a minimal, accurate
+     * stanza once; real installs through the wrapper keep writing full
+     * metadata. Idempotent and fail-safe.
+     */
+    private fun registerLegacyPackagesInDpkgDb() {
+        val status = File(varDir, "lib/dpkg/status")
+        if (!status.isFile) return
+        try {
+            val statusText = status.readText()
+            val entries = mutableListOf<Pair<String, List<File>>>()
+            val codeServerRoot = File(usrDir, "lib/code-server")
+            if (File(binDir, "code-server").isFile &&
+                !statusText.contains("\nPackage: code-server\n")
+            ) {
+                entries.add("code-server" to listOfNotNull(codeServerRoot.takeIf { it.isDirectory }, File(binDir, "code-server")))
+            }
+            val nodeRoot = File(usrDir, "opt/nodejs-24")
+            if (nodeRoot.isDirectory &&
+                !statusText.contains("\nPackage: nodejs-24\n")
+            ) {
+                entries.add("nodejs-24" to listOf(nodeRoot, File(binDir, "node")))
+            }
+            if (entries.isEmpty()) return
+
+            if (!File(varDir, "lib/dpkg/status.amcode-legacy-bak").exists()) {
+                status.copyTo(File(varDir, "lib/dpkg/status.amcode-legacy-bak"), overwrite = false)
+            }
+            val arch = when (val abi = android.os.Build.SUPPORTED_ABIS.firstOrNull()) {
+                "arm64-v8a" -> "arm64"
+                "x86_64" -> "x86_64"
+                else -> abi
+            }
+            var appended = StringBuilder()
+            for ((name, roots) in entries) {
+                val version = when (name) {
+                    "code-server" -> packageJsonVersion(codeServerRoot) ?: "4.143.1"
+                    else -> packageJsonVersion(File(nodeRoot, "lib/node_modules/nodejs-24"))
+                        ?: nodeRoot.name.removePrefix("nodejs-").ifBlank { "24" }
+                }
+                appended.append("\nPackage: $name\n")
+                    .append("Version: $version\n")
+                    .append("Architecture: ${arch ?: "all"}\n")
+                    .append("Maintainer: AMCode legacy registration\n")
+                    .append("Status: install ok installed\n\n")
+
+                val listFile = File(varDir, "lib/dpkg/info/$name.list")
+                if (!listFile.exists()) {
+                    val lines = StringBuilder()
+                    for (root in roots) {
+                        if (root == null || !root.exists()) continue
+                        if (root.isFile) lines.append(root.absolutePath).append('\n')
+                        else root.walkTopDown().filter { it.isFile || java.nio.file.Files.isSymbolicLink(it.toPath()) }
+                            .forEach { lines.append(it.absolutePath).append('\n') }
+                    }
+                    writeAtomically(listFile, lines.toString())
+                }
+                Log.i(TAG, "dpkg db: registered legacy $name $version")
+            }
+            writeAtomically(status, statusText.dropLastWhile { it == '\n' } + "\n" + appended)
+        } catch (e: Exception) {
+            Log.w(TAG, "Cannot register legacy packages in the dpkg db: ${e.message}")
+        }
+    }
+
+    /** Best-effort "version" from a package.json inside [root]. */
+    private fun packageJsonVersion(root: File?): String? {
+        if (root == null) return null
+        return try {
+            val text = File(root, "package.json").readText()
+            Regex("\"version\"\\s*:\\s*\"([^\"]+)\"").find(text)?.groupValues?.get(1)
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun writeAtomically(target: File, content: String) {
+        val tmp = File(target.parentFile, "${target.name}.amcode-tmp")
+        tmp.writeText(content)
+        if (!tmp.renameTo(target)) {
+            target.delete()
+            if (!tmp.renameTo(target)) {
+                tmp.delete()
+                Log.w(TAG, "Cannot write ${target.absolutePath}")
+            }
+        }
+    }
+
     // ─── apt wrapper / URL resolution ─────────────────────────
 
     private data class AptResult(val exitCode: Int, val lines: List<String>)
@@ -2103,6 +2236,11 @@ object TermuxManager {
             for (i in 0 until MAX_RANGE_CONNECTIONS) {
                 File(dir, "${spec.filename}.part$i").delete()
             }
+            // Range-named parts (.part.<start>-<end>) from this or an older
+            // build are never reused across a repo version change.
+            dir.listFiles { f ->
+                f.name.startsWith("${spec.filename}.part.")
+            }?.forEach { it.delete() }
         }
     }
 
@@ -2175,9 +2313,7 @@ object TermuxManager {
             downloadRanged(spec, dest, size, connections, onProgress)
         } catch (e: RangeUnsupportedException) {
             Log.i(TAG, "Range not supported for ${spec.filename}; using single stream")
-            for (i in 0 until connections) {
-                File(dest.parentFile, "${dest.name}.part$i").delete()
-            }
+            cleanupPartialDownloads(listOf(spec))
             downloadSingle(spec, dest, size, onProgress)
         }
     }
@@ -2196,13 +2332,16 @@ object TermuxManager {
         val downloaded = AtomicLong(0L)
         val abort = AtomicBoolean(false)
 
-        // Resume any parts left by a previous app run. Guard against parts
-        // larger than the current segment (e.g. a repo switched versions).
+        // Resume any parts left by a previous app run. The part file name
+        // encodes its exact byte range, so a repo version bump (new size ->
+        // shifted segment boundaries) can never mis-read an old layout: only
+        // parts whose name matches this run's ranges are resumed, everything
+        // else is garbage-collected by cleanupPartialDownloads.
         for (i in 0 until segments) {
             val start = i.toLong() * segmentSize
             val end = minOf(size - 1, start + segmentSize - 1)
             val expected = end - start + 1
-            val part = File(dest.parentFile, "${dest.name}.part$i")
+            val part = rangePartFile(dest, start, end)
             if (part.length() > expected) part.delete()
             downloaded.addAndGet(part.length())
         }
@@ -2248,6 +2387,10 @@ object TermuxManager {
         }
     }
 
+    /** Part file whose name encodes the exact byte range it holds. */
+    private fun rangePartFile(dest: File, start: Long, end: Long): File =
+        File(dest.parentFile, "${dest.name}.part.$start-$end")
+
     private fun downloadSegment(
         url: String,
         dest: File,
@@ -2259,7 +2402,7 @@ object TermuxManager {
         onProgress: (Long, Long) -> Unit,
         total: Long
     ): Boolean {
-        val part = File(dest.parentFile, "${dest.name}.part$index")
+        val part = rangePartFile(dest, start, end)
         val expected = end - start + 1
         if (part.length() > expected) part.delete()
         var attempt = 0
@@ -2325,7 +2468,12 @@ object TermuxManager {
     }
 
     private fun mergeSegments(spec: DownloadSpec, dest: File, segments: Int, size: Long): Boolean {
-        val parts = (0 until segments).map { File(dest.parentFile, "${dest.name}.part$it") }
+        val segmentSize = (size + segments - 1) / segments
+        val parts = (0 until segments).map { i ->
+            val start = i.toLong() * segmentSize
+            val end = minOf(size - 1, start + segmentSize - 1)
+            rangePartFile(dest, start, end)
+        }
         if (parts.any { !it.isFile }) return false
         val total = parts.sumOf { it.length() }
         if (total != size) {
