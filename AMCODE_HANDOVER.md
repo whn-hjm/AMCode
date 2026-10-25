@@ -283,9 +283,8 @@ curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' http://127.0.0.1:<PORT>
 
 - [x] **[T-K] extra-keys 方案A子集（Esc/Tab/↑↓←→）+ 可收起**：行尾 ▼ 收起 / 右下角 ▲ 把手展开，选择持久化（外接键盘用户收一次即永久隐藏）；native 工具栏，dispatchKeyEvent 标准硬件键路径；验证：渲染/布局✓、按钮不抢焦点（点按钮后 mServedView 仍为 WebView）✓、IME 打开时自动隐藏✓；**网页内效果无法用 uiautomator 观察（VS Code a11y 不暴露）**——终端 ↑ 历史回溯请人工确认一次。Ctrl/Alt 粘滞仍留待后续（021cda3 之后的批次）
 - [x] **[T-K2]** extra-keys Ctrl/Alt 粘滞键 + 一键组合行（点按=单次武装、长按=锁定、armed 蓝色/locked 绿色；对工具栏键与外接键盘硬件键生效（dispatchKeyEvent meta 注入+one-shot 实测）；**一键组合行 ^C ^D ^L ^U ^S ^`** 覆盖软键盘无法组合的场景（软键盘 commitText 带不上修饰键——此为 Android WebView 平台限制）；5558 实测全状态循环
-- [ ] **[T-K3]** 按键行自定义（长按编辑按键内容/排序；低优先）
 - [x] **[T-M] 剔除错架构死重**：安装时按 ABI 删除 npm 异架构 prebuilds（arm64：copilot-sdk/koffi/watcher-x64/msal/argon2-x64 等约 154MB；x86_64：argon2 arm 系）并同步修剪 code-server.list；5560 fresh 实测剔除执行、dpkg clean、页面正常（8c8b8ae）
-- [ ] **[T-N]** 核验系统 `rg`（ripgrep 包）16KB 对齐（本轮审计未覆盖，下次审计并入）
+- [x] **[T-N]** `rg` 16KB 核验：拉取实机 rg 二进制（x86_64 构建）llvm-readelf 检查，3 个 PT_LOAD Align 全部 0x4000——达标；arm64 构建出自同一 Termux 构建系统（审计已证实统一 16K 参数）。**16KB 议题全部关账**
   - 方案A（native toolbar）：App 层 WebView 下方加一排按钮，把 Esc/Ctrl/Tab/方向键翻译成 `dispatchKeyEvent` 注入 WebView —— 优点：不依赖页面结构、横竖屏布局可控；缺点：Ctrl 组合键状态管理复杂（要自己维护 modifier 粘滞），与 IME 抬起时的 inset 联动要重测（focus 修复同款敏感区）。
   - 方案B（JS 注入）：页面里注入 fixed 定位的按键条，向 xterm textarea 发 KeyboardEvent —— 优点：xterm 原生路径、Ctrl 组合简单；缺点：依赖 code-server DOM 结构（升级可能破）、滚动/全屏布局冲突。
   - 建议：先做 A 的 Esc/Tab/方向键子集（无 modifier 粘滞），验证布局与 IME 共存后，再决定 Ctrl 的实现（A 粘滞 or B 注入）。回归点：ensureWebViewFocus、IME inset margin、Trust 提示对话框不被遮挡。
@@ -448,7 +447,7 @@ curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' http://127.0.0.1:<PORT>
 | P1-4 | **离线 SDK/自定义 bootstrap** | L/XL | 把 git/clang/python 等预打进可选 asset pack，首装 <1-2 分钟零网络 | fresh 安装 <2 分钟 |
 | P1-5 | TUR 镜像/CDN + 断点差分 | L | 自建 GitHub Releases/R2 缓存固定版本 deb | 无代理下载明显提速 |
 | P1-6/7 | clangd/rust-analyzer/LLDB 预编译 | L | 各语言工具链 optional 安装 | 补全/调试可用 |
-| P1-8 | 移动端 UI 分叉 | L | **2026-10-25 用户拍板：virtual mouse 不做**（触摸保持原生路径，够用）；extra-keys 已在主线落地（§7 T-K/T-K2）。剩余可选项：按键行自定义（T-K3） | 触屏可用性 |
+| P1-8 | 移动端 UI 分叉 | L | **2026-10-25 用户拍板：virtual mouse 不做**（触摸保持原生路径，够用）；extra-keys 已在主线落地（§7 T-K/T-K2）。按键行自定义已按用户决定移除（2026-10-25） | 触屏可用性 |
 | P1-9 | CI 完整化（双 APK + emulator smoke） | L | 当前 CI 只有 debug+lint+unsigned release | PR 产出 online/offline + 测试报告 |
 
 ### 执行建议（原路线图结论）
