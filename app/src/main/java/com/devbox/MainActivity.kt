@@ -266,6 +266,14 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         try {
+            // Some AOSP-based devices/images ship without any WebView provider;
+            // every later WebView call would throw. Fail with an actionable
+            // message instead of a blank screen.
+            if (!isWebViewAvailable()) {
+                showNoWebViewError()
+                return
+            }
+
             // Decide WebView debugging BEFORE the first WebView instance is
             // inflated by setContentView(): on some Chromium versions the
             // devtools socket is bound at first-WebView init, and a later
@@ -1934,6 +1942,35 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun isChinese(): Boolean = Locale.getDefault().language == "zh"
+
+    /**
+     * Creating a WebView throws on devices without a WebView provider
+     * (some AOSP builds). Probe once and keep the rest of onCreate safe.
+     */
+    private fun isWebViewAvailable(): Boolean = try {
+        WebView(this)
+        true
+    } catch (e: Exception) {
+        Log.e(TAG, "WebView provider is unavailable", e)
+        false
+    }
+
+    private fun showNoWebViewError() {
+        val isZh = isChinese()
+        AlertDialog.Builder(this)
+            .setTitle(if (isZh) "缺少系统 WebView" else "System WebView missing")
+            .setMessage(
+                if (isZh)
+                    "此设备没有可用的 Android System WebView，AMCode 无法显示 VS Code。\n\n" +
+                        "请安装或更新“Android System WebView”后重新打开应用。"
+                else
+                    "This device has no usable Android System WebView, so AMCode cannot show VS Code.\n\n" +
+                        "Please install or update \"Android System WebView\" and reopen the app."
+            )
+            .setCancelable(false)
+            .setPositiveButton(if (isZh) "退出" else "Exit") { _, _ -> finish() }
+            .show()
+    }
 
     private fun isDebuggableBuild(): Boolean =
         (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0

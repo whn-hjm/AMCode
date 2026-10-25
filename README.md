@@ -1,39 +1,56 @@
 # AMCode — VS Code on Android
 
 <p align="center">
-  <strong>一个 APK。打开就是 VS Code。无需 Termux，无需 root。</strong>
+  <strong>One APK. Open it and you're in VS Code. No Termux, no root.</strong>
 </p>
 
 <p align="center">
-  English | <a href="#chinese">中文</a>
+  v1.1.0 (versionCode 2) · code-server 4.143.1 · Node.js 24.18.0 · Android 8.0+
 </p>
 
 ---
 
 AMCode bundles [code-server](https://github.com/coder/code-server) with a Termux-native runtime into a single Android app. Open it and you're staring at a fully functional VS Code editor — write, compile, debug, all on your phone or tablet.
 
-Big thanks to **[Termux](https://github.com/termux/termux-app)** for providing the ARM64-native Linux environment, and **[code-server](https://github.com/coder/code-server)** for bringing VS Code to the browser. AMCode simply puts these two great projects together in one APK.
+Big thanks to **[Termux](https://github.com/termux/termux-app)** for the ARM64/x86_64-native Linux environment, and **[code-server](https://github.com/coder/code-server)** for bringing VS Code to the browser. AMCode simply puts these two great projects together in one APK.
+
+## Two APK Variants
+
+| | Online (default) | Offline (arm64) |
+|---|---|---|
+| APK size | ~64 MB | 185.7 MB |
+| code-server + Node.js | downloaded on first launch from TUR | bundled inside the APK |
+| First-launch download | ≈127 MB from TUR + ~18 MB dependencies | ~18 MB dependencies only (never touches TUR) |
+| Best for | any network that can reach `tur.kcubeterm.com` | slow/unreachable TUR, reproducible installs |
+
+Both variants are otherwise identical. The offline APK embeds the same pinned, SHA-256-verified `code-server` and `nodejs-24` `.deb`s that the online variant downloads; on first launch it only pulls the ~18 MB of small dependencies from the main Termux repository.
 
 ## Installation & First Launch
 
-1. Download and install the APK from [Releases](https://github.com/whn-hjm/AMCode/releases)
-2. Open AMCode — it will ask for **storage permission** (recommended: grant it, so your workspace is at `/sdcard/AMCode/`)
-3. The app downloads ~236MB of packages on first launch (~5 minutes). You'll see live progress.
-4. Once complete, VS Code appears.
+1. Download the APK from [Releases](https://github.com/whn-hjm/AMCode/releases) and install it.
+2. Open AMCode. **No storage permission is requested** — the initial workspace lives in the app-private home directory (`/data/user/0/com.devbox/files/home`).
+3. The app unpacks a native bootstrap (Termux `bootstrap-2026.08.02-r1+apt.android-7`, ~32 MB per ABI, bundled in the APK) and installs code-server. You'll see live progress in the loading overlay:
+   - **Online variant:** ≈127 MB from TUR — downloaded with 8 parallel HTTP Range connections with resume support — plus ~18 MB of dependencies.
+   - **Offline variant:** ~18 MB of dependencies from the main Termux mirror only.
+4. Once complete, VS Code appears in the app's WebView.
 
-## Usage
+A persistent notification keeps the server alive. It has two actions: **Stop** and **Storage**.
 
-### Writing Code
+## Workspace & Storage
 
-Open any folder from the VS Code explorer. Your home directory is:
-- `/sdcard/AMCode/` (if you granted storage permission)
-- Internal app directory (if you chose internal storage)
+- **Default (new installs):** internal home at `/data/user/0/com.devbox/files/home`. Nothing outside the app sandbox is touched, and `~/storage/shared` is a symlink to `/storage/emulated/0` for read access to shared storage.
+- **Switch anytime:** the notification's **Storage** action (or the in-app dialog) toggles between the internal home and the legacy shared-storage workspace `/sdcard/AMCode`. Switching never moves any files; each location keeps its own contents.
+- **Shared storage is `noexec`:** the external workspace is fine for editing files, but Git hooks, compiled binaries, and Python venvs won't execute from there. The dialog warns about this.
+- **Legacy installs:** if you previously ran an older AMCode release with the external workspace, a one-time migration dialog asks whether to move to the internal home (files are left in place either way).
 
-### Terminal
+## Terminal & Packages
 
-Press `` Ctrl+` `` to open the terminal. It's a real **bash** shell. Install dev tools:
+Press `` Ctrl+` `` for a real **bash** shell running on Android's bionic libc — no proot, no emulation.
+
+`pkg` works just like in Termux (same repositories, thousands of packages). For example, `git` is *not* preinstalled — add it yourself:
 
 ```bash
+pkg install git          # Git (not bundled — install it yourself)
 pkg install clang make cmake   # C / C++
 pkg install python             # Python
 pkg install rust               # Rust
@@ -41,9 +58,29 @@ pkg install openjdk-17         # Java
 pkg install golang             # Go
 ```
 
-### Extensions
+Notes:
 
-Extensions work normally. Search and install from the VS Code marketplace.
+- The main repository is served from the fastest of three tested mirrors (Tsinghua, USTC, official); a mirror must answer HTTP 200 to be eligible.
+- All repositories are GPG-signed (main repo key `5A897D96E57CF20C`, TUR key `6A5C550C260667D1`); the keys ship inside the APK. No `trusted=yes` sources remain after setup.
+- Installed `.deb`s are repackaged on the fly so Termux's `data/data/com.termux` payload paths land under AMCode's own package directory — apt/dpkg behave normally afterwards.
+
+## Extensions
+
+- The marketplace is **[Open VSX](https://open-vsx.org)** (code-server's default), not the Microsoft Marketplace — Microsoft's marketplace may only be used by official VS Code products.
+- Pure-JS extensions and language packs install and run. **glibc-native extension binaries do not work** (the runtime is bionic), so extensions that ship prebuilt `.node` binaries compiled against glibc won't load.
+- A platform shim (`android-as-linux.js`) is injected into the extension host so extensions see a Linux-ish platform (`fileWatcher`, `ptyHost`, terminal stay Android-native). Kill switches: create `$HOME/.amcode/disable-platform-shim` or set `AMCODE_ANDROID_PLATFORM_SHIM=0`.
+- VS Code **Workspace Trust** is not bypassed. On first load you get a one-time hint explaining trust; restricted mode and the trust prompt behave exactly as upstream. Only trust folders you control.
+- `ripgrep` (15.2.0) is re-linked at startup so search works.
+
+## Security
+
+- code-server binds to `127.0.0.1` on a **dynamically allocated port** (chosen by binding an ephemeral socket before launch) with `--auth password`.
+- A random 32-byte token is generated on **every** start. Only its SHA-256 hex digest is written to a `0600` config file (`cache/run/code-server.yaml`). The token never appears in argv, environment variables, or logcat (stdout monitoring redacts it).
+- The app itself logs in (`POST /login`, verified via `/mint-key`) and injects the resulting **HttpOnly** session cookie into the WebView. The page never handles the raw password.
+- The server is unreachable from other devices: loopback-only bind, and no JavaScript↔native bridge is registered in the WebView.
+- A PID file plus `/proc` validation cleans up orphaned code-server processes from previous runs; the service stops the whole tree on task removal and app stop.
+- WebView debugging is enabled only for debuggable (non-release) builds.
+- Health check every 10 s; automatic restart on crash, at most 10 consecutive attempts.
 
 ## Requirements
 
@@ -51,139 +88,46 @@ Extensions work normally. Search and install from the VS Code marketplace.
 |---|---|
 | **Android** | 8.0+ (API 26+) |
 | **Architecture** | ARM64 (most devices) or x86_64 (emulator) |
-| **Storage** | ~1.5GB free (environment + packages) |
-| **Network** | Required for first launch only. Offline after that. |
+| **Storage** | ~1.5 GB free (environment + packages + workspace) |
+| **Network** | First launch only (online variant: TUR must be reachable — see below). Fully offline afterwards. |
 
-### Network Notes
-
-- AMCode **auto-tests multiple mirrors** (Tsinghua, USTC, Official) and picks the fastest one for you.
-- TUR packages (code-server itself) are downloaded from `tur.kcubeterm.com`. A VPN/proxy may be needed in some regions.
-- Once installed, no network is needed. Everything runs locally.
-
-### Terminal Notes
-
-- The terminal is a real Linux shell (bash), not an Android shell.
-- `pkg` is available — same package manager as Termux, with 3000+ packages.
-- The `~` directory maps to your workspace, not the Android file system root.
-
-## Architecture
-
-```
-                     AMCode APK
-┌──────────────────────────────────────────┐
-│                                          │
-│  ┌─ WebView ───────────────────────┐    │
-│  │  http://localhost:8080           │    │
-│  │  ┌────────────────────────────┐  │    │
-│  │  │  VS Code (code-server)     │  │    │
-│  │  │  • Editor                  │  │    │
-│  │  │  • Terminal (bash)         │  │    │
-│  │  │  • Extensions marketplace  │  │    │
-│  │  └────────────────────────────┘  │    │
-│  └──────────────────┬───────────────┘    │
-│                     │                     │
-│  ┌─ Foreground Service ─────────────┐    │
-│  │  Health checks every 10s          │    │
-│  │  Auto-restart on crash            │    │
-│  └──────────────────┬────────────────┘    │
-│                     │                     │
-│  ┌─ Termux Native Runtime ──────────┐    │
-│  │  /data/data/com.devbox/files/usr/ │    │
-│  │  bash • node • git • clang • py  │    │
-│  │  pkg/apt → 3000+ packages        │    │
-│  │  Bionic libc, no proot overhead  │    │
-│  └──────────────────────────────────┘    │
-└──────────────────────────────────────────┘
-```
+TUR (`tur.kcubeterm.com`) has no mirrors and can be slow in some regions. If the ≈127 MB TUR download is painful, use the offline APK or a proxy/VPN.
 
 ## Build
 
 ```bash
-# Prerequisites: JDK 21+, Android SDK 34+, Gradle 8.7
+# Prerequisites: JDK 21, Android SDK 34 (AGP 8.4.0, Gradle 8.7 — wrapper included,
+# with distribution SHA-256 verification)
 echo "sdk.dir=/path/to/Android/Sdk" > local.properties
-./gradlew assembleRelease
+
+./gradlew assembleRelease                      # online APK (~64 MB)
+./gradlew assembleRelease -PofflineBundle=true -PofflineBundleArch=aarch64   # offline APK (185.7 MB)
+# -PofflineBundleArch=x86_64 for the emulator; -PofflineBundleSourceDir=/path/to/debs
+# to reuse previously downloaded .debs (filename must match).
 # APK at: app/build/outputs/apk/release/app-release.apk
 ```
 
-The Termux bootstrap files are downloaded automatically during build (cached in `app/src/main/assets/`).
+- **Bootstrap:** the two Termux bootstrap archives (aarch64 32,203,582 B / x86_64 32,112,380 B) are downloaded automatically during the first build, pinned by SHA-256; a missing or corrupt archive fails the build with manual-download instructions.
+- **Signing:** put `app/keystore.properties` (gitignored) with `storeFile`/`storePassword`/`keyAlias`/`keyPassword`, or export `AMCODE_STORE_FILE` / `AMCODE_STORE_PASSWORD` / `AMCODE_KEY_ALIAS` / `AMCODE_KEY_PASSWORD`. A partially filled configuration fails the build (rather than silently producing an unsigned APK); with nothing configured you get an unsigned APK.
+- The dependency set is deliberately minimal (no Material, no webkit-v1, no lifecycle-service); R8 shrinking is enabled for release.
+
+## Limitations
+
+- **No Microsoft Marketplace** — extensions come from Open VSX only (licensing).
+- **No glibc-native extensions** — bionic runtime; prebuilt `.node` binaries from glibc builds fail to load.
+- **Shared storage is `noexec`** — Git hooks, compiled artifacts, and virtualenvs must live in the internal home to run.
+- **`targetSdk = 28`** — required so app-data binaries can execute (W^X policy on API 29+). This is the same trade-off Termux makes, and it means the app cannot ship on Google Play.
+- **TUR can be slow** (no mirrors) — prefer the offline APK or a proxy.
+- A known Termux quirk is tolerated: `py3compile` dies on API 28 under seccomp; dpkg treats it as non-fatal and the package self-heals via `dpkg --configure -a` at next startup.
+
+## Acknowledgements & License
+
+- [Termux](https://github.com/termux/termux-app) — the native Linux environment, bootstrap, and package repositories.
+- [code-server](https://github.com/coder/code-server) — VS Code in the browser.
+- [TUR (Termux User Repository)](https://github.com/termux-user-repository/tur) — code-server and Node.js packages.
+
+MIT — see [LICENSE](LICENSE).
 
 ---
 
-<h2 id="chinese">中文说明</h2>
-
-## AMCode — 在 Android 上运行 VS Code
-
-**一个 APK，打开即用。** AMCode 将 code-server 和 Termux 原生运行环境打包成一个 App，让你在手机上拥有完整的 VS Code 开发体验。
-
-本项目基于 **[Termux](https://github.com/termux/termux-app)** 提供的 ARM64 Linux 环境和 **[code-server](https://github.com/coder/code-server)** 提供的 VS Code Web 版本，感谢这两个优秀的开源项目。
-
-## 安装与首次启动
-
-1. 从 [Releases](https://github.com/whn-hjm/AMCode/releases) 下载 APK 安装
-2. 打开 App —— 会提示**存储权限**（建议授予，工作目录将设为 `/sdcard/AMCode/`）
-3. 首次启动会自动下载约 236MB 的依赖包（约 5 分钟），终端会实时显示进度
-4. 安装完成后自动进入 VS Code 界面
-
-## 使用说明
-
-### 写代码
-
-从 VS Code 的文件浏览器打开任意文件夹。你的工作目录：
-- `/sdcard/AMCode/`（授予存储权限后）
-- App 内部目录（选择内部存储时）
-
-### 终端
-
-按 `` Ctrl+` `` 打开终端。这是一个真正的 **bash** 终端，可以用 `pkg` 安装开发工具：
-
-```bash
-pkg install clang make cmake   # C / C++
-pkg install python             # Python
-pkg install rust               # Rust
-pkg install openjdk-17         # Java
-pkg install golang             # Go
-```
-
-### 扩展
-
-VS Code 扩展市场正常使用，直接搜索安装即可。
-
-## 使用条件
-
-| | |
-|---|---|
-| **系统** | Android 8.0+ |
-| **架构** | ARM64（大多数设备）或 x86_64（模拟器） |
-| **存储** | 约 1.5GB 可用空间 |
-| **网络** | 仅首次启动需要，之后完全离线 |
-
-### 网络说明
-
-- AMCode 会**自动测速多个镜像**（清华、中科大、官方），选择最快的使用。
-- code-server 本体从 TUR（`tur.kcubeterm.com`）下载，部分地区可能需要代理。
-- 安装完成后完全离线运行，不需网络。
-
-### 终端说明
-
-- 终端是标准 Linux bash，不是 Android shell
-- 包管理器 `pkg` 可用，3000+ 软件包
-- `~` 目录映射到你的工作目录
-
-## 构建
-
-```bash
-# 需要：JDK 21+、Android SDK 34+、Gradle 8.7
-echo "sdk.dir=/path/to/Android/Sdk" > local.properties
-./gradlew assembleRelease
-# APK 在：app/build/outputs/apk/release/app-release.apk
-```
-
-Termux bootstrap 文件由 Gradle 在构建时自动下载（缓存于 `app/src/main/assets/`）。
-
-## License
-
-MIT — see [LICENSE](LICENSE)
-
----
-
-AMCode is not affiliated with Microsoft, the VS Code project, or the Termux project.
+AMCode is not affiliated with Microsoft, the VS Code project, the Termux project, or Open VSX.

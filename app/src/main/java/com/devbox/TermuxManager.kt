@@ -6,6 +6,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.io.File
@@ -173,7 +174,15 @@ object TermuxManager {
      * Initialize Termux environment. Call once from background thread.
      * Idempotent — if already initialized, returns immediately.
      */
+    /** Serializes installs: a HOME-switch restart racing the first install
+     *  must never run two bootstrap/apt pipelines over the same prefix. */
+    private val initializeMutex = kotlinx.coroutines.sync.Mutex()
+
     suspend fun initialize(context: Context): Result<Unit> = withContext(Dispatchers.IO) {
+        initializeMutex.withLock { initializeLocked(context) }
+    }
+
+    private suspend fun initializeLocked(context: Context): Result<Unit> = withContext(Dispatchers.IO) {
         filesDir = context.filesDir
         appContext = context.applicationContext
         offlineBundleChecked = false

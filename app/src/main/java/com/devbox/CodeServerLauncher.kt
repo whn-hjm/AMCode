@@ -168,9 +168,8 @@ object CodeServerLauncher {
             start()
             Result.success(Unit)
         } catch (e: CancellationException) {
-            // The coroutine may be cancelled while a process has already been
-            // spawned; make sure it does not survive as an orphan.
-            stop()
+            // start() already aborted the process it spawned; a global stop()
+            // here could tear down a replacement start's server instead.
             throw e
         } catch (e: Exception) {
             Log.e(TAG, "Failed to start code-server", e)
@@ -212,8 +211,11 @@ object CodeServerLauncher {
             // on loopback.
             cleanupStaleCodeServerProcesses()
 
-            // Prefer a real free port; 8080 remains only a last-resort fallback.
-            val port = findFreePort() ?: DEFAULT_PORT
+            // Prefer a real free port; falling back to a fixed port would
+            // reintroduce the collision surface the dynamic port exists for.
+            val port = findFreePort() ?: throw RuntimeException(
+                "cannot allocate a free loopback port (ServerSocket(0) failed)"
+            )
             val url = "http://$BIND_HOST:$port"
 
             if (!isCurrent(generation)) {
@@ -284,24 +286,33 @@ object CodeServerLauncher {
             // Monitor output + process exit. Use a local process reference so a
             // restart can never have its status overwritten by the old process.
             monitorJob = scope.launch {
+                val tokenHash = sha256Hex(token)
                 try {
-                    val reader = BufferedReader(InputStreamReader(process.inputStream))
-                    var line: String?
-                    while (reader.readLine().also { line = it } != null) {
-                        val raw = line!!
-                        // Defence in depth: code-server redacts passwords
-                        // itself, but never let our token reach logcat if a
-                        // future version prints it.
-                        val safe = if (raw.contains(token)) {
-                            raw.replace(token, "<redacted>")
-                        } else {
-                            raw
-                        }
-                        Log.d(TAG, "code-server: $safe")
-                        if (raw.contains("HTTP server listening") ||
-                            raw.contains("Server listening on")
-                        ) {
-                            Log.i(TAG, "code-server reported listening")
+                    BufferedReader(InputStreamReader(process.inputStream)).use { reader ->
+                        var line: String?
+                        while (reader.readLine().also { line = it } != null) {
+                            val raw = line!!
+                            // Defence in depth: code-server redacts passwords
+                            // itself, but never let our token (or its SHA-256,
+                            // which equals the session cookie value, or the
+                            // cookie itself) reach logcat if a future version
+                            // prints any of them.
+                            var safe = if (raw.contains(token)) {
+                                raw.replace(token, "<redacted>")
+                            } else {
+                                raw
+                            }
+                            if (safe.contains(tokenHash)) safe = safe.replace(tokenHash, "<redacted>")
+                            val liveCookie = sessionCookie
+                            if (liveCookie != null && safe.contains(liveCookie)) {
+                                safe = safe.replace(liveCookie, "<redacted>")
+                            }
+                            Log.d(TAG, "code-server: $safe")
+                            if (raw.contains("HTTP server listening") ||
+                                raw.contains("Server listening on")
+                            ) {
+                                Log.i(TAG, "code-server reported listening")
+                            }
                         }
                     }
                 } catch (e: Exception) {
@@ -325,34 +336,53 @@ object CodeServerLauncher {
                 }
             }
 
-            if (!isCurrent(generation)) {
-                Log.i(TAG, "Start superseded after spawn; killing code-server")
+            try {
+                if (!isCurrent(generation)) {
+                    Log.i(TAG, "Start superseded after spawn; killing code-server")
+                    abortStartedProcess(process, pid)
+                    return@withContext
+                }
+
+                waitForServerReady(process, port, generation)
+
+                if (!isCurrent(generation)) {
+                    Log.i(TAG, "Start superseded while waiting; killing code-server")
+                    abortStartedProcess(process, pid)
+                    return@withContext
+                }
+
+                // Perform the same login POST a browser would, then verify the
+                // resulting session cookie against an authenticated endpoint. A
+                // server that is up but cannot be authenticated must never be
+                // exposed to the WebView as "ready".
+                val cookie = loginAndVerify(port, token)
+                if (cookie == null) {
+                    abortStartedProcess(process, pid)
+                    throw RuntimeException("code-server password authentication failed")
+                }
+                // The login retries can block for seconds; ownership may have
+                // moved on to a newer start while authenticating.
+                if (!isCurrent(generation)) {
+                    Log.i(TAG, "Start superseded while authenticating; killing code-server")
+                    abortStartedProcess(process, pid)
+                    return@withContext
+                }
+                sessionCookie = cookie
+                sessionPort = port
+                Log.i(TAG, "code-server session established (cookie len=${cookie.length}, value redacted)")
+
+                _status.value = ServerStatus(ServerState.RUNNING, "Server running", port, url, pid)
+            } catch (e: CancellationException) {
+                // This call owns `process`; abort exactly that process. A
+                // global stop() must never run from a cancelled caller — a
+                // replacement start may already own the shared state.
+                Log.i(TAG, "start() cancelled; aborting the process spawned by this call")
                 abortStartedProcess(process, pid)
-                return@withContext
-            }
-
-            waitForServerReady(process, port, generation)
-
-            if (!isCurrent(generation)) {
-                Log.i(TAG, "Start superseded while waiting; killing code-server")
+                throw e
+            } catch (e: Exception) {
                 abortStartedProcess(process, pid)
-                return@withContext
+                throw e
             }
-
-            // Perform the same login POST a browser would, then verify the
-            // resulting session cookie against an authenticated endpoint. A
-            // server that is up but cannot be authenticated must never be
-            // exposed to the WebView as "ready".
-            val cookie = loginAndVerify(port, token)
-            if (cookie == null) {
-                abortStartedProcess(process, pid)
-                throw RuntimeException("code-server password authentication failed")
-            }
-            sessionCookie = cookie
-            sessionPort = port
-            Log.i(TAG, "code-server session established (cookie len=${cookie.length}, value redacted)")
-
-            _status.value = ServerStatus(ServerState.RUNNING, "Server running", port, url, pid)
         }
     }
 
@@ -400,7 +430,12 @@ object CodeServerLauncher {
                 Log.w(TAG, "Cannot create ${userDir.absolutePath}; skipping settings seed")
                 return
             }
-            val tmp = File(userDir, "settings.json.tmp")
+            // Unique temp name so overlapping starts never write the same file;
+            // stale temps from killed installs are dropped first.
+            userDir.listFiles { f ->
+                f.name.startsWith("settings.json.") && f.name.endsWith(".tmp")
+            }?.forEach { it.delete() }
+            val tmp = File(userDir, "settings.json.${System.nanoTime()}.tmp")
             tmp.writeText(doc.toString(2))
             if (!tmp.renameTo(settings)) {
                 settings.delete()
@@ -427,11 +462,15 @@ object CodeServerLauncher {
         } catch (e: Exception) {
             Log.w(TAG, "Cannot kill aborted code-server", e)
         }
-        if (serverProcess === process) serverProcess = null
-        if (serverProcess == null) activeHomePath = null
+        // Only clear the shared session state when this process is still the
+        // live one; a newer start may own the launcher by now.
+        if (serverProcess === process) {
+            serverProcess = null
+            activeHomePath = null
+            sessionCookie = null
+            sessionPort = -1
+        }
         removePidFile(pid)
-        sessionCookie = null
-        sessionPort = -1
     }
 
     // ─── Runtime repairs / compatibility ─────────────────────────────────────
@@ -631,9 +670,13 @@ object CodeServerLauncher {
         val parent = dest.parentFile ?: return null
         return try {
             parent.mkdirs()
-            // Temp file + rename so a killed process cannot leave a truncated
-            // require() target behind.
-            val tmp = File(parent, "${dest.name}.tmp")
+            // A unique temp name per install: overlapping starts must never
+            // write the same temp file. Stale temps from killed installs are
+            // dropped first.
+            parent.listFiles { f ->
+                f.name.startsWith("${dest.name}.") && f.name.endsWith(".tmp")
+            }?.forEach { it.delete() }
+            val tmp = File(parent, "${dest.name}.${System.nanoTime()}.tmp")
             App.instance.assets.open(PLATFORM_SHIM_ASSET).use { input ->
                 FileOutputStream(tmp).use { output -> input.copyTo(output) }
             }
@@ -754,8 +797,12 @@ object CodeServerLauncher {
     private fun authConfigFile(): File =
         File(File(App.instance.cacheDir, RUN_DIR), AUTH_CONFIG_FILE)
 
-    private fun authConfigTmpFile(): File =
-        File(authConfigFile().parentFile, "$AUTH_CONFIG_FILE.tmp")
+    /**
+     * Per-port temp name: two overlapping starts must never write the same
+     * temp file (a half-written config is read by the winning server).
+     */
+    private fun authConfigTmpFile(port: Int): File =
+        File(authConfigFile().parentFile, "$AUTH_CONFIG_FILE.$port.tmp")
 
     /** Old location from earlier builds; removed on cleanup as well. */
     private fun legacyAuthConfigFile(): File = File(runDir(), AUTH_CONFIG_FILE)
@@ -841,7 +888,16 @@ object CodeServerLauncher {
     }
 
     private fun deleteAuthConfig() {
-        for (file in listOf(authConfigFile(), authConfigTmpFile(), legacyAuthConfigFile())) {
+        val dir = authConfigFile().parentFile
+        // Fixed names first, then any per-port temp left by a killed start.
+        val targets = mutableListOf(authConfigFile(), legacyAuthConfigFile())
+        try {
+            dir?.listFiles { f ->
+                f.name.startsWith("$AUTH_CONFIG_FILE.") && f.name.endsWith(".tmp")
+            }?.let { targets.addAll(it) }
+        } catch (_: Exception) {
+        }
+        for (file in targets) {
             try {
                 if (file.exists() && file.delete()) {
                     Log.d(TAG, "Removed code-server auth config")
@@ -871,9 +927,12 @@ object CodeServerLauncher {
                     Log.w(TAG, "Skipping unreadable process $pid during cleanup")
                     false
                 } else {
+                    // PID-file match requires the recorded start time: a
+                    // recycled PID must never be signalled just because the
+                    // number (and nothing else) matches.
                     val recordedMatch = recorded?.pid == pid &&
-                        (recorded.startTime == null ||
-                            recorded.startTime == readProcStartTime(pid))
+                        recorded.startTime != null &&
+                        recorded.startTime == readProcStartTime(pid)
                     isCodeServerCmdline(cmd) || recordedMatch
                 }
             }
@@ -929,8 +988,15 @@ object CodeServerLauncher {
             survivors = survivors.filter { isProcessAlive(it) }
         }
         if (survivors.isNotEmpty()) {
-            Log.w(TAG, "Force-killing code-server process(es): $survivors")
-            survivors.forEach { sendSignal(it, "KILL") }
+            // A PID can be recycled during the grace period; re-validate the
+            // command line before the uncatchable SIGKILL.
+            val toKill = survivors.filter { pid ->
+                readCmdline(pid)?.let { isCodeServerCmdline(it) } == true
+            }
+            if (toKill.isNotEmpty()) {
+                Log.w(TAG, "Force-killing code-server process(es): $toKill")
+                toKill.forEach { sendSignal(it, "KILL") }
+            }
         }
     }
 
@@ -1086,7 +1152,7 @@ object CodeServerLauncher {
                 return null
             }
             val dest = authConfigFile()
-            val tmp = authConfigTmpFile()
+            val tmp = authConfigTmpFile(port)
             val hashedPassword = sha256Hex(token)
             // The hash is hex, but quoting also prevents any YAML numeric
             // interpretation for future token formats.

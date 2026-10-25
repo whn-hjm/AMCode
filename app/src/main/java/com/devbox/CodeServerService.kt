@@ -106,14 +106,17 @@ class CodeServerService : Service() {
                 )
                 // Cancel the current pipeline and wait for it to unwind before
                 // a new one starts, otherwise two servers could be spawned.
+                // The health-check loop may equally be blocked in an HTTP call
+                // inside the old pipeline; join both.
                 val previous = initJob
                 previous?.cancel()
                 initJob = null
-                healthCheckJob?.cancel()
+                val previousHealth = healthCheckJob
+                previousHealth?.cancel()
                 healthCheckJob = null
                 restartCount = 0
                 CodeServerLauncher.stop()
-                initializeAndStart(waitFor = previous)
+                initializeAndStart(waitFor = previous, waitForHealth = previousHealth)
                 return START_STICKY
             }
             else -> {
@@ -179,7 +182,7 @@ class CodeServerService : Service() {
      * [waitFor] is an already-cancelled previous pipeline (HOME switch); the
      * new pipeline joins it first so two servers can never be spawned.
      */
-    private fun initializeAndStart(waitFor: Job? = null) {
+    private fun initializeAndStart(waitFor: Job? = null, waitForHealth: Job? = null) {
         if (initJob?.isActive == true) {
             Log.i(TAG, "initializeAndStart ignored: already active")
             return
@@ -189,16 +192,17 @@ class CodeServerService : Service() {
         healthCheckJob = null
 
         initJob = scope.launch {
+            val self = coroutineContext[Job]
             try {
-                if (waitFor != null) {
+                listOfNotNull(waitFor, waitForHealth).forEach { job ->
                     try {
-                        // The cancelled pipeline's blocking sections (apt/dpkg)
-                        // do not observe coroutine cancellation promptly; do
-                        // not let this pipeline (and its UI) wait on them
-                        // forever — e.g. when the user switches HOME while the
-                        // first install is still downloading.
-                        withTimeoutOrNull(15_000) { waitFor.join() }
-                        if (waitFor.isActive) {
+                        // The cancelled pipelines' blocking sections (apt/dpkg/
+                        // HTTP) do not observe coroutine cancellation
+                        // promptly; do not let this pipeline (and its UI) wait
+                        // on them forever — e.g. when the user switches HOME
+                        // while the first install is still downloading.
+                        withTimeoutOrNull(15_000) { job.join() }
+                        if (job.isActive) {
                             Log.w(TAG, "Previous pipeline still unwinding; starting anyway")
                         }
                     } catch (e: CancellationException) {
@@ -240,7 +244,7 @@ class CodeServerService : Service() {
                                     progress.message,
                                     progress.percent.coerceIn(0, 100)
                                 )
-                                updateNotification(progress.message, "${progress.percent}%")
+                                updateProgressNotification(progress.message, "${progress.percent}%")
                             }
                             else -> { /* READY/FAILED handled by Result below */ }
                         }
@@ -292,7 +296,7 @@ class CodeServerService : Service() {
                                     60,
                                     serverStatus.url
                                 )
-                                updateNotification(
+                                updateProgressNotification(
                                     serverStatus.message.ifBlank { "Starting code-server..." },
                                     "Starting..."
                                 )
@@ -336,6 +340,15 @@ class CodeServerService : Service() {
                 Log.i(TAG, "Initialization cancelled")
                 throw e
             } catch (e: Exception) {
+                // A pipeline that was superseded (ACTION_RESTART/stop) can end
+                // in a normal failure when its blocking section unwinds: the
+                // launcher process it was starting is already gone by design.
+                // It must NOT tear down the service the replacement pipeline
+                // is running in.
+                if (initJob !== self || !isActive) {
+                    Log.w(TAG, "Superseded pipeline failed (${e.message}); leaving the service to its owner")
+                    return@launch
+                }
                 Log.e(TAG, "Service initialization failed", e)
                 _serviceStatus.value = ServiceStatus(
                     ServiceState.ERROR, "Failed: ${e.message}", 0
@@ -350,78 +363,83 @@ class CodeServerService : Service() {
         }
     }
 
+    private val healthCheckLock = Any()
+
     private fun startHealthChecks() {
-        if (healthCheckJob?.isActive == true) {
-            Log.d(TAG, "Health check already running")
-            return
-        }
-        healthCheckJob = scope.launch {
-            while (isActive) {
-                delay(HEALTH_INTERVAL_MS)
+        synchronized(healthCheckLock) {
+            if (healthCheckJob?.isActive == true) {
+                Log.d(TAG, "Health check already running")
+                return
+            }
+            healthCheckJob = scope.launch {
+                while (isActive) {
+                    delay(HEALTH_INTERVAL_MS)
 
-                val healthy = try {
-                    CodeServerLauncher.healthCheck()
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (e: Exception) {
-                    Log.w(TAG, "Health check error", e)
-                    false
-                }
+                    val healthy = try {
+                        CodeServerLauncher.healthCheck()
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Health check error", e)
+                        false
+                    }
 
-                if (healthy) {
-                    if (restartCount != 0) restartCount = 0
-                    continue
-                }
+                    if (healthy) {
+                        if (restartCount != 0) restartCount = 0
+                        continue
+                    }
 
-                restartCount++
-                Log.w(TAG, "Health check failed; restart attempt $restartCount/$MAX_RESTARTS")
-                if (restartCount > MAX_RESTARTS) {
-                    Log.e(TAG, "Too many restarts, giving up")
+                    restartCount++
+                    Log.w(TAG, "Health check failed; restart attempt $restartCount/$MAX_RESTARTS")
+                    if (restartCount > MAX_RESTARTS) {
+                        Log.e(TAG, "Too many restarts, giving up")
+                        _serviceStatus.value = ServiceStatus(
+                            ServiceState.ERROR, "VS Code crashed too many times", 0
+                        )
+                        updateNotification("VS Code failed", "Too many restarts")
+                        CodeServerLauncher.stop()
+                        stopForeground(STOP_FOREGROUND_REMOVE)
+                        stopSelf()
+                        return@launch
+                    }
+
                     _serviceStatus.value = ServiceStatus(
-                        ServiceState.ERROR, "VS Code crashed too many times", 0
-                    )
-                    updateNotification("VS Code failed", "Too many restarts")
-                    CodeServerLauncher.stop()
-                    stopForeground(STOP_FOREGROUND_REMOVE)
-                    stopSelf()
-                    return@launch
-                }
-
-                _serviceStatus.value = ServiceStatus(
-                    ServiceState.STARTING_SERVER,
-                    "Restarting VS Code...",
-                    80,
-                    CodeServerLauncher.status.value.url
-                )
-                updateNotification("Restarting VS Code...", "Recovering from crash")
-
-                CodeServerLauncher.stop()
-                delay(RESTART_DELAY_MS)
-
-                var restarted = false
-                try {
-                    restarted = CodeServerLauncher.prepareAndStart().isSuccess
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (e: Exception) {
-                    Log.e(TAG, "Restart threw", e)
-                }
-
-                if (restarted) {
-                    // Reset only after a successful restart.
-                    restartCount = 0
-                    _serviceStatus.value = ServiceStatus(
-                        ServiceState.RUNNING,
-                        "VS Code restarted",
-                        100,
+                        ServiceState.STARTING_SERVER,
+                        "Restarting VS Code...",
+                        80,
                         CodeServerLauncher.status.value.url
                     )
-                    updateNotification("VS Code restarted", "Recovered from crash")
-                } else {
-                    Log.e(TAG, "Restart failed")
-                    _serviceStatus.value = ServiceStatus(
-                        ServiceState.ERROR, "Restart failed", 0
-                    )
+                    updateNotification("Restarting VS Code...", "Recovering from crash")
+
+                    CodeServerLauncher.stop()
+                    delay(RESTART_DELAY_MS)
+
+                    var restarted = false
+                    try {
+                        restarted = CodeServerLauncher.prepareAndStart().isSuccess
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Restart threw", e)
+                    }
+
+                    if (restarted) {
+                        // Reset only after a successful restart.
+                        restartCount = 0
+                        _serviceStatus.value = ServiceStatus(
+                            ServiceState.RUNNING,
+                            "VS Code restarted",
+                            100,
+                            CodeServerLauncher.status.value.url
+                        )
+                        updateNotification("VS Code restarted", "Recovered from crash")
+                    } else {
+                        Log.e(TAG, "Restart failed")
+                        _serviceStatus.value = ServiceStatus(
+                            ServiceState.ERROR, "Restart failed", 0
+                        )
+                        updateNotification("VS Code failed", "Restart failed")
+                    }
                 }
             }
         }
@@ -491,5 +509,20 @@ class CodeServerService : Service() {
         val notification = createNotification(title, content)
         val manager = getSystemService(NOTIFICATION_SERVICE) as android.app.NotificationManager
         manager.notify(App.NOTIFICATION_ID, notification)
+    }
+
+    @Volatile
+    private var lastProgressNotificationAt = 0L
+
+    /**
+     * The system rate-limits (and mutes) spammy notification senders; progress
+     * ticks during a 200MB download do not need more than ~2 updates/second.
+     * State transitions keep using the unthrottled [updateNotification].
+     */
+    private fun updateProgressNotification(title: String, content: String) {
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (now - lastProgressNotificationAt < 500) return
+        lastProgressNotificationAt = now
+        updateNotification(title, content)
     }
 }
