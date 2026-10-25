@@ -7,4 +7,108 @@
     <string name="error_occurred">An error occurred</string>
     <string name="service_notification_title">VS Code Server</string>
     <string name="service_notification_text">VS Code is running in the background</string>
+
+    <!-- Service / startup errors -->
+    <string name="error_vscode_stopped">VS Code has stopped</string>
+    <string name="error_service_connection_lost">Connection to the VS Code service was lost</string>
+    <string name="error_renderer_crashed">The web page renderer crashed</string>
+    <string name="error_auth_exhausted">Could not authenticate the local VS Code session</string>
+    <string name="error_local_auth_failed">Local authentication failed; please retry</string>
+    <string name="error_no_auth_session">Could not obtain the local authentication session</string>
+    <string name="error_load_timeout">VS Code did not load in time</string>
+    <string name="error_cannot_restart">Cannot restart VS Code</string>
+
+    <!-- Progress / retry hint -->
+    <string name="progress_reauthenticating">Re-authenticating…</string>
+    <string name="progress_retrying_connection">Retrying connection (%1$d/%2$d)…</string>
+    <string name="hint_tap_to_retry">Tap here to retry</string>
+
+    <!-- Toasts -->
+    <string name="toast_shared_permission_denied_keep_internal">Shared storage permission not granted; keeping internal HOME</string>
+    <string name="toast_internal_not_writable">Internal storage is not writable</string>
+    <string name="toast_cannot_open_storage_settings">Cannot open storage settings</string>
+    <string name="toast_cannot_request_storage_permission">Cannot request storage permission</string>
+    <string name="toast_fallback_internal_this_launch">Using internal HOME for this launch; files in /sdcard/AMCode are unchanged</string>
+    <string name="toast_fallback_internal_permission_denied">Shared storage permission not granted; using internal HOME for this launch. Files in /sdcard/AMCode are unchanged</string>
+    <string name="toast_shared_access_not_granted">Shared storage access was not granted</string>
+    <string name="toast_shared_access_granted">Shared storage access granted</string>
+    <string name="toast_notification_permission_needed">Notification permission is needed to keep VS Code running</string>
+    <string name="toast_external_not_writable_keep_internal">/sdcard/AMCode is not writable; keeping internal HOME</string>
+    <string name="toast_cannot_switch_external">Could not switch to external storage</string>
+    <string name="toast_cannot_switch_internal">Could not switch to internal storage</string>
+    <string name="toast_app_crashed">App crashed: %1$s. Check crash log.</string>
+    <string name="toast_cannot_start_vscode">Cannot start VS Code: %1$s</string>
+
+    <!-- Common buttons -->
+    <string name="button_exit">Exit</string>
+    <string name="button_cancel">Cancel</string>
+    <string name="button_close">Close</string>
+
+    <!-- One-time external-HOME migration dialog -->
+    <string name="dialog_migration_title">Workspace Storage</string>
+    <string name="dialog_migration_message">AMCode now defaults to internal storage for HOME (Git/builds can run, and it is faster).\n\nYour current workspace is /sdcard/AMCode. Switching does NOT move or delete any files; they stay reachable through ~/storage/shared.\n\nFolders on shared storage can be modified by other apps. VS Code opens them in Restricted Mode and asks you to trust them.\n\nSwitch to internal storage now?</string>
+    <string name="dialog_migration_switch_internal">Switch to internal</string>
+    <string name="dialog_migration_keep_external">Keep external</string>
+
+    <!-- External HOME trust dialog -->
+    <string name="dialog_trust_external_title">Workspace Trust Warning</string>
+    <string name="dialog_trust_external_message">Your HOME is on shared storage (/sdcard/AMCode), where other apps can modify files.\n\nAMCode does not bypass VS Code Workspace Trust. VS Code opens this folder in Restricted Mode and may ask whether to trust it. Only trust folders you control.</string>
+    <string name="dialog_trust_external_continue">Continue</string>
+    <string name="dialog_trust_external_use_internal">Use internal HOME</string>
+
+    <!-- External workspace unavailable dialog -->
+    <string name="dialog_external_unavailable_title">External Workspace Unavailable</string>
+    <string name="dialog_external_unavailable_message">/sdcard/AMCode is not writable right now. No files will be moved or deleted.\n\nStart with internal HOME for this launch, or switch to internal HOME permanently.</string>
+    <string name="dialog_external_unavailable_use_internal_now">Use internal for now</string>
+    <string name="dialog_external_unavailable_switch_permanent">Switch permanently</string>
+
+    <!-- All files access dialog -->
+    <string name="dialog_all_files_title">Storage Access Required</string>
+    <string name="dialog_all_files_message">You chose shared storage /sdcard/AMCode. Android requires All files access to read and write it.\n\nYou can also use internal HOME (recommended); existing files are not moved.</string>
+    <string name="dialog_all_files_grant">Grant Access</string>
+    <string name="dialog_all_files_use_internal">Use Internal Storage</string>
+
+    <!-- On-demand shared storage prompt dialog -->
+    <string name="dialog_shared_prompt_title">Shared Storage Access</string>
+    <string name="dialog_shared_prompt_message">This workspace is on shared storage (/sdcard). Android requires additional storage access to read and write it.\n\nAfter granting it, VS Code still opens the folder in Restricted Mode and may ask you to trust it.</string>
+    <string name="dialog_shared_prompt_grant">Grant access</string>
+    <string name="dialog_shared_prompt_not_now">Not now</string>
+
+    <!-- Shared folder trust dialog -->
+    <string name="dialog_shared_trust_title">Workspace Trust</string>
+    <string name="dialog_shared_trust_message">This folder is on shared storage, where other apps can modify files.\n\nAMCode does not bypass VS Code Workspace Trust: VS Code opens it in Restricted Mode and may ask whether to trust it. Only trust folders you control.</string>
+    <string name="dialog_shared_trust_ok">I understand</string>
+
+    <!-- Internal HOME trust hint dialog -->
+    <string name="dialog_internal_trust_title">Enable extensions: trust the workspace</string>
+    <string name="dialog_internal_trust_message">The first time the workspace opens, VS Code shows a Restricted Mode banner at the top and disables user extensions.\n\nThis workspace is AMCode\'s app-private directory (no other app can access it). On your own device, tap \"Trust the Authors\" in the banner to enable all extensions, or keep Restricted Mode.\n\nAMCode never trusts a folder automatically on your behalf.</string>
+    <string name="dialog_internal_trust_ok">Got it</string>
+
+    <!-- Workspace storage info dialog -->
+    <string name="dialog_storage_title">Workspace Storage</string>
+    <string name="dialog_storage_message_external">Current HOME: %1$s\n\nUsing shared storage /sdcard/AMCode. Shared storage is noexec, so Git/build tools may be limited. Switching to internal HOME does not move or delete files.</string>
+    <string name="dialog_storage_message_external_unavailable">Current HOME: %1$s\n\nThe external workspace /sdcard/AMCode is unavailable; internal HOME is being used for this launch. Files are not moved or deleted.</string>
+    <string name="dialog_storage_message_internal">Current HOME: %1$s\n\nUsing internal storage. Shared files are available through ~/storage/shared; Android asks for access the first time /sdcard is used.</string>
+    <string name="dialog_storage_grant_shared">Grant shared storage</string>
+    <string name="dialog_storage_switch_to_internal">Switch to internal HOME</string>
+    <string name="dialog_storage_switch_to_external">Switch to external /sdcard/AMCode</string>
+
+    <!-- Switch to external storage confirmation dialog -->
+    <string name="dialog_switch_external_title">Switch to external storage?</string>
+    <string name="dialog_switch_external_message">VS Code will restart using /sdcard/AMCode as HOME. Save any unsaved editors first.\n\nNote: shared storage lacks Unix permissions/symlinks and is usually noexec — Git, build artifacts, venvs and parts of npm may be limited.\n\nStorage access is required; files in the internal HOME are not moved or deleted.</string>
+    <string name="dialog_switch_external_switch">Switch</string>
+
+    <!-- Switch to internal storage confirmation dialog -->
+    <string name="dialog_switch_internal_title">Switch to internal storage?</string>
+    <string name="dialog_switch_internal_message">VS Code will restart with internal HOME. Save any unsaved editors first.\n\nFiles in /sdcard/AMCode are not moved or deleted and remain reachable through ~/storage/shared.</string>
+    <string name="dialog_switch_internal_switch_restart">Switch and restart</string>
+
+    <!-- Missing WebView dialog -->
+    <string name="dialog_no_webview_title">System WebView missing</string>
+    <string name="dialog_no_webview_message">This device has no usable Android System WebView, so AMCode cannot show VS Code.\n\nPlease install or update \"Android System WebView\" and reopen the app.</string>
+
+    <!-- WebView version gate (soft minimum, non-blocking) -->
+    <string name="dialog_webview_outdated_title">WebView version is outdated</string>
+    <string name="dialog_webview_outdated_message">Your Android System WebView (version %1$s) is quite old; some VS Code features may not work correctly. Please update \"Android System WebView\" via the app store on this device.</string>
+    <string name="dialog_webview_outdated_ok">OK</string>
 </resources>

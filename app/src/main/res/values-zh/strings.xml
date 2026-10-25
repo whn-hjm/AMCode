@@ -1,0 +1,104 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 服务 / 启动错误 -->
+    <string name="error_vscode_stopped">VS Code 已停止</string>
+    <string name="error_service_connection_lost">VS Code 服务连接已断开</string>
+    <string name="error_renderer_crashed">网页渲染进程已崩溃</string>
+    <string name="error_auth_exhausted">无法完成本地 VS Code 认证</string>
+    <string name="error_local_auth_failed">本地认证失败，请重试</string>
+    <string name="error_no_auth_session">无法取得本地认证会话</string>
+    <string name="error_load_timeout">VS Code 加载超时</string>
+    <string name="error_cannot_restart">无法重启 VS Code</string>
+
+    <!-- 进度 / 重试提示 -->
+    <string name="progress_reauthenticating">正在重新认证…</string>
+    <string name="progress_retrying_connection">正在重试连接（%1$d/%2$d）…</string>
+    <string name="hint_tap_to_retry">点击此处重试</string>
+
+    <!-- Toast -->
+    <string name="toast_shared_permission_denied_keep_internal">未获得共享存储权限，保持内部存储</string>
+    <string name="toast_internal_not_writable">内部存储不可写</string>
+    <string name="toast_cannot_open_storage_settings">无法打开存储设置</string>
+    <string name="toast_cannot_request_storage_permission">无法申请存储权限</string>
+    <string name="toast_fallback_internal_this_launch">本次使用内部存储；/sdcard/AMCode 文件保持不变</string>
+    <string name="toast_fallback_internal_permission_denied">未获得共享存储权限，本次使用内部存储；/sdcard/AMCode 文件保持不变</string>
+    <string name="toast_shared_access_not_granted">未获得共享存储权限</string>
+    <string name="toast_shared_access_granted">已获得共享存储访问权限</string>
+    <string name="toast_notification_permission_needed">需要通知权限以保持 VS Code 在后台运行</string>
+    <string name="toast_external_not_writable_keep_internal">/sdcard/AMCode 当前不可写，保持内部存储</string>
+    <string name="toast_cannot_switch_external">无法切换到外部存储</string>
+    <string name="toast_cannot_switch_internal">无法切换到内部存储</string>
+
+    <!-- 通用按钮 -->
+    <string name="button_exit">退出</string>
+    <string name="button_cancel">取消</string>
+    <string name="button_close">关闭</string>
+
+    <!-- 一次性外部 HOME 迁移对话框 -->
+    <string name="dialog_migration_title">工作区存储方式</string>
+    <string name="dialog_migration_message">AMCode 现在默认使用内部存储作为 HOME（Git/编译可执行，速度更快）。\n\n你当前的工作区是 /sdcard/AMCode。切换不会移动或删除任何文件，它们仍可通过 ~/storage/shared 打开。\n\n共享存储中的文件夹可能被其他应用修改，VS Code 会以受限模式打开并要求你确认信任。\n\n是否切换到内部存储？</string>
+    <string name="dialog_migration_switch_internal">切换到内部存储</string>
+    <string name="dialog_migration_keep_external">保留外部存储</string>
+
+    <!-- 外部 HOME 信任对话框 -->
+    <string name="dialog_trust_external_title">工作区信任提示</string>
+    <string name="dialog_trust_external_message">当前 HOME 位于共享存储 /sdcard/AMCode，其他应用可能修改其中的文件。\n\nAMCode 不会绕过 VS Code 的 Workspace Trust；VS Code 会将此文件夹以受限模式打开，并可能询问你是否信任。请只信任你控制的文件夹。</string>
+    <string name="dialog_trust_external_continue">继续</string>
+    <string name="dialog_trust_external_use_internal">改用内部存储</string>
+
+    <!-- 外部工作区不可用对话框 -->
+    <string name="dialog_external_unavailable_title">外部工作区不可用</string>
+    <string name="dialog_external_unavailable_message">/sdcard/AMCode 当前不可写。文件不会被移动或删除。\n\n可以本次先用内部存储启动，或永久切换到内部存储。</string>
+    <string name="dialog_external_unavailable_use_internal_now">本次使用内部存储</string>
+    <string name="dialog_external_unavailable_switch_permanent">永久切换</string>
+
+    <!-- 所有文件访问对话框 -->
+    <string name="dialog_all_files_title">需要存储权限</string>
+    <string name="dialog_all_files_message">你选择了共享存储 /sdcard/AMCode。Android 需要“所有文件访问”权限才能读写它。\n\n也可以改用内部存储（推荐），现有文件不会被移动。</string>
+    <string name="dialog_all_files_grant">授权访问</string>
+    <string name="dialog_all_files_use_internal">使用内部存储</string>
+
+    <!-- 按需共享存储授权提示对话框 -->
+    <string name="dialog_shared_prompt_title">共享存储访问</string>
+    <string name="dialog_shared_prompt_message">该工作区位于共享存储（/sdcard）。Android 需要额外的存储授权才能读写它。\n\n授权后 VS Code 仍会以受限模式打开该文件夹，并可能询问你是否信任。</string>
+    <string name="dialog_shared_prompt_grant">去授权</string>
+    <string name="dialog_shared_prompt_not_now">暂不</string>
+
+    <!-- 共享文件夹信任对话框 -->
+    <string name="dialog_shared_trust_title">工作区信任提示</string>
+    <string name="dialog_shared_trust_message">该文件夹位于共享存储，其他应用可能修改其中的文件。\n\nAMCode 不会绕过 VS Code 的 Workspace Trust：VS Code 会以受限模式打开它，并可能询问你是否信任。请只信任你控制的文件夹。</string>
+    <string name="dialog_shared_trust_ok">我知道了</string>
+
+    <!-- 内部 HOME 信任提示对话框 -->
+    <string name="dialog_internal_trust_title">启用扩展：信任工作区</string>
+    <string name="dialog_internal_trust_message">首次打开工作区时，VS Code 顶部会显示受限模式（Restricted Mode）横幅，此时用户扩展被停用。\n\n该工作区是 AMCode 的应用私有目录（其他应用无法访问）。如果这是你自己的设备，点击横幅上的 “Trust the Authors / 信任” 即可启用全部扩展；也可以保持受限模式。\n\nAMCode 不会代替你自动信任任何文件夹。</string>
+    <string name="dialog_internal_trust_ok">我知道了</string>
+
+    <!-- 工作区存储信息对话框 -->
+    <string name="dialog_storage_title">工作区存储</string>
+    <string name="dialog_storage_message_external">当前 HOME：%1$s\n\n使用共享存储 /sdcard/AMCode。共享存储不可执行二进制，Git/编译可能受限。切换到内部存储不会移动或删除文件。</string>
+    <string name="dialog_storage_message_external_unavailable">当前 HOME：%1$s\n\n外部工作区 /sdcard/AMCode 当前不可用，本次使用内部 HOME。文件不会被移动或删除。</string>
+    <string name="dialog_storage_message_internal">当前 HOME：%1$s\n\n使用内部存储。共享文件可通过 ~/storage/shared 打开；首次访问 /sdcard 时需要授权。</string>
+    <string name="dialog_storage_grant_shared">授权共享存储</string>
+    <string name="dialog_storage_switch_to_internal">切换到内部存储</string>
+    <string name="dialog_storage_switch_to_external">切换到外部存储</string>
+
+    <!-- 切换到外部存储确认对话框 -->
+    <string name="dialog_switch_external_title">切换到外部存储？</string>
+    <string name="dialog_switch_external_message">VS Code 会重启并使用 /sdcard/AMCode 作为 HOME，请先保存未保存的编辑内容。\n\n注意：共享存储不支持 Unix 权限/符号链接，且通常不可执行（noexec）——Git、编译产物、venv、npm 部分功能会受限。\n\n需要存储授权；内部 HOME 中的文件不会被移动或删除。</string>
+    <string name="dialog_switch_external_switch">切换</string>
+
+    <!-- 切换到内部存储确认对话框 -->
+    <string name="dialog_switch_internal_title">切换到内部存储？</string>
+    <string name="dialog_switch_internal_message">VS Code 会重启以使用内部 HOME，请先保存未保存的编辑内容。\n\n/sdcard/AMCode 中的文件不会被移动或删除，仍可通过 ~/storage/shared 打开。</string>
+    <string name="dialog_switch_internal_switch_restart">切换并重启</string>
+
+    <!-- 缺少 WebView 对话框 -->
+    <string name="dialog_no_webview_title">缺少系统 WebView</string>
+    <string name="dialog_no_webview_message">此设备没有可用的 Android System WebView，AMCode 无法显示 VS Code。\n\n请安装或更新“Android System WebView”后重新打开应用。</string>
+
+    <!-- WebView 版本门槛（软性最低版本，不阻塞使用） -->
+    <string name="dialog_webview_outdated_title">WebView 版本过旧</string>
+    <string name="dialog_webview_outdated_message">当前 Android System WebView 版本（%1$s）过低，部分 VS Code 功能可能无法正常使用。请在此设备的应用商店中更新“Android System WebView”。</string>
+    <string name="dialog_webview_outdated_ok">知道了</string>
+</resources>

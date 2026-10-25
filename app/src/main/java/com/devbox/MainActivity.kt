@@ -66,6 +66,9 @@ class MainActivity : AppCompatActivity() {
         private const val MAX_WEBVIEW_RETRIES = 3
         private const val MAX_AUTH_RETRIES = 2
         private const val SESSION_COOKIE_NAME = "code-server-session"
+
+        /** Soft WebView minimum; below this major version only a warning is shown. */
+        private const val MIN_WEBVIEW_MAJOR_VERSION = 70
     }
 
     private lateinit var webView: WebView
@@ -149,7 +152,7 @@ class MainActivity : AppCompatActivity() {
                             }
                             CodeServerService.ServiceState.STOPPED -> {
                                 showError(
-                                    if (isChinese()) "VS Code 已停止" else "VS Code has stopped",
+                                    getString(R.string.error_vscode_stopped),
                                     retry = { retryService() }
                                 )
                             }
@@ -168,7 +171,7 @@ class MainActivity : AppCompatActivity() {
             Log.w(TAG, "Service disconnected")
             if (!isFinishing && !isDestroyed) {
                 showError(
-                    if (isChinese()) "VS Code 服务连接已断开" else "Connection to the VS Code service was lost",
+                    getString(R.string.error_service_connection_lost),
                     retry = { retryService() }
                 )
             }
@@ -202,8 +205,7 @@ class MainActivity : AppCompatActivity() {
                 } else {
                     Toast.makeText(
                         this@MainActivity,
-                        if (isChinese()) "未获得共享存储权限，保持内部存储"
-                        else "Shared storage permission not granted; keeping internal HOME",
+                        getString(R.string.toast_shared_permission_denied_keep_internal),
                         Toast.LENGTH_LONG
                     ).show()
                 }
@@ -242,8 +244,7 @@ class MainActivity : AppCompatActivity() {
                 } else {
                     Toast.makeText(
                         this@MainActivity,
-                        if (isChinese()) "未获得共享存储权限，保持内部存储"
-                        else "Shared storage permission not granted; keeping internal HOME",
+                        getString(R.string.toast_shared_permission_denied_keep_internal),
                         Toast.LENGTH_LONG
                     ).show()
                 }
@@ -273,6 +274,10 @@ class MainActivity : AppCompatActivity() {
                 showNoWebViewError()
                 return
             }
+
+            // Soft minimum-version gate: warn (never block) on an outdated
+            // WebView provider. Checked on every launch, not persisted.
+            checkWebViewVersionThreshold()
 
             // Decide WebView debugging BEFORE the first WebView instance is
             // inflated by setContentView(): on some Chromium versions the
@@ -338,7 +343,11 @@ class MainActivity : AppCompatActivity() {
             handleLaunchIntent(intent)
         } catch (e: Exception) {
             Log.e(TAG, "Crash in onCreate", e)
-            Toast.makeText(this, "App crashed: ${e.message}. Check crash log.", Toast.LENGTH_LONG).show()
+            Toast.makeText(
+                this,
+                getString(R.string.toast_app_crashed, e.message ?: "null"),
+                Toast.LENGTH_LONG
+            ).show()
         }
     }
 
@@ -405,27 +414,15 @@ class MainActivity : AppCompatActivity() {
      */
     private fun showExternalMigrationDialog() {
         if (isFinishing || isDestroyed) return
-        val isZh = isChinese()
         AlertDialog.Builder(this)
-            .setTitle(if (isZh) "工作区存储方式" else "Workspace Storage")
-            .setMessage(
-                if (isZh)
-                    "AMCode 现在默认使用内部存储作为 HOME（Git/编译可执行，速度更快）。\n\n" +
-                        "你当前的工作区是 /sdcard/AMCode。切换不会移动或删除任何文件，它们仍可通过 ~/storage/shared 打开。\n\n" +
-                        "共享存储中的文件夹可能被其他应用修改，VS Code 会以受限模式打开并要求你确认信任。\n\n" +
-                        "是否切换到内部存储？"
-                else
-                    "AMCode now defaults to internal storage for HOME (Git/builds can run, and it is faster).\n\n" +
-                        "Your current workspace is /sdcard/AMCode. Switching does NOT move or delete any files; they stay reachable through ~/storage/shared.\n\n" +
-                        "Folders on shared storage can be modified by other apps. VS Code opens them in Restricted Mode and asks you to trust them.\n\n" +
-                        "Switch to internal storage now?"
-            )
+            .setTitle(R.string.dialog_migration_title)
+            .setMessage(R.string.dialog_migration_message)
             .setCancelable(false)
-            .setPositiveButton(if (isZh) "切换到内部存储" else "Switch to internal") { _, _ ->
+            .setPositiveButton(R.string.dialog_migration_switch_internal) { _, _ ->
                 HomePrefs.markExternalMigrationPrompted(this)
                 finishInternalHome(persist = true)
             }
-            .setNegativeButton(if (isZh) "保留外部存储" else "Keep external") { _, _ ->
+            .setNegativeButton(R.string.dialog_migration_keep_external) { _, _ ->
                 HomePrefs.markExternalMigrationPrompted(this)
                 // The dialog above already explains shared-folder trust; avoid
                 // stacking a second warning on the same launch.
@@ -469,7 +466,7 @@ class MainActivity : AppCompatActivity() {
             Log.e(TAG, "Internal HOME could not be applied")
             Toast.makeText(
                 this,
-                if (isChinese()) "内部存储不可写" else "Internal storage is not writable",
+                getString(R.string.toast_internal_not_writable),
                 Toast.LENGTH_LONG
             ).show()
         } else if (persist) {
@@ -536,24 +533,16 @@ class MainActivity : AppCompatActivity() {
      */
     private fun showExternalTrustDialog() {
         if (isFinishing || isDestroyed) return
-        val isZh = isChinese()
         AlertDialog.Builder(this)
-            .setTitle(if (isZh) "工作区信任提示" else "Workspace Trust Warning")
-            .setMessage(
-                if (isZh)
-                    "当前 HOME 位于共享存储 /sdcard/AMCode，其他应用可能修改其中的文件。\n\n" +
-                        "AMCode 不会绕过 VS Code 的 Workspace Trust；VS Code 会将此文件夹以受限模式打开，并可能询问你是否信任。请只信任你控制的文件夹。"
-                else
-                    "Your HOME is on shared storage (/sdcard/AMCode), where other apps can modify files.\n\n" +
-                        "AMCode does not bypass VS Code Workspace Trust. VS Code opens this folder in Restricted Mode and may ask whether to trust it. Only trust folders you control."
-            )
+            .setTitle(R.string.dialog_trust_external_title)
+            .setMessage(R.string.dialog_trust_external_message)
             .setCancelable(false)
-            .setPositiveButton(if (isZh) "继续" else "Continue") { _, _ ->
+            .setPositiveButton(R.string.dialog_trust_external_continue) { _, _ ->
                 HomePrefs.markExternalTrustWarningShown(this)
                 sharedTrustWarned = true
                 continueAfterExternalHome()
             }
-            .setNegativeButton(if (isZh) "改用内部存储" else "Use internal HOME") { _, _ ->
+            .setNegativeButton(R.string.dialog_trust_external_use_internal) { _, _ ->
                 HomePrefs.markExternalTrustWarningShown(this)
                 sharedTrustWarned = true
                 if (HomePrefs.applyInternalHome(this, persist = true)) {
@@ -570,30 +559,20 @@ class MainActivity : AppCompatActivity() {
 
     private fun showExternalUnavailableDialog() {
         if (storageResolved || isFinishing || isDestroyed) return
-        val isZh = isChinese()
         AlertDialog.Builder(this)
-            .setTitle(if (isZh) "外部工作区不可用" else "External Workspace Unavailable")
-            .setMessage(
-                if (isZh)
-                    "/sdcard/AMCode 当前不可写。文件不会被移动或删除。\n\n可以本次先用内部存储启动，或永久切换到内部存储。"
-                else
-                    "/sdcard/AMCode is not writable right now. No files will be moved or deleted.\n\nStart with internal HOME for this launch, or switch to internal HOME permanently."
-            )
+            .setTitle(R.string.dialog_external_unavailable_title)
+            .setMessage(R.string.dialog_external_unavailable_message)
             .setCancelable(false)
-            .setPositiveButton(if (isZh) "本次使用内部存储" else "Use internal for now") { _, _ ->
+            .setPositiveButton(R.string.dialog_external_unavailable_use_internal_now) { _, _ ->
                 finishInternalHome(
                     persist = false,
-                    fallbackReason = if (isZh) {
-                        "本次使用内部存储；/sdcard/AMCode 文件保持不变"
-                    } else {
-                        "Using internal HOME for this launch; files in /sdcard/AMCode are unchanged"
-                    }
+                    fallbackReason = getString(R.string.toast_fallback_internal_this_launch)
                 )
             }
-            .setNeutralButton(if (isZh) "永久切换" else "Switch permanently") { _, _ ->
+            .setNeutralButton(R.string.dialog_external_unavailable_switch_permanent) { _, _ ->
                 finishInternalHome(persist = true)
             }
-            .setNegativeButton(if (isZh) "退出" else "Exit") { _, _ ->
+            .setNegativeButton(R.string.button_exit) { _, _ ->
                 finish()
             }
             .show()
@@ -601,23 +580,17 @@ class MainActivity : AppCompatActivity() {
 
     private fun showAllFilesAccessDialog() {
         if (isFinishing || isDestroyed) return
-        val isZh = isChinese()
         AlertDialog.Builder(this)
-            .setTitle(if (isZh) "需要存储权限" else "Storage Access Required")
-            .setMessage(
-                if (isZh)
-                    "你选择了共享存储 /sdcard/AMCode。Android 需要“所有文件访问”权限才能读写它。\n\n也可以改用内部存储（推荐），现有文件不会被移动。"
-                else
-                    "You chose shared storage /sdcard/AMCode. Android requires All files access to read and write it.\n\nYou can also use internal HOME (recommended); existing files are not moved."
-            )
+            .setTitle(R.string.dialog_all_files_title)
+            .setMessage(R.string.dialog_all_files_message)
             .setCancelable(false)
-            .setPositiveButton(if (isZh) "授权访问" else "Grant Access") { _, _ ->
+            .setPositiveButton(R.string.dialog_all_files_grant) { _, _ ->
                 launchAllFilesAccessSettings(StoragePurpose.STARTUP_EXTERNAL)
             }
-            .setNeutralButton(if (isZh) "使用内部存储" else "Use Internal Storage") { _, _ ->
+            .setNeutralButton(R.string.dialog_all_files_use_internal) { _, _ ->
                 finishInternalHome(persist = true)
             }
-            .setNegativeButton(if (isZh) "退出" else "Exit") { _, _ ->
+            .setNegativeButton(R.string.button_exit) { _, _ ->
                 finish()
             }
             .show()
@@ -654,7 +627,7 @@ class MainActivity : AppCompatActivity() {
         if (purpose == StoragePurpose.ON_DEMAND_SHARED || purpose == StoragePurpose.SWITCH_EXTERNAL) {
             Toast.makeText(
                 this,
-                if (isChinese()) "无法打开存储设置" else "Cannot open storage settings",
+                getString(R.string.toast_cannot_open_storage_settings),
                 Toast.LENGTH_LONG
             ).show()
         } else {
@@ -678,7 +651,7 @@ class MainActivity : AppCompatActivity() {
             if (purpose == StoragePurpose.ON_DEMAND_SHARED || purpose == StoragePurpose.SWITCH_EXTERNAL) {
                 Toast.makeText(
                     this,
-                    if (isChinese()) "无法申请存储权限" else "Cannot request storage permission",
+                    getString(R.string.toast_cannot_request_storage_permission),
                     Toast.LENGTH_LONG
                 ).show()
             } else {
@@ -696,11 +669,7 @@ class MainActivity : AppCompatActivity() {
         if (storageResolved) return
         finishInternalHome(
             persist = false,
-            fallbackReason = if (isChinese()) {
-                "未获得共享存储权限，本次使用内部存储；/sdcard/AMCode 文件保持不变"
-            } else {
-                "Shared storage permission not granted; using internal HOME for this launch. Files in /sdcard/AMCode are unchanged"
-            }
+            fallbackReason = getString(R.string.toast_fallback_internal_permission_denied)
         )
     }
 
@@ -710,14 +679,14 @@ class MainActivity : AppCompatActivity() {
         if (!granted) {
             Toast.makeText(
                 this,
-                if (isChinese()) "未获得共享存储权限" else "Shared storage access was not granted",
+                getString(R.string.toast_shared_access_not_granted),
                 Toast.LENGTH_LONG
             ).show()
             return
         }
         Toast.makeText(
             this,
-            if (isChinese()) "已获得共享存储访问权限" else "Shared storage access granted",
+            getString(R.string.toast_shared_access_granted),
             Toast.LENGTH_SHORT
         ).show()
         warnSharedFolderTrust()
@@ -750,8 +719,7 @@ class MainActivity : AppCompatActivity() {
             if (shouldShowRequestPermissionRationale(Manifest.permission.POST_NOTIFICATIONS)) {
                 Toast.makeText(
                     this,
-                    if (isChinese()) "需要通知权限以保持 VS Code 在后台运行"
-                    else "Notification permission is needed to keep VS Code running",
+                    getString(R.string.toast_notification_permission_needed),
                     Toast.LENGTH_SHORT
                 ).show()
             }
@@ -990,7 +958,7 @@ class MainActivity : AppCompatActivity() {
                     { recreate() }
                 }
                 showError(
-                    if (isChinese()) "网页渲染进程已崩溃" else "The web page renderer crashed",
+                    getString(R.string.error_renderer_crashed),
                     retry = retryAction,
                     showToast = false
                 )
@@ -1311,8 +1279,7 @@ class MainActivity : AppCompatActivity() {
         if (authRetryCount >= MAX_AUTH_RETRIES) {
             Log.e(TAG, "Authentication retries exhausted")
             showError(
-                if (isChinese()) "无法完成本地 VS Code 认证"
-                else "Could not authenticate the local VS Code session",
+                getString(R.string.error_auth_exhausted),
                 retry = { workspaceRestartRequested() },
                 showToast = false
             )
@@ -1324,7 +1291,7 @@ class MainActivity : AppCompatActivity() {
         progressBar.visibility = View.VISIBLE
         progressBar.progress = 0
         statusText.text = getString(R.string.initializing)
-        progressText.text = if (isChinese()) "正在重新认证…" else "Re-authenticating…"
+        progressText.text = getString(R.string.progress_reauthenticating)
         clearErrorClicks()
 
         val generation = ++loadGeneration
@@ -1332,7 +1299,7 @@ class MainActivity : AppCompatActivity() {
             val cookie = CodeServerLauncher.refreshSessionCookie()
             if (cookie.isNullOrBlank()) {
                 showError(
-                    if (isChinese()) "本地认证失败，请重试" else "Local authentication failed; please retry",
+                    getString(R.string.error_local_auth_failed),
                     retry = { workspaceRestartRequested() },
                     showToast = false
                 )
@@ -1398,39 +1365,27 @@ class MainActivity : AppCompatActivity() {
 
     private fun showSharedStoragePrompt() {
         if (isFinishing || isDestroyed) return
-        val isZh = isChinese()
         AlertDialog.Builder(this)
-            .setTitle(if (isZh) "共享存储访问" else "Shared Storage Access")
-            .setMessage(
-                if (isZh)
-                    "该工作区位于共享存储（/sdcard）。Android 需要额外的存储授权才能读写它。\n\n授权后 VS Code 仍会以受限模式打开该文件夹，并可能询问你是否信任。"
-                else
-                    "This workspace is on shared storage (/sdcard). Android requires additional storage access to read and write it.\n\nAfter granting it, VS Code still opens the folder in Restricted Mode and may ask you to trust it."
-            )
-            .setPositiveButton(if (isZh) "去授权" else "Grant access") { _, _ ->
+            .setTitle(R.string.dialog_shared_prompt_title)
+            .setMessage(R.string.dialog_shared_prompt_message)
+            .setPositiveButton(R.string.dialog_shared_prompt_grant) { _, _ ->
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                     launchAllFilesAccessSettings(StoragePurpose.ON_DEMAND_SHARED)
                 } else {
                     requestLegacyStoragePermissions(StoragePurpose.ON_DEMAND_SHARED)
                 }
             }
-            .setNegativeButton(if (isZh) "暂不" else "Not now", null)
+            .setNegativeButton(R.string.dialog_shared_prompt_not_now, null)
             .show()
     }
 
     private fun warnSharedFolderTrust() {
         if (sharedTrustWarned || isFinishing || isDestroyed) return
         sharedTrustWarned = true
-        val isZh = isChinese()
         AlertDialog.Builder(this)
-            .setTitle(if (isZh) "工作区信任提示" else "Workspace Trust")
-            .setMessage(
-                if (isZh)
-                    "该文件夹位于共享存储，其他应用可能修改其中的文件。\n\nAMCode 不会绕过 VS Code 的 Workspace Trust：VS Code 会以受限模式打开它，并可能询问你是否信任。请只信任你控制的文件夹。"
-                else
-                    "This folder is on shared storage, where other apps can modify files.\n\nAMCode does not bypass VS Code Workspace Trust: VS Code opens it in Restricted Mode and may ask whether to trust it. Only trust folders you control."
-            )
-            .setPositiveButton(if (isZh) "我知道了" else "I understand", null)
+            .setTitle(R.string.dialog_shared_trust_title)
+            .setMessage(R.string.dialog_shared_trust_message)
+            .setPositiveButton(R.string.dialog_shared_trust_ok, null)
             .show()
     }
 
@@ -1447,22 +1402,10 @@ class MainActivity : AppCompatActivity() {
         val internal = HomePrefs.internalHomeDir(this).absolutePath
         if (TermuxManager.homeDir.absolutePath != internal) return
 
-        val isZh = isChinese()
         val dialog = AlertDialog.Builder(this)
-            .setTitle(if (isZh) "启用扩展：信任工作区" else "Enable extensions: trust the workspace")
-            .setMessage(
-                if (isZh)
-                    "首次打开工作区时，VS Code 顶部会显示受限模式（Restricted Mode）横幅，此时用户扩展被停用。\n\n" +
-                        "该工作区是 AMCode 的应用私有目录（其他应用无法访问）。如果这是你自己的设备，点击横幅上的 " +
-                        "“Trust the Authors / 信任” 即可启用全部扩展；也可以保持受限模式。\n\n" +
-                        "AMCode 不会代替你自动信任任何文件夹。"
-                else
-                    "The first time the workspace opens, VS Code shows a Restricted Mode banner at the top and disables user extensions.\n\n" +
-                        "This workspace is AMCode's app-private directory (no other app can access it). On your own device, tap " +
-                        "\"Trust the Authors\" in the banner to enable all extensions, or keep Restricted Mode.\n\n" +
-                        "AMCode never trusts a folder automatically on your behalf."
-            )
-            .setPositiveButton(if (isZh) "我知道了" else "Got it", null)
+            .setTitle(R.string.dialog_internal_trust_title)
+            .setMessage(R.string.dialog_internal_trust_message)
+            .setPositiveButton(R.string.dialog_internal_trust_ok, null)
             .create()
         // Mark only once the dialog is actually on screen: an exception or
         // a finishing Activity must not permanently consume the hint.
@@ -1486,37 +1429,21 @@ class MainActivity : AppCompatActivity() {
      */
     private fun showWorkspaceStorageDialog() {
         if (isFinishing || isDestroyed) return
-        val isZh = isChinese()
         val modeExternal = HomePrefs.getMode(this) == HomePrefs.MODE_EXTERNAL
         val effective = TermuxManager.homeDir.absolutePath
         val usingExternal = modeExternal &&
             effective == HomePrefs.externalHomeDir().absolutePath
-        val message =
-            if (isZh) {
-                "当前 HOME：$effective\n\n" + when {
-                    usingExternal ->
-                        "使用共享存储 /sdcard/AMCode。共享存储不可执行二进制，Git/编译可能受限。切换到内部存储不会移动或删除文件。"
-                    modeExternal ->
-                        "外部工作区 /sdcard/AMCode 当前不可用，本次使用内部 HOME。文件不会被移动或删除。"
-                    else ->
-                        "使用内部存储。共享文件可通过 ~/storage/shared 打开；首次访问 /sdcard 时需要授权。"
-                }
-            } else {
-                "Current HOME: $effective\n\n" + when {
-                    usingExternal ->
-                        "Using shared storage /sdcard/AMCode. Shared storage is noexec, so Git/build tools may be limited. Switching to internal HOME does not move or delete files."
-                    modeExternal ->
-                        "The external workspace /sdcard/AMCode is unavailable; internal HOME is being used for this launch. Files are not moved or deleted."
-                    else ->
-                        "Using internal storage. Shared files are available through ~/storage/shared; Android asks for access the first time /sdcard is used."
-                }
-            }
+        val messageRes = when {
+            usingExternal -> R.string.dialog_storage_message_external
+            modeExternal -> R.string.dialog_storage_message_external_unavailable
+            else -> R.string.dialog_storage_message_internal
+        }
 
         val builder = AlertDialog.Builder(this)
-            .setTitle(if (isZh) "工作区存储" else "Workspace Storage")
-            .setMessage(message)
-            .setNegativeButton(if (isZh) "关闭" else "Close", null)
-            .setNeutralButton(if (isZh) "授权共享存储" else "Grant shared storage") { _, _ ->
+            .setTitle(R.string.dialog_storage_title)
+            .setMessage(getString(messageRes, effective))
+            .setNegativeButton(R.string.button_close, null)
+            .setNeutralButton(R.string.dialog_storage_grant_shared) { _, _ ->
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                     launchAllFilesAccessSettings(StoragePurpose.ON_DEMAND_SHARED)
                 } else {
@@ -1524,11 +1451,11 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         if (modeExternal) {
-            builder.setPositiveButton(if (isZh) "切换到内部存储" else "Switch to internal HOME") { _, _ ->
+            builder.setPositiveButton(R.string.dialog_storage_switch_to_internal) { _, _ ->
                 confirmSwitchToInternalHome()
             }
         } else {
-            builder.setPositiveButton(if (isZh) "切换到外部存储" else "Switch to external /sdcard/AMCode") { _, _ ->
+            builder.setPositiveButton(R.string.dialog_storage_switch_to_external) { _, _ ->
                 confirmSwitchToExternalHome()
             }
         }
@@ -1542,23 +1469,13 @@ class MainActivity : AppCompatActivity() {
      */
     private fun confirmSwitchToExternalHome() {
         if (isFinishing || isDestroyed) return
-        val isZh = isChinese()
         AlertDialog.Builder(this)
-            .setTitle(if (isZh) "切换到外部存储？" else "Switch to external storage?")
-            .setMessage(
-                if (isZh)
-                    "VS Code 会重启并使用 /sdcard/AMCode 作为 HOME，请先保存未保存的编辑内容。\n\n" +
-                        "注意：共享存储不支持 Unix 权限/符号链接，且通常不可执行（noexec）——Git、编译产物、venv、npm 部分功能会受限。\n\n" +
-                        "需要存储授权；内部 HOME 中的文件不会被移动或删除。"
-                else
-                    "VS Code will restart using /sdcard/AMCode as HOME. Save any unsaved editors first.\n\n" +
-                        "Note: shared storage lacks Unix permissions/symlinks and is usually noexec — Git, build artifacts, venvs and parts of npm may be limited.\n\n" +
-                        "Storage access is required; files in the internal HOME are not moved or deleted."
-            )
-            .setPositiveButton(if (isZh) "切换" else "Switch") { _, _ ->
+            .setTitle(R.string.dialog_switch_external_title)
+            .setMessage(R.string.dialog_switch_external_message)
+            .setPositiveButton(R.string.dialog_switch_external_switch) { _, _ ->
                 performSwitchToExternalHome()
             }
-            .setNegativeButton(if (isZh) "取消" else "Cancel", null)
+            .setNegativeButton(R.string.button_cancel, null)
             .show()
     }
 
@@ -1575,8 +1492,7 @@ class MainActivity : AppCompatActivity() {
         if (!HomePrefs.isExternalWritable()) {
             Toast.makeText(
                 this,
-                if (isChinese()) "/sdcard/AMCode 当前不可写，保持内部存储"
-                else "/sdcard/AMCode is not writable; keeping internal HOME",
+                getString(R.string.toast_external_not_writable_keep_internal),
                 Toast.LENGTH_LONG
             ).show()
             return
@@ -1589,7 +1505,7 @@ class MainActivity : AppCompatActivity() {
         } else {
             Toast.makeText(
                 this,
-                if (isChinese()) "无法切换到外部存储" else "Could not switch to external storage",
+                getString(R.string.toast_cannot_switch_external),
                 Toast.LENGTH_LONG
             ).show()
         }
@@ -1597,19 +1513,13 @@ class MainActivity : AppCompatActivity() {
 
     private fun confirmSwitchToInternalHome() {
         if (isFinishing || isDestroyed) return
-        val isZh = isChinese()
         AlertDialog.Builder(this)
-            .setTitle(if (isZh) "切换到内部存储？" else "Switch to internal storage?")
-            .setMessage(
-                if (isZh)
-                    "VS Code 会重启以使用内部 HOME，请先保存未保存的编辑内容。\n\n/sdcard/AMCode 中的文件不会被移动或删除，仍可通过 ~/storage/shared 打开。"
-                else
-                    "VS Code will restart with internal HOME. Save any unsaved editors first.\n\nFiles in /sdcard/AMCode are not moved or deleted and remain reachable through ~/storage/shared."
-            )
-            .setPositiveButton(if (isZh) "切换并重启" else "Switch and restart") { _, _ ->
+            .setTitle(R.string.dialog_switch_internal_title)
+            .setMessage(R.string.dialog_switch_internal_message)
+            .setPositiveButton(R.string.dialog_switch_internal_switch_restart) { _, _ ->
                 performSwitchToInternalHome()
             }
-            .setNegativeButton(if (isZh) "取消" else "Cancel", null)
+            .setNegativeButton(R.string.button_cancel, null)
             .show()
     }
 
@@ -1617,7 +1527,7 @@ class MainActivity : AppCompatActivity() {
         if (!HomePrefs.applyInternalHome(this, persist = true)) {
             Toast.makeText(
                 this,
-                if (isChinese()) "无法切换到内部存储" else "Could not switch to internal storage",
+                getString(R.string.toast_cannot_switch_internal),
                 Toast.LENGTH_LONG
             ).show()
             return
@@ -1661,7 +1571,7 @@ class MainActivity : AppCompatActivity() {
         } catch (e: Exception) {
             Log.e(TAG, "Cannot restart CodeServerService", e)
             showError(
-                if (isChinese()) "无法重启 VS Code" else "Cannot restart VS Code",
+                getString(R.string.error_cannot_restart),
                 retry = { retryService() }
             )
         }
@@ -1727,11 +1637,11 @@ class MainActivity : AppCompatActivity() {
             progressBar.visibility = View.VISIBLE
             progressBar.progress = 0
             statusText.text = getString(R.string.initializing)
-            progressText.text = if (isChinese()) {
-                "正在重试连接（$webViewRetryCount/$MAX_WEBVIEW_RETRIES）…"
-            } else {
-                "Retrying connection ($webViewRetryCount/$MAX_WEBVIEW_RETRIES)…"
-            }
+            progressText.text = getString(
+                R.string.progress_retrying_connection,
+                webViewRetryCount,
+                MAX_WEBVIEW_RETRIES
+            )
             clearErrorClicks()
             mainFrameError = false
             loadGeneration++
@@ -1804,8 +1714,7 @@ class MainActivity : AppCompatActivity() {
                 ?: CodeServerLauncher.refreshSessionCookie()
             if (cookie.isNullOrBlank()) {
                 showError(
-                    if (isChinese()) "无法取得本地认证会话"
-                    else "Could not obtain the local authentication session",
+                    getString(R.string.error_no_auth_session),
                     retry = { workspaceRestartRequested() },
                     showToast = false
                 )
@@ -1823,7 +1732,7 @@ class MainActivity : AppCompatActivity() {
             if (generation != loadGeneration || isFinishing || isDestroyed) return@launch
             if (!webViewReady && !mainFrameError) {
                 showError(
-                    if (isChinese()) "VS Code 加载超时" else "VS Code did not load in time",
+                    getString(R.string.error_load_timeout),
                     retry = { retryWebView() },
                     showToast = false
                 )
@@ -1878,7 +1787,11 @@ class MainActivity : AppCompatActivity() {
         } catch (e: Exception) {
             serviceStartRequested = false
             Log.e(TAG, "Failed to start service", e)
-            Toast.makeText(this, "Cannot start VS Code: ${e.message}", Toast.LENGTH_LONG).show()
+            Toast.makeText(
+                this,
+                getString(R.string.toast_cannot_start_vscode, e.message ?: "null"),
+                Toast.LENGTH_LONG
+            ).show()
         }
         updateProgress(getString(R.string.initializing), 0)
         // A "Storage" notification action may have cold-started the Activity.
@@ -1920,7 +1833,7 @@ class MainActivity : AppCompatActivity() {
         loadingOverlay.visibility = View.VISIBLE
         progressBar.visibility = View.GONE
         statusText.text = getString(R.string.error_occurred)
-        val hint = if (isChinese()) "点击此处重试" else "Tap here to retry"
+        val hint = getString(R.string.hint_tap_to_retry)
         progressText.text = if (retry != null) "$text\n\n$hint" else text
 
         val listener = retry?.let { action -> View.OnClickListener { action() } }
@@ -1941,8 +1854,6 @@ class MainActivity : AppCompatActivity() {
         progressText.isClickable = false
     }
 
-    private fun isChinese(): Boolean = Locale.getDefault().language == "zh"
-
     /**
      * Creating a WebView throws on devices without a WebView provider
      * (some AOSP builds). Probe once and keep the rest of onCreate safe.
@@ -1956,19 +1867,40 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun showNoWebViewError() {
-        val isZh = isChinese()
         AlertDialog.Builder(this)
-            .setTitle(if (isZh) "缺少系统 WebView" else "System WebView missing")
-            .setMessage(
-                if (isZh)
-                    "此设备没有可用的 Android System WebView，AMCode 无法显示 VS Code。\n\n" +
-                        "请安装或更新“Android System WebView”后重新打开应用。"
-                else
-                    "This device has no usable Android System WebView, so AMCode cannot show VS Code.\n\n" +
-                        "Please install or update \"Android System WebView\" and reopen the app."
-            )
+            .setTitle(R.string.dialog_no_webview_title)
+            .setMessage(R.string.dialog_no_webview_message)
             .setCancelable(false)
-            .setPositiveButton(if (isZh) "退出" else "Exit") { _, _ -> finish() }
+            .setPositiveButton(R.string.button_exit) { _, _ -> finish() }
+            .show()
+    }
+
+    /**
+     * Soft minimum-version gate for the WebView provider: evaluated on every
+     * launch, never persisted. Queries the installed WebView provider package
+     * and shows a single non-blocking warning when its major version is below
+     * [MIN_WEBVIEW_MAJOR_VERSION]. A missing package or an unparseable version
+     * skips the check silently.
+     */
+    private fun checkWebViewVersionThreshold() {
+        val providers = listOf("com.google.android.webview", "com.android.webview")
+        var versionName: String? = null
+        for (provider in providers) {
+            versionName = try {
+                packageManager.getPackageInfo(provider, 0).versionName
+            } catch (e: Exception) {
+                null
+            }
+            if (!versionName.isNullOrBlank()) break
+        }
+        val version = versionName ?: return
+        val major = version.substringBefore('.').toIntOrNull() ?: return
+        if (major >= MIN_WEBVIEW_MAJOR_VERSION) return
+        if (isFinishing || isDestroyed) return
+        AlertDialog.Builder(this)
+            .setTitle(getString(R.string.dialog_webview_outdated_title))
+            .setMessage(getString(R.string.dialog_webview_outdated_message, version))
+            .setPositiveButton(R.string.dialog_webview_outdated_ok, null)
             .show()
     }
 
