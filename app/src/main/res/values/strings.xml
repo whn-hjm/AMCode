@@ -143,4 +143,6 @@
     <string name="cd_key_down">Arrow down</string>
     <string name="cd_key_left">Arrow left</string>
     <string name="cd_key_right">Arrow right</string>
+    <string name="cd_key_collapse">Collapse extra keys</string>
+    <string name="cd_key_expand">Show extra keys</string>
 </resources>

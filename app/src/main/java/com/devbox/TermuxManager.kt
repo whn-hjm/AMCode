@@ -1976,6 +1976,8 @@ object TermuxManager {
                 "xargs -r sed -i 's|com.termux|com.devbox|g' 2>/dev/null"
         )
 
+        stripForeignArchBinaries()
+
         // nodejs-24 installs into opt/nodejs-24/bin; code-server expects both
         // bin/node and lib/code-server/lib/node.
         val nodeJs24 = File(usrDir, "opt/nodejs-24/bin/node")
@@ -1995,6 +1997,76 @@ object TermuxManager {
             } catch (_: Exception) {
             }
         }
+    }
+
+    /**
+     * The TUR code-server package ships npm prebuilds for every platform;
+     * on arm64 the x86_64/arm32 copies are dead weight (~154 MB, ~30% of the
+     * unpacked tree) that can never load. Delete them right after unpack and
+     * prune the matching lines from the dpkg .list so `dpkg --verify` and
+     * future upgrades stay consistent (found by the 16KB page-size audit;
+     * arm64 devices only — emulators keep the stock tree for fidelity).
+     */
+    private fun stripForeignArchBinaries() {
+        val abi = android.os.Build.SUPPORTED_ABIS.firstOrNull() ?: return
+        val codeServerRoot = File(usrDir, "lib/code-server")
+        if (!codeServerRoot.isDirectory) return
+
+        // Per-ABI dead-weight list from the 16KB audit: npm prebuilds for the
+        // other architectures (and glibc builds that cannot load on bionic).
+        val deadPaths = if (abi.startsWith("arm64")) listOf(
+            "lib/code-server/lib/vscode/extensions/microsoft-authentication/dist/libmsalruntime.so",
+            "lib/code-server/lib/vscode/extensions/microsoft-authentication/dist/msal-node-runtime.node",
+            "lib/code-server/lib/vscode/node_modules/@github/copilot-sdk-linux-x64",
+            "lib/code-server/lib/vscode/node_modules/@koromix/koffi-linux-x64",
+            "lib/code-server/lib/vscode/node_modules/@parcel/watcher-linux-x64-glibc",
+            "lib/code-server/lib/vscode/node_modules/@parcel/watcher-linux-x64-musl",
+            "lib/code-server/lib/vscode/node_modules/@vscode/sandbox-runtime/vendor/seccomp/x64/apply-seccomp",
+            "lib/code-server/node_modules/argon2/prebuilds/freebsd-x64",
+            "lib/code-server/node_modules/argon2/prebuilds/linux-x64",
+            "lib/code-server/node_modules/argon2/prebuilds/linux-arm"
+        ) else listOf(
+            "lib/code-server/node_modules/argon2/prebuilds/freebsd-arm64",
+            "lib/code-server/node_modules/argon2/prebuilds/linux-arm64",
+            "lib/code-server/node_modules/argon2/prebuilds/linux-arm"
+        )
+        var freed = 0L
+        var files = 0
+        val deletedPrefixes = mutableListOf<String>()
+        for (rel in deadPaths) {
+            val target = File(usrDir, rel)
+            if (!target.exists()) continue
+            deletedPrefixes.add(usrDir.absolutePath + "/" + rel.trimEnd('/') + "/")
+            if (target.isDirectory) {
+                target.walkTopDown().forEach {
+                    if (it.isFile) {
+                        freed += it.length()
+                        files++
+                    }
+                }
+                target.deleteRecursively()
+            } else {
+                freed += target.length()
+                files++
+                target.delete()
+            }
+        }
+        if (files == 0) return
+
+        // Keep the dpkg database consistent: drop the .list lines that point
+        // into the removed trees (directories have a trailing slash).
+        val listFile = File(varDir, "lib/dpkg/info/code-server.list")
+        if (listFile.isFile) {
+            try {
+                val kept = listFile.readLines().filter { line ->
+                    deletedPrefixes.none { line.startsWith(it) }
+                }
+                listFile.writeText(kept.joinToString("", postfix = "\n"))
+            } catch (e: Exception) {
+                Log.w(TAG, "Cannot prune code-server.list after stripping: ${e.message}")
+            }
+        }
+        Log.i(TAG, "stripForeignArchBinaries: removed $files file(s), ${(freed / (1024 * 1024))} MB of foreign-arch binaries")
     }
 
     private fun runShellQuiet(script: String): Boolean {

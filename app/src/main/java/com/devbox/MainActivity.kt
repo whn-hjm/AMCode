@@ -1048,6 +1048,15 @@ class MainActivity : AppCompatActivity() {
             button.isFocusableInTouchMode = false
             button.setOnClickListener { dispatchExtraKey(keyCode) }
         }
+        // Collapsible for hardware-keyboard users; the choice is remembered.
+        findViewById<View>(R.id.key_collapse).setOnClickListener {
+            HomePrefs.setExtraKeysEnabled(this, false)
+            updateKeyToolbarVisibility()
+        }
+        findViewById<View>(R.id.key_toolbar_handle).setOnClickListener {
+            HomePrefs.setExtraKeysEnabled(this, true)
+            updateKeyToolbarVisibility()
+        }
     }
 
     private fun dispatchExtraKey(keyCode: Int) {
@@ -1061,12 +1070,19 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** Extra keys live only while VS Code is up and the IME is closed. */
+    /**
+     * Extra keys live only while VS Code is up and the IME is closed, and
+     * only when the user has not collapsed them (hardware-keyboard users).
+     * While collapsed a small handle stays in the corner to bring them back.
+     */
     private fun updateKeyToolbarVisibility() {
         if (!::keyToolbar.isInitialized) return
-        val visible = webViewReady && !mainFrameError && imeBottomPx == 0 &&
+        val pageReady = webViewReady && !mainFrameError &&
             ::loadingOverlay.isInitialized && loadingOverlay.visibility != View.VISIBLE
-        keyToolbar.visibility = if (visible) View.VISIBLE else View.GONE
+        val enabled = pageReady && imeBottomPx == 0 && HomePrefs.isExtraKeysEnabled(this)
+        keyToolbar.visibility = if (enabled) View.VISIBLE else View.GONE
+        val handle = findViewById<View>(R.id.key_toolbar_handle)
+        handle.visibility = if (pageReady && imeBottomPx == 0 && !enabled) View.VISIBLE else View.GONE
     }
 
     private fun setupImeInsets() {

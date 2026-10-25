@@ -119,6 +119,7 @@ object HomePrefs {
     private const val KEY_EXTERNAL_MIGRATION_PROMPTED = "external_migration_prompted"
     private const val KEY_EXTERNAL_TRUST_WARNED = "external_trust_warned"
     private const val KEY_INTERNAL_TRUST_HINT_SHOWN = "internal_trust_hint_shown"
+    private const val KEY_EXTRA_KEYS_ENABLED = "extra_keys_enabled"
 
     const val MODE_INTERNAL = "internal"
     const val MODE_EXTERNAL = "external"
@@ -170,6 +171,17 @@ object HomePrefs {
 
     fun markInternalTrustHintShown(context: Context) {
         prefs(context).edit().putBoolean(KEY_INTERNAL_TRUST_HINT_SHOWN, true).apply()
+    }
+
+    /**
+     * Extra-keys toolbar visibility, remembered across launches: users with a
+     * hardware keyboard collapse the row once and never see it again.
+     */
+    fun isExtraKeysEnabled(context: Context): Boolean =
+        prefs(context).getBoolean(KEY_EXTRA_KEYS_ENABLED, true)
+
+    fun setExtraKeysEnabled(context: Context, enabled: Boolean) {
+        prefs(context).edit().putBoolean(KEY_EXTRA_KEYS_ENABLED, enabled).apply()
     }
 
     /** Legacy shared-storage workspace: /sdcard/AMCode */

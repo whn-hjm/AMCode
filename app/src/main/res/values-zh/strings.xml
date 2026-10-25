@@ -144,4 +144,6 @@
     <string name="cd_key_down">方向键 下</string>
     <string name="cd_key_left">方向键 左</string>
     <string name="cd_key_right">方向键 右</string>
+    <string name="cd_key_collapse">收起扩展按键行</string>
+    <string name="cd_key_expand">显示扩展按键行</string>
 </resources>
