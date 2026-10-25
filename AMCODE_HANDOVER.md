@@ -259,24 +259,25 @@ curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' http://127.0.0.1:<PORT>
 
 - [x] **单 ABI bootstrap 减包**：`-PbootstrapArch=<abi>`（缓存移至 `bootstrap-cache/`，staged 到 generated assets；默认仍双 ABI 通用包）。产物：online 通用 64MB；offline arm64 单架构 **161.8MB（原 194.7MB）**。（2026-10-25 主 agent）
 - [ ] **push + GitHub Release**：commit 已就绪；发布 online（通用）+ offline arm64（单架构）双 APK 及 SHA-256。CI 首跑需确认。
-- [ ] **amcode-dpkg-wrapper 与 pkg-setup 的 dpkg lock**（assets/*.sh + TermuxManager.ensurePkgSetup）
+- [x] **amcode-dpkg-wrapper 与 pkg-setup 的 dpkg lock**：repair 前 bounded 等待残留 apt/dpkg/pkg 退出（`b4907fd`；5558 实测 full repair warnings=0）
 
-### P2（子代理并行开发中，文件独占）
+### P2
 
-- [ ] **[T-B]** Range 下载 part 文件按区间起点命名，消除断点续传布局漂移（TermuxManager 下载区，子代理1）
-- [ ] **[T-C]** 健康检查重启统一走 initJob 单飞通道 / launcher Mutex 串行（CodeServerService+Launcher，子代理2）
-- [ ] **[T-D1]** 旧安装 dpkg DB 补登记（code-server/node 一次性登记，TermuxManager，子代理1）
-- [ ] **[T-D2]** 32 位 ARM fail-fast（bootstrapAsset 明确报错，TermuxManager，子代理1）
-- [ ] **[T-G1]** resolv.conf 不再覆盖用户定制（TermuxManager，子代理1）
-- [ ] **[T-E1]** i18n 迁移 values-zh（MainActivity 对话框/Toast + strings.xml + values-zh，子代理3）
-- [ ] **[T-E2]** WebView 版本门槛检查（MainActivity，子代理3）
-- [ ] **[T-F]** ~~mint-key 语义调研~~ **已完成（主 agent 直查 v4.143.1 源码）：无副作用问题，保留现用法**（结论见 §6.10）。
-- [ ] **[T-G2]** D2D dataExtractionRules 显式排除 cache 域（res/xml，主 agent 顺带）
+- [x] **[T-B]** Range 下载 part 文件按区间起点命名（.part.<start>-<end>），消除断点续传布局漂移（`558efcf`；offline 路径不走 Range，编译+逻辑验证）
+- [x] **[T-C]** 健康检查重启统一走 initJob 单飞通道：恢复循环搬进管线 recovery 分支 + pipelineLock 线性化；launcher 失败不再全局 stop、auth config 写入前查 generation（`3c89736`）
+- [x] **[T-D1]** 旧安装 dpkg DB 补登记：status 缺条目时一次性写入 stanza+info list（`558efcf`；5558 模拟旧装实测：删条目→重启→自动补回 2 包）
+- [x] **[T-D2]** 32 位 ARM fail-fast：bootstrapAsset 返回 null + 明确报错（`558efcf`）
+- [x] **[T-G1]** resolv.conf 仅缺失时写默认，保留用户 DNS 定制（`558efcf`）
+- [x] **[T-F]** mint-key 语义调研：v4.143.1 源码证实无副作用，保留现用法（见 §6.10）
+- [x] **[T-G2]** D2D cache 域——CI lint 证伪：cacheDir 本就不参与备份，改为注释说明（`3c89736`）
+- [x] **[T-G3]** terminal 输出持久化到 files/logs/setup.log（1MB 轮转）（`558efcf`）
+- [ ] **[T-E1]** i18n 迁移 values-zh（子代理3 进行中）
+- [ ] **[T-E2]** WebView 版本门槛检查（子代理3 进行中）
 - [ ] `~/storage/shared` 无 MANAGE 时的按需授权/拒绝/重试 UI 全回归（已部分覆盖）
+- [ ] **[T-H]** dpkg wrapper 对大 deb 的 ~6 倍磁盘峰值：空间预检或流式评估（tmp 残留已清，见 §6.2 相邻风险）
 
 ### P3（体验/工程）
 
-- [ ] **[T-G3]** terminal 输出持久化到文件（TermuxManager.emitOutput → 轮转日志，子代理1）
 - [ ] UI/UX：extra-keys、virtual mouse（见 §13 P1-8）。
 
 ### 长期
@@ -337,6 +338,21 @@ curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' http://127.0.0.1:<PORT>
 ---
 
 ## 11. 变更记录（每批次一条，倒序；新改动加在最上面）
+
+### 2026-10-25 上午（续）· `558efcf`+`3c89736` 任务板批次（T-A~T-H）
+- **T-A** `-PbootstrapArch` 单架构打包（bootstrap-cache/，arm64 offline 194.7→161.8MB，5560 单架构 fresh 45s 全绿）。
+- **T-C** 崩溃恢复并入 initJob 管线（recovery 分支+pipelineLock；健康循环只探测+交接）；launcher prepareAndStart 失败不再全局 stop；auth config 落盘前查 generation。
+- **T-B** Range part 按字节区间命名 + 旧式/新式残留统一清理。
+- **T-D1** 旧安装 dpkg DB 一次性补登记（模拟旧装实测通过）；**T-D2** 32 位 ABI 明确拒绝；**T-G1** resolv.conf 保留用户定制；**T-G3** setup.log 持久化（1MB 轮转）。
+- **T-F** mint-key 源码核实：无副作用。**CI**：gradlew exec bit、去 setup-android、修 data-extraction cache 域 lint 错误。
+- **T-H**（新发现入池）：wrapper 大 deb 磁盘峰值预检。
+
+### 2026-10-25 上午 · `d78c59c` 文档整合 + CI 修复
+- **唯一项目文档规则**：AMCODE_HANDOVER.md（+§13 重任务池摘要）；10-24 四份历史文档移入 docs/history/ 只读存档；根 ROADMAP.md 删除；README 补 `-PbootstrapArch`。
+- CI 三连修：gradlew +x、移除 setup-android（runner 预装 SDK）、lint 抓到 data-extraction 规则非法 cache 域。
+
+### 2026-10-25 上午 · `062c342` 单 ABI bootstrap 减包 + 任务板化
+- bootstrap-cache/ + `-PbootstrapArch` staging；dataExtractionRules cache 注释；HANDOVER 重构为交接+运维+任务板+评审汇总+变更记录五合一。
 
 ### 2026-10-25 上午 · `c229683` 管线并发正确性 + minSdk 验证 + 文档
 - **并发**：被取代管线失败不再 stopSelf（所有权检查）；取消的 start 只 abort 本进程；auth 后 checkpoint；ACTION_RESTART join 健康循环；startHealthChecks 同步化；TermuxManager.initialize 加 Mutex；auth-config/shim/settings 唯一 tmp 名；PID 匹配要求 starttime；SIGKILL 前复验 cmdline；findFreePort 失败即败；stdout 三重脱敏；通知节流 2/s；重启失败也更新通知。
