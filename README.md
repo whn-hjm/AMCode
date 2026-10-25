@@ -18,7 +18,7 @@ Big thanks to **[Termux](https://github.com/termux/termux-app)** for the ARM64/x
 
 | | Online (default) | Offline (arm64) |
 |---|---|---|
-| APK size | ~64 MB | 185.7 MB |
+| APK size | ~64 MB | ~162 MB (arm64-only) |
 | code-server + Node.js | downloaded on first launch from TUR | bundled inside the APK |
 | First-launch download | ≈127 MB from TUR + ~18 MB dependencies | ~18 MB dependencies only (never touches TUR) |
 | Best for | any network that can reach `tur.kcubeterm.com` | slow/unreachable TUR, reproducible installs |
@@ -100,14 +100,17 @@ TUR (`tur.kcubeterm.com`) has no mirrors and can be slow in some regions. If the
 # with distribution SHA-256 verification)
 echo "sdk.dir=/path/to/Android/Sdk" > local.properties
 
-./gradlew assembleRelease                      # online APK (~64 MB)
-./gradlew assembleRelease -PofflineBundle=true -PofflineBundleArch=aarch64   # offline APK (185.7 MB)
+./gradlew assembleRelease                      # online APK, universal (~64 MB)
+./gradlew assembleRelease -PofflineBundle=true -PofflineBundleArch=aarch64 \
+    -PbootstrapArch=aarch64                    # offline APK, arm64-only (~162 MB)
 # -PofflineBundleArch=x86_64 for the emulator; -PofflineBundleSourceDir=/path/to/debs
 # to reuse previously downloaded .debs (filename must match).
+# -PbootstrapArch=aarch64|x86_64 stages a single bootstrap zip (~33 MB smaller
+# APK); omit it for a universal APK that carries both.
 # APK at: app/build/outputs/apk/release/app-release.apk
 ```
 
-- **Bootstrap:** the two Termux bootstrap archives (aarch64 32,203,582 B / x86_64 32,112,380 B) are downloaded automatically during the first build, pinned by SHA-256; a missing or corrupt archive fails the build with manual-download instructions.
+- **Bootstrap:** the Termux bootstrap archives (aarch64 32,203,582 B / x86_64 32,112,380 B) are downloaded automatically during the first build (cached in `bootstrap-cache/`), pinned by SHA-256; a missing or corrupt archive fails the build with manual-download instructions. `-PbootstrapArch=<abi>` ships only one of them.
 - **Signing:** put `app/keystore.properties` (gitignored) with `storeFile`/`storePassword`/`keyAlias`/`keyPassword`, or export `AMCODE_STORE_FILE` / `AMCODE_STORE_PASSWORD` / `AMCODE_KEY_ALIAS` / `AMCODE_KEY_PASSWORD`. A partially filled configuration fails the build (rather than silently producing an unsigned APK); with nothing configured you get an unsigned APK.
 - The dependency set is deliberately minimal (no Material, no webkit-v1, no lifecycle-service); R8 shrinking is enabled for release.
 
