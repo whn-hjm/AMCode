@@ -281,7 +281,10 @@ curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' http://127.0.0.1:<PORT>
 
 ### P3（体验/工程）
 
-- [ ] UI/UX：extra-keys、virtual mouse（见 §13 P1-8）。
+- [ ] **[T-K] extra-keys 按键行**（§13 P1-8 轻量版，选型备忘 2026-10-25）：
+  - 方案A（native toolbar）：App 层 WebView 下方加一排按钮，把 Esc/Ctrl/Tab/方向键翻译成 `dispatchKeyEvent` 注入 WebView —— 优点：不依赖页面结构、横竖屏布局可控；缺点：Ctrl 组合键状态管理复杂（要自己维护 modifier 粘滞），与 IME 抬起时的 inset 联动要重测（focus 修复同款敏感区）。
+  - 方案B（JS 注入）：页面里注入 fixed 定位的按键条，向 xterm textarea 发 KeyboardEvent —— 优点：xterm 原生路径、Ctrl 组合简单；缺点：依赖 code-server DOM 结构（升级可能破）、滚动/全屏布局冲突。
+  - 建议：先做 A 的 Esc/Tab/方向键子集（无 modifier 粘滞），验证布局与 IME 共存后，再决定 Ctrl 的实现（A 粘滞 or B 注入）。回归点：ensureWebViewFocus、IME inset margin、Trust 提示对话框不被遮挡。
 
 ### 长期
 
