@@ -1,9 +1,11 @@
-# AMCode 交接与开发维护文档
+# AMCode 交接与运维开发文档
 
-> 交接日期：2026-10-24（Asia/Shanghai）  
-> 当前代码基线：`ef2b56c`（本地 `main`；代码 commit 4 个尚未 push，本文档为 docs-only 追加）  
-> 工作区：`D:\Code\code-server\vsboxed`  
-> 远程：`https://github.com/whn-hjm/AMCode.git`  
+> **本文档双重用途：① 项目交接；② 日常运维与开发手册。每次改动项目后必须更新本文档（尤其是 §11 变更记录与 §6/§7）。**
+>
+> 最近更新：2026-10-25 上午（Asia/Shanghai）
+> 代码基线：`c229683`（本地 `main`，领先 origin 9 个 commit；v1.1.0 / versionCode 2）
+> 工作区：`D:\Code\code-server\vsboxed`
+> 远程：`https://github.com/whn-hjm/AMCode.git`
 > 适用对象：zcode / 后续维护者
 
 ---
@@ -11,17 +13,20 @@
 ## 0. 给接手模型的提示词（简短版）
 
 ```text
-你是 AMCode 的接手开发者。工作区：D:\Code\code-server\vsboxed，代码基线 ef2b56c（4 个代码 commit 未 push，另有交接文档 docs commit）。
+你是 AMCode 的接手开发者。工作区：D:\Code\code-server\vsboxed，代码基线 c229683（v1.1.0）。
+本地 main 领先 origin/main 多个 commit（含 2026-10-24/25 的六批修复），push 前不需要再处理 keystore（签名已走 gitignored keystore.properties，jks 从未入库）。
 
-先完整阅读 AMCODE_HANDOVER.md（本文件），再读 AMCODE_FIXES_2026-10-24.md 和 AMCODE_NEXT_BATCH_PLAN.md。不要重新审计/重做已经修好的 pkg、internal HOME、auth、offline dpkg；只从“未完成任务”里按优先级做增量。
+先完整阅读 AMCODE_HANDOVER.md（本文件，交接+运维双用途）。历史审计见 AMCODE_REVIEW_2026-10-24.md（旧基线，很多问题已修）；本轮评审结论已并入本文件 §10。
+不要重做已修项（pkg/keyring/internal HOME/auth/并发修复等）；只从 §7 任务池按优先级做增量。
 
-约束：
-- 只保留平板 emulator-5558（API34，1600×1200，4:3）；API28 是 headless 5560，测试时才开；不要启动手机 AVD AMCode_Pixel6_API34 / 5556。
-- 不要清 5558 的 app 数据；需要 fresh 测试时先说明并用 offline bundle。
-- 构建默认 APK 与 offline bundle 时注意 Gradle 会清理 build/outputs 里的额外文件，成品要复制到 D:\ 保存。
-- 改代码前先 git status；每次构建后更新 AMCODE_HANDOVER.md 的时间线/验证状态。
+环境约束：
+- 平板 emulator-5558（API34，1600×1200）是主测试机：不要清它的 app 数据。
+- API28 headless 5560（C 盘 AVD）、API29 5570 / API26 5572（D:\avds，ANDROID_AVD_HOME=D:/avds 启动）用于 fresh/回归；5556 手机 AVD 不要启动。
+- C 盘只剩 ~11G：新 AVD/镜像一律放 D 盘（SDK 本身在 D:\Android\Sdk）。
+- Gradle 会清理 build/outputs 额外文件，成品 APK 构建后立即复制到 D:\。
+- 改代码前 git status；每次构建后更新本文件 §11；不要提交 review-assets/。
 
-下一优先级：release fresh 安装回归 → internal workspace Trust 一键提示 → API 26/29 回归 → watcherExclude → README/ARCHITECTURE 更新 → versionCode bump + push。
+下一优先级（详见 §7）：单 ABI bootstrap 减包 → push + GitHub Release（双 APK）→ P2/P3 池。
 ```
 
 ---
@@ -32,9 +37,10 @@ AMCode（包名 `com.devbox`，仓库目录名 `vsboxed`）把 **Termux 原生�
 
 - 包名必须正好 10 字符：`com.devbox` 与 `com.termux` 等长，bootstrap 二进制/脚本里的路径按同长度替换。
 - `minSdk=26`，`targetSdk=28`（刻意保留，targetSdk 29+ 会触发 W^X，不能从 app data 执行二进制）。
-- `compileSdk=34`，AGP 8.4.0，Gradle 8.7，JDK 21。
-- code-server **4.143.1**（TUR 包），Node **24.18.0**，bootstrap 来自 Termux `bootstrap-2026.08.02-r1+apt.android-7`。
-- 版本：`versionName=1.0.0`，`versionCode=1`（尚未 bump）。
+- `compileSdk=34`，AGP 8.4.0，Gradle 8.7（wrapper 带 distributionSha256Sum），JDK 21。
+- code-server **4.143.1**（TUR），Node **24.18.0**，bootstrap 来自 Termux `bootstrap-2026.08.02-r1+apt.android-7`（双 ABI，构建期下载并 SHA-256 校验）。
+- 版本：`versionName=1.1.0`，`versionCode=2`。
+- 仅支持 64 位（arm64-v8a 真机 / x86_64 模拟器）；32 位 ARM 会拿到无法执行的 aarch64 bootstrap（§6.7）。
 
 ---
 
@@ -42,47 +48,57 @@ AMCode（包名 `com.devbox`，仓库目录名 `vsboxed`）把 **Termux 原生�
 
 ```text
 MainActivity
-  ├─ HomePrefs（internal / external / 迁移提示）
-  ├─ 存储权限（API30+ MANAGE_EXTERNAL_STORAGE / API26-29 READ+WRITE）
-  ├─ CodeServerService（前台服务，初始化/健康检查/stop）
+  ├─ 无 WebView 设备探测（AOSP 镜像缺 WebView → 明确报错对话框）
+  ├─ HomePrefs（internal 默认 / external 迁移 / 双向切换 / ~/storage/shared）
+  ├─ 存储权限（API30+ MANAGE / API26-29 READ+WRITE，仅按需请求）
+  ├─ CodeServerService（前台服务，初始化/健康检查/stop/重启）
+  ├─ 文件选择器（onShowFileChooser → SAF，供扩展上传/VS Code webview）
   └─ WebView
         ├─ http://127.0.0.1:<动态端口>/?folder=<HOME>
-        ├─ CookieManager 注入 code-server-session
+        ├─ CookieManager 注入 HttpOnly code-server-session
         ├─ focus/IME inset/JS focus shim
-        └─ Trust/Restricted Mode 提示
+        ├─ 内部 HOME 首次加载 → 一次性 Trust 提示（不自动信任）
+        └─ URL 白名单：本机 host:port + about: + http/https/mailto/tel
 
-CodeServerService
-  ├─ TermuxManager.initialize()
-  │    ├─ bootstrap 解压 / SYMLINKS / keyring / TUR key
-  │    ├─ pkg/dpkg wrapper / dpkg DB 迁移
-  │    ├─ ensureLibCpp30()
-  │    ├─ ensurePkgSetup()：marker 快路径 / full repair
-  │    └─ 在线 apt 或 offline bundle 安装 code-server/node
-  └─ CodeServerLauncher
-       ├─ 127.0.0.1 + ServerSocket(0) 动态端口
-       ├─ 随机 token → SHA-256 → cache/run/code-server.yaml (0600)
-       ├─ --auth password --config ...
-       ├─ POST /login + /mint-key 验证，cookie 交给 Activity
-       ├─ PID 文件 + 旧进程清理 / 进程树 kill
-       ├─ ripgrep symlink 修复
-       └─ android-as-linux.js + execArgv shim
+CodeServerService（单飞 initJob + 管线所有权检查）
+  ├─ ACTION_RESTART：取消旧管线（join ≤15s）→ 新管线
+  ├─ 失败清理只由"当前拥有者"执行（被取代的管线失败不再拆服务）
+  └─ 健康检查 10s / 最多重启 10 次（进度通知节流 2/s）
+
+CodeServerLauncher
+  ├─ TermuxManager.initialize()（Mutex 串行化）
+  │    ├─ bootstrap 原子拷出（tmp+长度校验，失败自删，成功后删缓存）
+  │    ├─ ensurePkgSetup()：marker 快路径 / full repair（含 dpkg --configure -a 自愈）
+  │    ├─ offline bundle：staged deb 失败即清理；archives 按包名去重取最新
+  │    └─ 在线 apt（镜像测速要求 HTTP 200）或 8 连接 Range 下载
+  └─ code-server 进程
+       ├─ 127.0.0.1 + ServerSocket(0) 动态端口（分配失败即失败，不回退 8080）
+       ├─ 随机 token → SHA-256 → cache/run/code-server.yaml（0600，唯一 tmp 名）
+       ├─ --auth password --config ...；POST /login + /mint-key 验证
+       ├─ 取消/失败只 abort 本管线进程（不全局 stop 误杀新管线）
+       ├─ 认证后再 checkpoint 才发布 RUNNING/会话
+       ├─ PID 文件（pid/starttime/port）+ cmdline 特征校验的孤儿清理
+       ├─ ripgrep symlink 修复 + android-as-linux execArgv 注入
+       └─ 启动前种子 files.watcherExclude（不覆盖用户 settings）
 ```
 
 ### 关键文件
 
 | 文件 | 作用 |
 |---|---|
-| `App.kt` | `HomePrefs`：HOME 模式、internal/external 迁移、`~/storage/shared` 链接 |
-| `TermuxManager.kt` | bootstrap、pkg/apt/dpkg、keyring、SYMLINKS、libc++30、启动 marker、offline bundle 安装 |
-| `CodeServerService.kt` | 前台服务、单次 init、健康检查、stop/onTaskRemoved |
-| `CodeServerLauncher.kt` | code-server 进程、动态端口、auth、PID/孤儿清理、ripgrep/shim |
-| `MainActivity.kt` | 启动状态机、存储、WebView、auth cookie、focus/IME、Trust/Storage UI |
+| `App.kt` | `HomePrefs`：HOME 模式、迁移、`~/storage/shared` 链接；崩溃日志 |
+| `TermuxManager.kt` | bootstrap、pkg/apt/dpkg、keyring、SYMLINKS、offline bundle、marker 快路径、Range 下载 |
+| `CodeServerService.kt` | 前台服务、单飞 initJob、管线所有权、健康检查、通知 |
+| `CodeServerLauncher.kt` | code-server 进程、auth、PID/孤儿清理、ripgrep/shim、用户设置种子 |
+| `MainActivity.kt` | 启动状态机、存储/通知权限、WebView、auth cookie、focus/IME、Trust/Storage UI、文件选择器 |
 | `WebViewInterface.kt` | 已不再注册 JS bridge；保留但不要重新暴露 |
-| `AndroidManifest.xml` | `requestLegacyExternalStorage`、`stopWithTask`、service/notification |
+| `AndroidManifest.xml` | `requestLegacyExternalStorage`、`stopWithTask`、backup/dataExtraction 规则 |
 | `assets/amcode-dpkg-wrapper.sh` | apt 调 dpkg 时改写 `.deb` 的 com.termux/com.devbox 路径 |
-| `assets/amcode-pkg-setup.sh` | keyring/SYMLINKS/pkg/dpkg DB 修复 |
+| `assets/amcode-pkg-setup.sh` | keyring/SYMLINKS/pkg/dpkg DB 修复 + wrapper tmp 残留清理 |
 | `assets/tur.gpg` | TUR 公钥 |
 | `assets/android-as-linux.js` | platform shim，execArgv 注入 |
+| `app/keystore.properties` | **gitignored** release 签名（缺失→unsigned；残缺→构建失败） |
+| `.github/workflows/android.yml` | CI：debug + lint + unsigned release |
 
 ---
 
@@ -92,276 +108,264 @@ CodeServerService
 
 | 时间 | 事件 |
 |---|---|
-| 2026-08-06 | 项目起步：确定 Termux + bionic + code-server + WebView 架构，不 proot、不 Flutter |
-| 2026-08-07 22:00 | `58e78b1` AMCode v1.0 - VS Code on Android |
-| 2026-08-07 22:09 | `6d3a6d1` release signing + lint suppression + release APK |
-| 2026-08-07 22:38–23:37 | `396d441`/`3fcdbd7`/`88f0024`/`95b4095`/`65eb900`/`fc57544`/`d2da84e`：seccomp/GPG 过滤、retry、镜像测速、README、ARCHITECTURE/DEVELOPMENT |
-| 2026-08-08 11:41–12:53 | `e817253`/`736a470`：NODE_OPTIONS、LD_PRELOAD platform 实验 |
-| 2026-08-08 15:12–15:31 | `13c0f0f` 回退 VHEditor 原生实验；`d0349a8` mirrors 排除；`2d9b486` termux-keyring 修复 |
+| 2026-08-06 | 项目起步：Termux + bionic + code-server + WebView 架构 |
+| 2026-08-07/08 | v1.0 发布、release 签名、seccomp/GPG 过滤、镜像测速、README/ARCHITECTURE、NODE_OPTIONS/LD_PRELOAD 实验及回滚 |
 
-### 3.2 本次审计与三轮修复（2026-10-24）
+### 3.2 审计与三轮修复（2026-10-24）
 
 | 时间 | 事件 |
 |---|---|
-| 2026-10-24 白天 | 全量审计：Android 层、Termux/apt、上游对照、构建层 4 个子代理；产出 `AMCODE_REVIEW_2026-10-24.md` |
-| 21:15 | 横屏平板 AVD `AMCode_Tablet_API34` + `run-emulator.bat`；手机 AVD 停用 |
-| 21:57 | `6f44555` 第一轮：pkg/keyring/TUR key、dpkg wrapper、启动单次化/完成 marker、Service/WebView 安全、存储权限、动态端口 |
-| 22:34 | `a9971e9` 第二轮：WebView focus/IME、ripgrep、android-as-linux shim、libc++30、TUR 并行 Range、offline bundle |
-| 22:40 | `1abedd7` 文档：第二轮验证 |
-| 23:44 | `ef2b56c` 第三轮：internal HOME + `~/storage/shared`、auth token/cookie、PID/孤儿清理、Trust 提示、`ensurePkgSetup` 快路径、offline dpkg 修复 |
-| 23:50 | 本文档；双 APK 产出；API28 headless 测试完成并关闭 |
+| 白天 | 全量审计（4 子代理）→ `AMCODE_REVIEW_2026-10-24.md` |
+| 21:57 | `6f44555` 第一轮：pkg/keyring/dpkg wrapper/启动单次化/安全/动态端口 |
+| 22:34 | `a9971e9` 第二轮：focus/IME、ripgrep、shim、libc++30、offline bundle |
+| 23:44 | `ef2b56c` 第三轮：internal HOME、auth token、PID 清理、快路径、offline dpkg |
+| 23:50 | `eb52968`/`fb2b154` 交接文档 + 路线图 |
 
-> 注意：`main` 当前有 **4 个代码 commit 尚未 push**（`6f44555`、`a9971e9`、`1abedd7`、`ef2b56c`），另有本文档 docs commit。push 前先处理 release keystore/密码。
+### 3.3 深夜评审 + 六批修复（2026-10-24 深夜 ~ 10-25 上午）
 
----
-
-## 4. 当前已验证行为（基线）
-
-### 4.1 安装与 pkg
-
-- `pkg install clang` / `hello` / `tree` 可安装；`dpkg --audit` 空（仅 `.dpkg.cfg` 权限 warning）。
-- TUR/main 仓库均为签名源；TUR key `6A5C550C260667D1`，main key `5A897D96E57CF20C`。
-- dpkg wrapper 会把 `.deb` 的 `data/data/com.termux` 改写为 `data/data/com.devbox`，并处理文本/ELF/symlink。
-- 第一轮修复后，`pkg install clang` 的 NO_PUBKEY / dpkg prefix 问题已关闭。
-
-### 4.2 启动
-
-- 首次 fresh offline：`ensurePkgSetup full repair done in 21971ms ... marker written`（含 19 包 postinst）。
-- 后续启动：`ensurePkgSetup fast path ... in 122ms`。
-- 启动链路：internal HOME → code-server auth → WebView cookie → page loaded；不再双初始化。
-- `ensureLibCpp30()` 已把 libc++ 29 升到 30；spdlog/@parcel/watcher 错误消失。
-
-### 4.3 存储
-
-- 新安装默认 `HOME=/data/user/0/com.devbox/files/home`。
-- `~/storage/shared -> /storage/emulated/0`；`/sdcard/AMCode` 原文件不搬不删。
-- 已有 `home_mode=external` 升级会弹一次迁移对话框（Switch/Keep），不自动移动文件。
-- `/storage/emulated` 是 FUSE `noexec`；外部工作区只适合作为共享目录，不适合执行脚本/Git 二进制。
-- API28 grant/deny/internal fallback 已通过；API28 fresh 也能到 code-server。
-
-### 4.4 auth
-
-- code-server 启动参数：`--auth password --config cache/run/code-server.yaml --bind-addr 127.0.0.1:<port>`。
-- 每次启动随机 32 字节 token；配置里只存 SHA-256 hex（0600）；不写 argv/env，不打印明文。
-- 未认证：`GET / -> 302 ./login`，`POST /mint-key -> 401`，WebSocket upgrade -> 401。
-- 正确 cookie：`/mint-key -> 200`；WebView 在首次导航前注入 `code-server-session`，无登录页。
-- 使用 SHA-256 hashed-password 的原因：明文 password 的 argon2 每请求约 130–160ms，SHA-256 约 3–6ms；4.143.1 支持该 legacy config 路径。
-
-### 4.5 focus / IME
-
-- 根因：启动日志 `terminal_output` TextView 抢走 Android focus/IME served view；`showSoftInput()` 被系统丢弃。
-- 修复：overlay 子树不可聚焦；WebView `focusableInTouchMode`；`ensureWebViewFocus()`；IME bottom inset 转为 WebView bottom margin；JS focus shim。
-- 实测：终端/扩展搜索一次点击 `mInputShown=true`，WebView `0,0-1600,551`；Back 恢复 1200。
-
-### 4.6 扩展
-
-- 13 个 `@vscode/ripgrep-universal/bin/*/rg` 全部重链到 `$PREFIX/bin/rg`；`rg 15.2.0`。
-- `android-as-linux.js` 默认启用；主进程把 `--require` 追加到 `process.execArgv`，扩展宿主看到 linux；fileWatcher/ptyHost/terminal 保持 android。
-- 纯 JS 扩展/语言包可安装激活；glibc native 扩展仍不可用。
-- Kill switch：`$HOME/.amcode/disable-platform-shim` 或 `AMCODE_ANDROID_PLATFORM_SHIM=0`。
-
-### 4.7 孤儿进程
-
-- PID 文件：`files/run/code-server.pid`（pid/starttime/port/bin，0600）。
-- 启动前按 PID + `/proc/<pid>/cmdline` 特征清理旧 code-server；Stop 发 SIGTERM→SIGKILL 进程树；`stopWithTask=true`。
-- force-stop 后下次启动会清理旧进程；划任务会停 server（no-orphan 的行为代价）。
-
-### 4.8 双 APK
-
-| 产物 | 大小 | 用途 |
+| 时间 | commit | 内容 |
 |---|---|---|
-| `D:\amcode-release-online.apk` / `app/build/outputs/apk/release/app-release.apk` | 64.52MB | 在线版，首次下载 code-server/node |
-| `D:\amcode-release-offline-arm64.apk` | 185.70MB | arm64 离线版，包含 code-server/node，首次只拉主镜像小依赖 |
-| `D:\amcode-debug-online.apk` / `app/build/outputs/apk/debug/app-debug.apk` | 68.78MB | debug 在线，当前 5558 已安装 |
-| `D:\amcode-debug-offline-x86_64.apk` | 189.62MB | x86_64 debug，offline 测试用 |
+| 10-25 00:2x | `dc572f9` | 批次1-3：v1.1.0、Trust 提示、双向切换 UI、watcherExclude、keystore 外置、安装管线加固（unpack 硬门+半配置自愈、bootstrap 原子化、镜像测速 HTTP 200、offline 清理/去重、opt/share/include 改写、libc++ marker）、双 ABI bootstrap 下载+SHA256、dataExtractionRules |
+| 10-25 02:0x | `5cd3ded` | 批次4-5：文件选择器、about:blank、三方 cookie 关、bindService 配对、configChanges 补齐、applyExternalHome 顺序、Restart join 超时、wrapper sha、依赖清理、R8 收紧（release -3.9MB）、死文件删除 |
+| 10-25 02:4x | `c229683` | 批次6+docs：管线并发正确性（所有权检查/abort 本进程/auth 后 checkpoint/Mutex 串行/唯一 tmp/pid 校验/通知节流/脱敏）、无 WebView 设备处理、README/ARCHITECTURE 重写、CI |
 
-offline arm64 APK 已确认包含：
-
-```text
-assets/offline-debs/aarch64/code-server_4.143.1_aarch64.deb
-assets/offline-debs/aarch64/nodejs-24_24.18.0_aarch64.deb
-assets/offline-debs/aarch64/manifest.json
-```
-
-在线 release 不含 `offline-debs`。
+**评审方式**：5 个评审子代理（Termux 层 / Android UI 层 / 启动器与服务层 / 构建发布层 / 文档一致性）+ 主 agent 全量读码；发现汇总见 §10。
 
 ---
 
-## 5. 构建与运行
+## 4. 当前已验证行为（基线 c229683）
+
+### 4.1 全 API 级别回归（2026-10-25，offline x86_64 debug v1.1.0）
+
+| 设备 | 场景 | 结果 |
+|---|---|---|
+| 5558 平板 API34 | 覆盖安装（数据保留） | full repair 一次（asset 变化触发）→ marker 重写 → 二次启动快路径 102ms → 页面加载 ✓ |
+| 5560 API28 release | **fresh 安装 offline release** | 30s 到页面；dpkg exit=0 clean；auth 302/401/200 ✓；非 loopback 拒绝 ✓ |
+| 5560 API28 release | R8 收紧后 release 覆盖 | 快路径 33ms + 页面加载 ✓（无反射断裂） |
+| 5570 API29 | fresh + 权限流 | fresh 30s ✓；切 external 拒绝路径（返回键）→ 保持 internal ✓；pm grant 后切换 → external HOME 生效 ✓；切回 ✓ |
+| 5572 API26 (google_apis) | fresh + 权限流 | fresh ~60s ✓（AOSP 镜像无 WebView，见 §6.12）；grant 后双向切换 ✓ |
+
+### 4.2 安装与 pkg
+
+- offline bundle：`[dpkg] exit=0 (unpack=0 configure=0 audit=clean; 19 packages)`，不访问 TUR，仅主镜像 ~18MB 依赖。
+- 镜像测速：三镜像取 HTTP 200 中最快（实测 USTC 193ms）。
+- marker：full repair 8-12.5s（首装后）／快路径 32-130ms。
+- dpkg wrapper 改写 `.deb` 前缀；`pkg install` 正常（debug 构建实测 hello/tree/clang；release 上 pkg 因 run-as/su 限制未直测，运行时管线与 debug 相同）。
+- 半配置状态（`Status: install ok unpacked`/half-*）会被启动健康检查发现并由 `dpkg --configure -a` 自愈。
+
+### 4.3 启动 / 安全
+
+- 启动链：internal HOME → 动态端口 → auth(password+SHA-256) → cookie 注入 → `?folder=` 页面加载。
+- 未认证：`GET /` → 302 login；`POST /mint-key` → 401；`/healthz` → 200；非 loopback 地址拒绝连接。
+- token/SHA-256/cookie 三重 stdout 脱敏；PID 文件 + cmdline+starttime 校验清理；SIGKILL 前重验 cmdline。
+- release：WebView 调试按 FLAG_DEBUGGABLE 关闭（在 setContentView 之前设置）。
+
+### 4.4 存储与 Trust
+
+- 新装默认 internal HOME，首启零权限弹窗；`~/storage/shared` 链接自动创建。
+- Storage 通知 action：internal ↔ `/sdcard/AMCode` 双向切换（带 noexec 警告），文件永不移动；API26/29 拒绝/授权路径实测。
+- internal 首次页面加载弹一次性 Trust 提示（标记在对话框实际显示后才写入）。
+
+---
+
+## 5. 构建与运行（运维手册·上）
 
 ### 5.1 环境
 
-- Windows + PowerShell，JDK 21
-- Android SDK：`D:\Android\Sdk`
-- Gradle wrapper：仓库自带 `gradlew.bat`（Gradle 8.7）
-- AVD：
-  - `AMCode_Tablet_API34`（可见平板，端口 5558，1600×1200，4:3；当前唯一运行）
-  - `AMCode_Tablet_API28`（headless，端口 5560；API28 测试用，当前已关闭）
-  - `AMCode_Pixel6_API34`（旧手机 AVD；**不要启动**）
-- AVD 默认位于 `C:\Users\15495\.android\avd\`，data 配置各 8GB，实际占用按快照增长；C 盘空间紧张时优先清理不用的 AVD/快照。
+- Windows + JDK 21；Android SDK：`D:\Android\Sdk`；仓库自带 `gradlew.bat`。
+- **release 签名**：读 `app/keystore.properties`（gitignored，本机已存在）或 `AMCODE_STORE_FILE/AMCODE_STORE_PASSWORD/AMCODE_KEY_ALIAS/AMCODE_KEY_PASSWORD` 环境变量。两者皆无 → unsigned release；keystore.properties 残缺 → 构建报错（防呆）。
+- bootstrap 双 ABI zip 构建期自动下载（github/ghproxy/gh-proxy 三源）+ SHA-256 校验，缺失即构建失败。
 
 ### 5.2 构建命令
 
-```powershell
-# 默认在线 debug
-.\gradlew.bat clean :app:assembleDebug
+```bash
+# 默认在线 debug（通用：双 ABI bootstrap）
+./gradlew.bat clean :app:assembleDebug
 
-# 默认在线 release
-.\gradlew.bat :app:assembleRelease
+# 默认在线 release（本机自动签名；通用 64MB）
+./gradlew.bat :app:assembleRelease
 
-# x86_64 offline debug（模拟器测试）
-.\gradlew.bat :app:assembleDebug `
-  -PofflineBundle=true -PofflineBundleArch=x86_64 `
-  -PofflineBundleSourceDir=D:\amcode-debs
+# x86_64 offline debug（模拟器回归用；单架构）
+./gradlew.bat :app:assembleDebug -PofflineBundle=true -PofflineBundleArch=x86_64 \
+  -PofflineBundleSourceDir=D:/amcode-debs -PbootstrapArch=x86_64
 
-# arm64 offline release（手机发布）
-.\gradlew.bat :app:assembleRelease `
-  -PofflineBundle=true -PofflineBundleArch=aarch64 `
-  -PofflineBundleSourceDir=D:\amcode-debs-arm64
+# arm64 offline release（发布用，单架构 161.8MB）
+./gradlew.bat :app:assembleRelease -PofflineBundle=true -PofflineBundleArch=aarch64 \
+  -PofflineBundleSourceDir=D:/amcode-debs-arm64 -PbootstrapArch=aarch64
 ```
 
-**重要构建坑**：
+**bootstrap 资产机制（2026-10-25 起）**：zip 缓存在仓库根 `bootstrap-cache/`（gitignored），构建时按 `-PbootstrapArch`（空=双 ABI）staged 到 generated assets；缺省下载（github/ghproxy/gh-proxy 三源）+ SHA-256 固定校验，缺失构建失败。**不要再往 `app/src/main/assets` 放 zip。**
 
-- Gradle 构建会清理/覆盖 `app/build/outputs` 里的额外 APK。offline release 构建后如果还要构建 online release，先把 offline APK 复制到 `D:\` 或 repo 外，否则 `app-release-offline-arm64.apk` 会消失。
-- 默认构建不会带 offline assets；如果从 offline 构建切回默认，建议 `clean`，并检查 APK 内没有 `offline-debs`。
-- offline debs 目录：`D:\amcode-debs`（x86_64）、`D:\amcode-debs-arm64`（aarch64）。
-- 构建机 TUR 慢时可用代理先下载两个 deb，再用 `-PofflineBundleSourceDir`；Gradle 会做 SHA256 校验。
-- `app-release-offline-arm64.apk` 的 `app-release.jks` 和密码目前都在仓库/构建脚本中；**公开分发前必须轮换 keystore 并把密码移出仓库**。
+**构建坑**（不变）：
+- offline ↔ 默认构建切换建议 `clean`，并检查 APK 内 offline-debs 有无；成品立即复制到 `D:\`。
+- 离线 deb 源：`D:\amcode-debs`（x86_64）、`D:\amcode-debs-arm64`（aarch64）。
+- CI（GitHub Actions，`.github/workflows/android.yml`）：debug+lint+unsigned release，bootstrap 缓存。
 
-### 5.3 启动模拟器
+### 5.3 AVD 清单
 
-```powershell
-# 可见平板
-D:\Android\Sdk\emulator\emulator.exe -avd AMCode_Tablet_API34 `
-  -gpu auto -no-audio -port 5558
+| AVD | 端口 | 用途 | 位置 |
+|---|---|---|---|
+| `AMCode_Tablet_API34` | 5558 | 主测试平板（**勿清数据**） | C 盘默认 |
+| `AMCode_Tablet_API28` | 5560 | API28 headless 回归 | C 盘默认 |
+| `AMCode_API29` | 5570 | API29 回归 | `D:\avds` |
+| `AMCode_API26` | 5572 | API26 回归（**必须 google_apis**，default 镜像无 WebView） | `D:\avds` |
+| `AMCode_Pixel6_API34` | 5556 | **不要启动** | C 盘 |
 
-# API28 headless（测试时才开）
-D:\Android\Sdk\emulator\emulator.exe -avd AMCode_Tablet_API28 `
-  -port 5560 -no-window -no-audio -no-snapshot -no-boot-anim `
-  -gpu swiftshader_indirect
-```
+5570/5572 启动方式：`ANDROID_AVD_HOME=D:/avds emulator -avd AMCode_API29 -port 5570 -no-window -no-audio -no-snapshot -no-boot-anim -gpu swiftshader_indirect`
 
-`run-emulator.bat` 默认启动 5558 平板。桌面快捷方式 `AMCode Android Emulator` 指向它。
-
-### 5.4 安装 / 日志
-
-```powershell
-$adb = "D:\Android\Sdk\platform-tools\adb.exe"
-& $adb -s emulator-5558 install -r app\build\outputs\apk\debug\app-debug.apk
-& $adb -s emulator-5558 shell pm grant com.devbox android.permission.POST_NOTIFICATIONS
-& $adb -s emulator-5558 shell appops set com.devbox MANAGE_EXTERNAL_STORAGE allow
-& $adb -s emulator-5558 logcat -s TermuxManager:I CodeServerLauncher:I CodeServerService:I MainActivity:I
-```
-
-### 5.5 关键验证
-
-```powershell
-# 启动快路径
-adb -s emulator-5558 logcat -d -s TermuxManager:I |
-  Select-String 'ensurePkgSetup (fast path|full repair)'
-
-# auth：从 pid 文件拿端口，从 yaml 拿 hash
-adb -s emulator-5558 shell run-as com.devbox cat files/run/code-server.pid
-adb -s emulator-5558 shell run-as com.devbox cat cache/run/code-server.yaml
-adb -s emulator-5558 forward tcp:<PORT> tcp:<PORT>
-curl.exe -i http://127.0.0.1:<PORT>/                    # 302 ./login
-curl.exe -i -X POST http://127.0.0.1:<PORT>/mint-key   # 401
-# 带 Cookie: code-server-session=<hash> 再请求 -> 200
-```
+### 5.4 常用验证命令
 
 ```bash
-# pkg / db / rg
-PREFIX=/data/user/0/com.devbox/files/usr
-export PATH=$PREFIX/bin:/system/bin HOME=/data/user/0/com.devbox/files/home
-pkg install -y hello
-dpkg --audit
-dpkg-query -W code-server nodejs-24
-rg --version
+ADB="D:/Android/Sdk/platform-tools/adb.exe"
+$ADB -s emulator-5558 install -r app/build/outputs/apk/debug/app-debug.apk
+$ADB -s emulator-5558 logcat -s TermuxManager:I CodeServerLauncher:I CodeServerService:I MainActivity:I HomePrefs:I
+# 快路径检查
+$ADB -s emulator-5558 logcat -d -s TermuxManager:I | grep -E 'ensurePkgSetup (fast path|full repair)'
+# auth（debug 构建 run-as 可用；release 用 logcat 里的端口）
+$ADB -s emulator-5558 shell run-as com.devbox cat files/run/code-server.pid
+$ADB -s emulator-5558 forward tcp:<PORT> tcp:<PORT>
+curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' http://127.0.0.1:<PORT>/   # 302 login
+# 触发存储对话框：am start -n com.devbox/.MainActivity -a com.devbox.action.OPEN_HOME_SETTINGS
 ```
 
 ---
 
-## 6. 已知问题与边界（接手先看）
+## 6. 已知问题与边界（接手先看；已修项已移除，见 §10/§11）
 
-1. **internal workspace 仍显示 VS Code Restricted Mode banner**：首次需要点 Trust，用户扩展才启用。当前按“提示、不自动信任”的产品决定保留；如果要改善，可加一次 App 级 Trust 引导或对 app-owned internal HOME 做受控预信任。
-2. **API28 `py3compile Bad system call`**：python postinst 的 py3compile 在 API28 seccomp 下失败，但 `dpkg exit=0`、`dpkg --audit` 空、code-server 正常；Python 字节码预编译可能不完整。
-3. **旧安装的 code-server/node 不会自动补登记到新 dpkg DB**：旧流程丢弃过嵌套 DB；fresh/offline 安装已正确登记。需要的话可做一次性重装/登记迁移。
-4. **没有“切回 external”UI**：existing external 保留；Storage action 提供切 internal/授权共享存储，但没有反向切换。
-5. **`versionCode=1`**：正式发版必须 bump；release 尚未 fresh 安装做 UI 回归（debug 已完整验证）。
-6. **默认在线 TUR 仍慢**：TUR 没有可用镜像，8 连接 Range 受 GitHub 限速；offline 版才是无 TUR 方案（185MB）。
-7. **auth 使用 SHA-256 hashed-password**：code-server 4.143.1 的 legacy 路径；未来升级 code-server 必须重新验证登录/cookie。
-8. **glibc native 扩展仍不可用**：bionic 无 libstdc++.so.6/glibc；纯 JS/语言包可用。要完整原生扩展需 proot/glibc（CodeFA 路线）或 VHEditor 式 patched code-server。
-9. **`~/storage/shared` watcher**：链接在 workspace 根下，VS Code file watcher 可能跟随；建议加 `files.watcherExclude`。
-10. **release keystore/密码在仓库中**：公开前轮换/移出；`amcode-release.jks` 仍在 `app/`。
-11. **README/ARCHITECTURE 已过时**：README 仍写首次 236MB/默认 `/sdcard/AMCode`；ARCHITECTURE 仍写 localhost:8080/无 auth。需要更新。
-12. **`AMCODE_REVIEW`/`AMCODE_NEXT_BATCH_PLAN`/`review-assets`**：review assets 是本地证据，未全部 commit；接手时直接读 workspace 文件。
-13. **未 push**：本地 `main` 有 4 个代码 commit（外加本文档）未推送；推送前确认 release keystore/密码问题。
-14. **C 盘 AVD 占用**：两个 8GB data 配置的 AVD 默认在 C 盘；测试环境清理时不要误删 5558 需要的 API34 AVD。
-
----
-
-## 7. 计划了但还没完成的任务
-
-> 更完整的重任务/候选池见 [AMCODE_ROADMAP.md](AMCODE_ROADMAP.md)；本节只列已经在主线计划里的项。
-
-按优先级，均建议在现有基线上增量，不要重做已修部分。
-
-### P0/P1
-
-- [ ] **release fresh 安装回归**：用 `D:\amcode-release-online.apk` 和离线 arm64 在 fresh AVD/数据上安装，验证 release 无 WebView 调试、auth、focus、pkg、internal HOME。
-- [ ] **internal workspace Trust 一键提示**：默认 internal 首次打开时给 App 级说明/引导；保留 VS Code 自身 Trust，不自动 `--disable-workspace-trust`。
-- [ ] **versionCode bump + push**：发版前把 `versionCode` 从 1 提升；确认 keystore 安全后再 push 4 个本地 commit。
-- [ ] **API 26/29 回归**：已有 API28，补 API26/29 的 READ/WRITE、grant/deny、internal fallback、code-server 安装。
-- [ ] **README/ARCHITECTURE 更新**：internal HOME、auth、双 APK、offline 安装、API28 支持、旧文档命令。
-- [ ] **`files.watcherExclude`**：把 `**/storage/shared/**` 加入默认设置，避免 watcher 跟随 `/sdcard`。
-- [ ] **显式 external 切换 UI**：Storage action 增加“切回 /sdcard/AMCode”，并显示 FUSE/noexec 警告。
-
-### P2
-
-- [ ] **旧安装 dpkg DB 迁移**：把旧 code-server/node 补登记，或提供一次性重装；同时验证 `pkg upgrade` 后 marker 失效/全修。
-- [ ] **API28 py3compile 兼容**：评估 seccomp/`py3compile` 失败是否影响 Python 扩展；必要时在 postinst 跳过或改用 `python -m compileall`。
-- [ ] **在线 TUR 下载体验**：进度 UI、断点续传状态、失败原因展示；连接数/限速调优需真实网络测试。
-- [ ] **offline bundle 更新机制**：TUR 版本升级时更新 `build.gradle.kts` 的 pinned URL/SHA256；测试 arm64 release。
-- [ ] **auth 升级路径**：若升级 code-server，验证 hashed-password/legacy 是否仍支持，或迁移到受支持的 auth 方式。
-- [ ] **Git 安装/扩展体验**：`git` 未安装，Git 相关扩展会报 not found；可把 git 加入初始/推荐安装。
-- [ ] **`~/storage/shared` 权限流程**：无 MANAGE 时首次打开共享目录的请求/拒绝/重试 UI 完整回归。
-- [ ] **release 签名安全**：轮换 keystore、移出密码、更新 CI/构建说明。
-
-### 长期/架构级
-
-- [ ] **glibc native 扩展**：proot/glibc 用户态（CodeFA）或 VHEditor 式 patched code-server；不是小修。
-- [ ] **Microsoft Marketplace**：当前只支持 Open VSX/VSIX，不要承诺官方 Marketplace。
-- [ ] **UI/UX**：mobile keyboard toolbar、layout、virtual mouse 等。
-- [ ] **CI**：目前无 CI；至少加 build + lint + 双 APK 构建。
+1. **单 APK 内嵌双 ABI bootstrap（~61MB / 占 APK 95%）**：assets 不受 abi split 影响，arm64 真机也带着 x86_64 zip。per-ABI flavor/-P 参数可把单架构 APK 降到 ~33MB。这是发布前最值得做的减包项。
+2. **pkg-setup 修复脚本不持 dpkg lock**：full repair 的 sed 改写与"上次会话残留终端里正在跑的 apt/dpkg"存在竞态窗口（marker 失效 + 恰逢终端 apt 时触发；后果是 DB 改写丢失，下次启动自愈）。
+3. **Range 下载跨运行续传的段布局漂移**：part 文件按 index 命名，两次启动间仓库版本变化时旧 part 可能被误当作新布局前缀；apt 提供 SHA-256 时兜底（损失效率），无 hash 的源可能装坏 deb（当前 TUR/主仓都提供 hash）。
+4. **健康检查重启路径未完全走 initJob 单飞通道**：重启循环直接调 prepareAndStart（现有 generation/abort 防护已消除跨管线误杀，但两条路径理论上仍可并存短暂时间）。
+5. **API28 `py3compile Bad system call`**：seccomp 下 python postinst 部分失败；dpkg exit=0/audit clean、code-server 正常，configure -a 自愈机制覆盖；Python 字节码可能不完整。
+6. **旧安装的 code-server/node 未补登记 dpkg DB**（早于 marker 机制的安装）；fresh/offline 已正确登记。
+7. **32 位 ARM 不支持**：`bootstrapAsset()` 对 armeabi-v7a 落到 aarch64 zip，装得上跑不起来且报错含糊。应显式 fail-fast 或文档声明。
+8. **多用户/work profile 路径视图**：dpkg DB 与 shell 脚本用 `/data/data/com.devbox` 字面路径，secondary user（`/data/user/10/...`）下 DB 记录与实际路径不一致（可运行，`dpkg -V` 错位）。声明不支持即可。
+9. **i18n 双轨制**：新 UI 全部走 `isChinese()` 硬编码双语，strings.xml/服务端消息仍仅英文；非中英文 locale 全英文。
+10. **mint-key 探测的潜在副作用**：每次启动 POST /mint-key 可能铸造并遗留一个 API key（未验证 4.143.1 语义；若确认有副作用，换无副作用需认证端点）。
+11. **glibc native 扩展不可用**（bionic 限制）：纯 JS/语言包可用；完整兼容需 proot/glibc（CodeFA 路线）或 VHEditor 式 patched code-server——见 AMCODE_ROADMAP.md。
+12. **AOSP 无 WebView 的设备**：现已给出明确报错对话框（未在真机复测；API26 AOSP 镜像实测触发该路径）。极旧 WebView 版本无版本门槛提示（P3 池）。
+13. **默认在线 TUR 仍慢**：TUR 无镜像，8 连接受 GitHub 限速；offline 版是解决方案（已实现）。
+14. **auth 使用 SHA-256 hashed-password** 是 code-server 4.143.1 legacy 路径；升级 code-server 必须重新验证。
+15. **keystore 历史**：`amcode-release.jks` 从未入库；旧密码 `amcode123` 曾随 6d3a6d1 进入 origin 历史（无 jks 文件本身，密码无用）。公开分发前轮换 keystore 仍是廉价保险（轮换=无法覆盖升级，需用户决策）。
 
 ---
 
-## 8. 维护约定
+## 7. 任务池（按优先级；做完一项更新一项；新发现随时追加）
 
-- 改代码前 `git status`；不要覆盖未跟踪的 review/截图。
-- 每次改动后：
-  1. `clean assembleDebug` / 需要时 release；
-  2. 5558 安装验证；
-  3. 更新本文件时间线和验证状态；
-  4. commit（不要提交 `review-assets`，除非明确需要）。
-- 不要启动手机 AVD；不要清 5558 数据；fresh 测试用 API28 headless 或明确说明。
-- 不要恢复 `--auth none`；不要把 token 写进 argv/env/logcat。
-- 不要用 `--root` 跑 offline dpkg；当前是 `--instdir` + configure，改动前先读 `TermuxManager` 的 dpkg 注释。
-- 不要移除 `android-as-linux.js` 的 execArgv 注入；只设 NODE_OPTIONS 不会到达扩展宿主。
-- 不要重新引入 `terminal_output` 可聚焦；会导致 IME 再次被抢。
-- 构建产物优先复制到 `D:\`，避免 Gradle 清理。
+> 本节是**活任务板**：完成打勾并写 commit 号；子代理/后续维护者从这里领任务。文件独占约定见括号。
+
+### P1（发布前）
+
+- [x] **单 ABI bootstrap 减包**：`-PbootstrapArch=<abi>`（缓存移至 `bootstrap-cache/`，staged 到 generated assets；默认仍双 ABI 通用包）。产物：online 通用 64MB；offline arm64 单架构 **161.8MB（原 194.7MB）**。（2026-10-25 主 agent）
+- [ ] **push + GitHub Release**：commit 已就绪；发布 online（通用）+ offline arm64（单架构）双 APK 及 SHA-256。CI 首跑需确认。
+- [ ] **amcode-dpkg-wrapper 与 pkg-setup 的 dpkg lock**（assets/*.sh + TermuxManager.ensurePkgSetup）
+
+### P2（子代理并行开发中，文件独占）
+
+- [ ] **[T-B]** Range 下载 part 文件按区间起点命名，消除断点续传布局漂移（TermuxManager 下载区，子代理1）
+- [ ] **[T-C]** 健康检查重启统一走 initJob 单飞通道 / launcher Mutex 串行（CodeServerService+Launcher，子代理2）
+- [ ] **[T-D1]** 旧安装 dpkg DB 补登记（code-server/node 一次性登记，TermuxManager，子代理1）
+- [ ] **[T-D2]** 32 位 ARM fail-fast（bootstrapAsset 明确报错，TermuxManager，子代理1）
+- [ ] **[T-G1]** resolv.conf 不再覆盖用户定制（TermuxManager，子代理1）
+- [ ] **[T-E1]** i18n 迁移 values-zh（MainActivity 对话框/Toast + strings.xml + values-zh，子代理3）
+- [ ] **[T-E2]** WebView 版本门槛检查（MainActivity，子代理3）
+- [ ] **[T-F]** mint-key 语义调研（读 code-server 4.143.1 源码；有副作用则换探测端点，子代理4，只读）
+- [ ] **[T-G2]** D2D dataExtractionRules 显式排除 cache 域（res/xml，主 agent 顺带）
+- [ ] `~/storage/shared` 无 MANAGE 时的按需授权/拒绝/重试 UI 全回归（已部分覆盖）
+
+### P3（体验/工程）
+
+- [ ] **[T-G3]** terminal 输出持久化到文件（TermuxManager.emitOutput → 轮转日志，子代理1）
+- [ ] UI/UX：extra-keys、virtual mouse（见 AMCODE_ROADMAP.md P1-8）。
+
+### 长期
+
+- proot/glibc 兼容模式、自编译 Android-native code-server、16KB page、TUR 镜像/CDN——全部见 [AMCODE_ROADMAP.md](AMCODE_ROADMAP.md)。
 
 ---
 
-## 9. 参考文档
+## 8. 维护约定（每次改动都读一遍）
 
-- [AMCODE_ROADMAP.md](AMCODE_ROADMAP.md)：扩展路线图/重任务池（proot、自编译 code-server、16KB、离线 SDK、工具链等，按 P0–P3/难度排列）。
-- [AMCODE_FIXES_2026-10-24.md](AMCODE_FIXES_2026-10-24.md)：三轮修复的详细根因、日志、验证。
-- [AMCODE_REVIEW_2026-10-24.md](AMCODE_REVIEW_2026-10-24.md)：全量审计报告（P0/P1/P2）。
-- [AMCODE_NEXT_BATCH_PLAN.md](AMCODE_NEXT_BATCH_PLAN.md)：下一批计划（已执行 A/B/C，残余见本文第 7 节）。
-- `ARCHITECTURE.md` / `DEVELOPMENT.md` / `README.md`：历史文档，部分已过时。
-- `review-assets/`：验证截图/日志（本地证据）。
+1. 改代码前 `git status`；不要覆盖未跟踪的 review-assets/。
+2. 每次改动后：
+   1. 构建（必要时 clean）+ 5558 或专用 AVD 验证；
+   2. **更新本文件 §3 时间线 + §4 验证状态 + §11 变更记录**；
+   3. commit（不要提交 `review-assets/`）。
+3. 不要启动手机 AVD（5556）；不要清 5558 数据；fresh 测试用 5560/5570/5572。
+4. 不要恢复 `--auth none`；不要把 token/hash/cookie 写进 argv/env/logcat。
+5. 不要用 `--root` 跑 offline dpkg（当前 `--instdir` + configure；改前读 TermuxManager 注释）。
+6. 不要移除 android-as-linux 的 execArgv 注入；不要让 `terminal_output` 可聚焦。
+7. 构建产物立即复制到 `D:\`。
+8. **本文件是唯一权威**：与代码冲突时以代码+实测为准，然后更新本文件。
 
 ---
 
-*交接完成。后续以本文件 + git log 为准；如果文档与代码冲突，先以当前代码和可复现实测为准，再更新文档。*
+## 9. 运维手册（故障排查）
+
+| 症状 | 原因 | 处置 |
+|---|---|---|
+| 首启反复 "Extraction failed" | bootstrap 缓存损坏（旧版本 bug，已修：原子拷贝+失败自删） | 新版本自愈；旧版本需 pm clear |
+| 启动卡 "Installing packages" 很久 | 在线版 TUR 慢（GitHub 限速） | 等（断点续传）；或改装 offline APK |
+| `dpkg --audit` 报 half-configured | postinst 曾失败（如 API28 py3compile） | 下次启动自动 `dpkg --configure -a` 自愈；手动：终端跑 `dpkg --configure -a` |
+| 怀疑 pkg 层坏（NO_PUBKEY/dpkg 路径错） | wrapper/keyring/symlink 失常 | 删 `files/.amcode-pkg-setup` marker → 下次启动强制 full repair |
+| 划掉任务卡后 VS Code 无法访问 | stopWithTask 停了服务（设计如此） | 重开 App（PID/孤儿自动清理） |
+| code-server 端口冲突/旧进程残留 | 异常退出 | 启动前自动清理（PID+cmdline 校验）；确认 `files/run/code-server.pid` 与 `ps` |
+| 打开即白屏+Toast 崩溃 | 设备无 WebView provider | 装系统 WebView（新版本有明确对话框提示） |
+| 外部 HOME 下 git/编译失败 | /sdcard FUSE noexec | Storage action 切回 internal HOME |
+| 通知栏没有进度更新 | 系统限流（已节流 2/s） | 正常；看 logcat |
+| `run-as: package not debuggable` | release 构建 | 从 logcat `code-server PID=... bound to 127.0.0.1:<port>` 拿端口 |
+
+**紧急恢复**：`pm clear com.devbox` 会清掉 internal HOME 的用户文件（含 `~/` 下项目）——清前先确认文件在 `/sdcard/AMCode` 或已备份。卸载重装同样清 data。
+
+---
+
+## 10. 评审发现汇总（2026-10-24/25，5 个评审子代理 + 主 agent 全量读码）
+
+> 已修复项的明细在 §11 对应批次里；此处只保留结论与**未修复项**（与 §6/§7 一一对应）。
+
+### 已全部修复（不再列）
+- **Termux 层**：installDebFiles 吞错、bootstrap 非原子、镜像测速 head 假阳性、offline staged 残留/双版本、wrapper tmp 残留、opt/share/include 改写缺口、libc++ 每次全扫、缓存 zip 永存/错名、矛盾注释、死代码。
+- **UI 层**：无文件选择器、onReceivedHttpError 缺失、三方 cookie、about:blank 吞导航、bindService 重复、configChanges 缺 uiMode、applyExternalHome 先设后验、Trust 标记时机、SWITCH_EXTERNAL 静默兜底、updateProgress 残留重试监听、settings 种子覆盖非对象值、backup 规则漏 ABI、崩溃日志 null。
+- **Launcher/Service 层**：被取代管线 stopSelf 拆服务（P1）、CE-stop 全局误杀、auth 后无 checkpoint、initialize 非重入、auth-config/shim/settings 并发覆盖、健康循环 check-then-act、pid 校验空 start 旁路、SIGKILL 不复验、重启失败不更新通知、通知刷屏、hash/cookie 不脱敏、reader 不关、findFreePort 回退 8080；确认 R8 收紧不影响 getPid 反射（目标是平台类）。
+- **构建层**：wrapper 无 sha、keystore 半填静默 unsigned、downloadBootstrap 永不 UP-TO-DATE、deb 未 noCompress、死文件（cpp/init.gradle.kts/bootstrap_setup.sh）、proguard 全量 keep、未用依赖、CI 缺失。
+- **文档层**：README/ARCHITECTURE 全面过时（已重写）；根 ROADMAP 已标注存档；DEVELOPMENT.md 方案表两行过时（本地文件，未改）。
+
+### 仍开放
+见 §6 / §7。补充两个低置信度项：mint-key 副作用（§6.10）、D2D 迁移默认范围含 cache 域（§7-P3）。
+
+---
+
+## 11. 变更记录（每批次一条，倒序；新改动加在最上面）
+
+### 2026-10-25 上午 · `c229683` 管线并发正确性 + minSdk 验证 + 文档
+- **并发**：被取代管线失败不再 stopSelf（所有权检查）；取消的 start 只 abort 本进程；auth 后 checkpoint；ACTION_RESTART join 健康循环；startHealthChecks 同步化；TermuxManager.initialize 加 Mutex；auth-config/shim/settings 唯一 tmp 名；PID 匹配要求 starttime；SIGKILL 前复验 cmdline；findFreePort 失败即败；stdout 三重脱敏；通知节流 2/s；重启失败也更新通知。
+- **minSdk**：无 WebView 设备给明确对话框（API26 AOSP 镜像实测发现）。
+- **文档**：README/ARCHITECTURE 全面重写（v1.1.0 事实）；根 ROADMAP 存档标注；GitHub Actions CI。
+- **验证**：API26(google_apis)/29 fresh + 双向切换 ✓；5558 覆盖安装快路径 ✓；5560 release fresh + R8 release ✓。
+
+### 2026-10-25 凌晨2点 · `5cd3ded` WebView/Service 边界 + 构建瘦身
+- 文件选择器（SAF）；about:blank 放行；主帧 HTTP 错误日志；三方 cookie 关；bindService/unbind 配对；configChanges 补 uiMode|density|fontScale|keyboard；applyExternalHome 先验证后设置；Trust 提示显示后才标记；进度行不再带重试监听；Restart join 15s 超时；settings 种子跳过非对象值。
+- 构建：wrapper distributionSha256Sum；keystore 半填报错；deb noCompress；downloadBootstrap UP-TO-DATE；删 material/webkit/lifecycle-service/viewBinding/androidTest 依赖；删 cpp/init.gradle.kts/scripts；**R8 全量 keep 移除（release -3.9MB，实测无回归）**。
+- 验证：5558 debug + 5560 release（R8）双端页面加载 ✓；5558 切 external→internal 双向 UI 实测 ✓。
+
+### 2026-10-25 凌晨0-1点 · `dc572f9` v1.1.0 功能批 + 安装管线加固
+- versionCode 2 / 1.1.0；keystore.properties/AMCODE_* 签名；internal Trust 一次性提示；Storage action 双向切换（noexec 警告）；watcherExclude 种子；WebView 调试决定移到 inflate 前；dataExtractionRules + backup 排除补全；崩溃日志 null 安全。
+- 安装：installDebFiles 以 unpack 为硬门 + 半配置健康检查 + configure -a 自愈；bootstrap tmp+长度校验+失败自删+成功删缓存（按 ABI 命名）；镜像测速要求 HTTP 200；offline 失败清理 staged deb；archives 按包名去重；首装改写扩到 opt/share/include；libc++ 扫描结果 marker 化；pkg-setup 清 wrapper tmp 残留；死代码删除。
+- 构建：双 ABI bootstrap 下载 + SHA-256 固定（aarch64=90a352db…、x86_64=c2d9892f…）；gh-proxy 第三源。
+- 验证：5558 full repair 8.5s→快路径 103ms；5560 release fresh 30s 全绿；auth 302/401/200；Trust 对话框截图确认。
+
+---
+
+## 12. 参考文档
+
+- [AMCODE_ROADMAP.md](AMCODE_ROADMAP.md)：重任务池（proot、自编译 code-server、16KB 等，P0–P3/难度评分）。
+- [AMCODE_FIXES_2026-10-24.md](AMCODE_FIXES_2026-10-24.md)：10-24 三轮修复详情（历史）。
+- [AMCODE_REVIEW_2026-10-24.md](AMCODE_REVIEW_2026-10-24.md)：10-24 全量审计（**基线 2d9b486，多数问题已修，仅作历史参考**）。
+- [AMCODE_NEXT_BATCH_PLAN.md](AMCODE_NEXT_BATCH_PLAN.md)：10-24 批次计划（已执行完毕，历史）。
+- `README.md` / `ARCHITECTURE.md`：2026-10-25 已重写为 v1.1.0 现状，可对外。
+- `DEVELOPMENT.md`（gitignored 本地）：v1.0 时代过程记录，"方案总结"表两行过时（dpkg wrapper、动态端口）。
+- `review-assets/`：验证截图/日志（本地证据，不入库）。
+
+---
+
+*交接+运维双用途。文档与代码冲突时，以当前代码和可复现实测为准，再更新本文档。*

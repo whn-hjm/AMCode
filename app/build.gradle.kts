@@ -120,11 +120,20 @@ android {
 // ─── Download Termux bootstrap during build ──────────────
 //
 // Both ABI bootstrap zips are required runtime assets (TermuxManager copies
-// them from the APK on first launch); a clean clone has neither because the
-// zips are gitignored (32MB each). Each archive is pinned by SHA-256 so a
-// truncated or tampered download can never be bundled silently.
+// them from the APK on first launch); a clean clone has none because the zips
+// are gitignored (~32MB each). Zips are cached in <root>/bootstrap-cache and
+// copied into generated assets by arch selection:
+//
+//   default                -> both zips (~61MB assets, universal APK)
+//   -PbootstrapArch=aarch64 -> arm64-only APK (~33MB assets)
+//   -PbootstrapArch=x86_64  -> emulator/x86-only APK (~33MB assets)
+//
+// Each archive is pinned by SHA-256 so a truncated or tampered download can
+// never be bundled silently.
 
-val bootstrapDir = File(projectDir, "src/main/assets")
+val bootstrapDir = File(rootDir, "bootstrap-cache")
+val bootstrapGeneratedDir = layout.buildDirectory.dir("generated/bootstrap-assets")
+val bootstrapArchFilter = providers.gradleProperty("bootstrapArch").orElse("").get()
 val bootstrapTag = "bootstrap-2026.08.02-r1%2Bapt.android-7"
 val bootstrapArchives = mapOf(
     "bootstrap-aarch64.zip" to
@@ -135,77 +144,100 @@ val bootstrapArchives = mapOf(
 
 tasks.register("downloadBootstrap") {
     group = "setup"
-    description = "Download Termux bootstrap zips for bundling in APK assets"
-    // Declared pins/outputs let cached builds skip re-hashing 2x32MB assets.
+    description = "Download Termux bootstrap zips and stage them as APK assets"
+    // Declared pins/filter/outputs let cached builds skip re-hashing 2x32MB assets.
     inputs.property("bootstrapArchives", bootstrapArchives.map { (name, pin) -> "$name=${pin.first}:${pin.second}" })
-    outputs.files(bootstrapArchives.keys.map { File(bootstrapDir, it) })
+    inputs.property("bootstrapArchFilter", bootstrapArchFilter)
+    outputs.dir(bootstrapGeneratedDir)
 
     doLast {
+        val selected = when (bootstrapArchFilter) {
+            "" -> bootstrapArchives.keys
+            "aarch64" -> listOf("bootstrap-aarch64.zip")
+            "x86_64" -> listOf("bootstrap-x86_64.zip")
+            else -> throw GradleException("Unsupported -PbootstrapArch=$bootstrapArchFilter (aarch64, x86_64 or empty)")
+        }
+        bootstrapDir.mkdirs()
+        val outDir = bootstrapGeneratedDir.get().asFile
+        // Drop archs that a previous build staged (arch filter switching).
+        outDir.listFiles()?.forEach { if (it.name !in selected) it.delete() }
+
         for ((name, pinned) in bootstrapArchives) {
             val (expectedSha, expectedSize) = pinned
-            val bootstrapFile = File(bootstrapDir, name)
+            val cached = File(bootstrapDir, name)
 
-            if (bootstrapFile.isFile && bootstrapFile.length() == expectedSize &&
-                offlineSha256(bootstrapFile).equals(expectedSha, ignoreCase = true)
+            if (!(cached.isFile && cached.length() == expectedSize &&
+                    offlineSha256(cached).equals(expectedSha, ignoreCase = true))
             ) {
-                println("Bootstrap already cached: ${bootstrapFile.absolutePath} (${bootstrapFile.length()} bytes)")
-                continue
-            }
-            bootstrapFile.delete()
+                cached.delete()
+                val urls = listOf(
+                    "https://github.com/termux/termux-packages/releases/download/$bootstrapTag/$name",
+                    "https://ghproxy.com/https://github.com/termux/termux-packages/releases/download/$bootstrapTag/$name",
+                    "https://gh-proxy.com/https://github.com/termux/termux-packages/releases/download/$bootstrapTag/$name"
+                )
+                var downloaded = false
+                for (url in urls) {
+                    try {
+                        println("Downloading $name from: $url")
+                        val connection = URL(url).openConnection()
+                        connection.connectTimeout = 15000
+                        connection.readTimeout = 300000
+                        connection.setRequestProperty("User-Agent", "VSBoxed-Build/1.0")
 
-            bootstrapDir.mkdirs()
-            val urls = listOf(
-                "https://github.com/termux/termux-packages/releases/download/$bootstrapTag/$name",
-                "https://ghproxy.com/https://github.com/termux/termux-packages/releases/download/$bootstrapTag/$name",
-                "https://gh-proxy.com/https://github.com/termux/termux-packages/releases/download/$bootstrapTag/$name"
-            )
-            var downloaded = false
-            for (url in urls) {
-                try {
-                    println("Downloading $name from: $url")
-                    val connection = URL(url).openConnection()
-                    connection.connectTimeout = 15000
-                    connection.readTimeout = 300000
-                    connection.setRequestProperty("User-Agent", "VSBoxed-Build/1.0")
-
-                    val tmp = File(bootstrapDir, "$name.part")
-                    connection.getInputStream().use { input ->
-                        tmp.outputStream().use { output -> input.copyTo(output) }
+                        val tmp = File(bootstrapDir, "$name.part")
+                        connection.getInputStream().use { input ->
+                            tmp.outputStream().use { output -> input.copyTo(output) }
+                        }
+                        if (tmp.length() != expectedSize ||
+                            !offlineSha256(tmp).equals(expectedSha, ignoreCase = true)
+                        ) {
+                            println("Checksum mismatch for $name (${tmp.length()} bytes); discarding")
+                            tmp.delete()
+                            continue
+                        }
+                        if (!tmp.renameTo(cached)) {
+                            tmp.delete()
+                            throw GradleException("Cannot rename $tmp to $cached")
+                        }
+                        downloaded = true
+                        println("Bootstrap downloaded: ${cached.length()} bytes (sha256 verified)")
+                        break
+                    } catch (e: Exception) {
+                        println("Failed from $url: ${e.message}")
+                        cached.delete()
+                        File(bootstrapDir, "$name.part").delete()
                     }
-                    if (tmp.length() != expectedSize ||
-                        !offlineSha256(tmp).equals(expectedSha, ignoreCase = true)
-                    ) {
-                        println("Checksum mismatch for $name (${tmp.length()} bytes); discarding")
-                        tmp.delete()
-                        continue
-                    }
-                    if (!tmp.renameTo(bootstrapFile)) {
-                        tmp.delete()
-                        throw GradleException("Cannot rename $tmp to $bootstrapFile")
-                    }
-                    downloaded = true
-                    println("Bootstrap downloaded: ${bootstrapFile.length()} bytes (sha256 verified)")
-                    break
-                } catch (e: Exception) {
-                    println("Failed from $url: ${e.message}")
-                    bootstrapFile.delete()
-                    File(bootstrapDir, "$name.part").delete()
+                }
+                if (!downloaded) {
+                    println("WARNING: Cannot download $name (network issue).")
+                    println("The app requires this asset at first launch; the build would ship a broken APK.")
+                    println("1. Download manually: https://github.com/termux/termux-packages/releases/download/$bootstrapTag/$name")
+                    println("2. Place it at: ${cached.absolutePath}")
+                    println("3. Rebuild")
+                    throw GradleException("Missing bootstrap asset: $name")
                 }
             }
-            if (!downloaded) {
-                println("WARNING: Cannot download $name (network issue).")
-                println("The app requires this asset at first launch; the build would ship a broken APK.")
-                println("1. Download manually: https://github.com/termux/termux-packages/releases/download/$bootstrapTag/$name")
-                println("2. Place it at: ${bootstrapFile.absolutePath}")
-                println("3. Rebuild")
-                throw GradleException("Missing bootstrap asset: $name")
+
+            // Stage only the selected arch(s) as assets.
+            if (name in selected) {
+                val outDir = bootstrapGeneratedDir.get().asFile
+                outDir.mkdirs()
+                val dest = File(outDir, name)
+                if (!(dest.isFile && dest.length() == expectedSize)) {
+                    cached.copyTo(dest, overwrite = true)
+                }
             }
         }
+        println("Bootstrap assets staged: $selected")
     }
 }
 
-// Download bootstrap during build (cached in assets after first build)
+// Bootstrap zips come from the generated dir (never from src/main/assets).
+android.sourceSets.getByName("main").assets.srcDir(bootstrapGeneratedDir.get().asFile)
 tasks.named("preBuild") { dependsOn("downloadBootstrap") }
+tasks.matching { it.name.startsWith("merge") && it.name.endsWith("Assets") }.configureEach {
+    dependsOn("downloadBootstrap")
+}
 
 // ─── Optional first-install TUR bypass bundle ────────────
 //

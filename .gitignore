@@ -43,3 +43,4 @@ app/amcode-release.jks
 app/keystore.properties
 DEVELOPMENT.md
 .cxx/
+bootstrap-cache

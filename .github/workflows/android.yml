@@ -30,7 +30,7 @@ jobs:
       - name: Cache bootstrap assets
         uses: actions/cache@v4
         with:
-          path: app/src/main/assets/bootstrap-*.zip
+          path: bootstrap-cache/*.zip
           key: bootstrap-${{ hashFiles('app/build.gradle.kts') }}
 
       - name: Build debug APK and lint
