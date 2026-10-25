@@ -5,8 +5,8 @@
      files/home (the user's workspace) stays backed up. -->
 <data-extraction-rules>
     <cloud-backup>
-        <!-- The cache domain (per-launch auth config) never leaves the device. -->
-        <exclude domain="cache" path="." />
+        <!-- The cache domain (per-launch auth config) is never backed up:
+         Android excludes cacheDir from Auto Backup and D2D by default. -->
         <exclude domain="root" path="files/usr" />
         <exclude domain="root" path="files/code-server" />
         <exclude domain="root" path="files/.code-server-data" />
@@ -17,7 +17,6 @@
         <exclude domain="root" path="files/run" />
     </cloud-backup>
     <device-transfer>
-        <exclude domain="cache" path="." />
         <exclude domain="root" path="files/usr" />
         <exclude domain="root" path="files/code-server" />
         <exclude domain="root" path="files/.code-server-data" />

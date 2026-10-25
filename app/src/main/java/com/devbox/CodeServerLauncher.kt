@@ -172,9 +172,13 @@ object CodeServerLauncher {
             // here could tear down a replacement start's server instead.
             throw e
         } catch (e: Exception) {
+            // No global stop() here either: start() has already aborted the
+            // exact process it spawned, and this call may be the late
+            // unwinding of a start that was cancelled/superseded — a stop()
+            // from it would bump the generation and kill the replacement
+            // start's server. Orphan sweeping happens on the next start()
+            // (cleanupStaleCodeServerProcesses) or on the service-side stop.
             Log.e(TAG, "Failed to start code-server", e)
-            // Kill any half-started process; stop() is asynchronous for the caller.
-            stop()
             Result.failure(e)
         }
     }
@@ -227,7 +231,7 @@ object CodeServerLauncher {
             // the app-private 0600 config; the token itself stays in memory
             // and is never in argv or logcat.
             val token = generateAuthToken()
-            val authConfig = writeAuthConfig(port, token)
+            val authConfig = writeAuthConfig(port, token, generation)
             if (authConfig == null) {
                 throw RuntimeException("Cannot write code-server authentication config")
             }
@@ -1143,8 +1147,13 @@ object CodeServerLauncher {
      * comparison (~3 ms). The login password is a 256-bit random token, so a
      * preimage-resistant hash is sufficient; there is no human password to
      * brute-force. code-server 4.143.1 supports this legacy config path.
+     *
+     * The final install is generation-gated: a start that was superseded
+     * while blocked in here must never overwrite the config a newer start
+     * has just installed (the fixed path is read by that server while it
+     * boots).
      */
-    private fun writeAuthConfig(port: Int, token: String): File? {
+    private fun writeAuthConfig(port: Int, token: String, generation: Int): File? {
         return try {
             val dir = authConfigFile().parentFile
             if (dir == null || (!dir.exists() && !dir.mkdirs())) {
@@ -1162,6 +1171,14 @@ object CodeServerLauncher {
                     "bind-addr: $BIND_HOST:$port\n"
             )
             restrictRuntimeFile(tmp)
+            // Last ownership check before replacing the shared destination:
+            // this start may have been superseded while blocked above (the
+            // caller's blocking sections do not observe cancellation).
+            if (!isCurrent(generation)) {
+                Log.i(TAG, "Auth config write skipped: start superseded")
+                tmp.delete()
+                return null
+            }
             if (dest.exists() && !dest.delete()) {
                 tmp.delete()
                 Log.e(TAG, "Cannot replace ${dest.absolutePath}")

@@ -31,7 +31,9 @@ import kotlinx.coroutines.withTimeoutOrNull
  * - Report status to bound activities
  *
  * Initialization is single-flight: repeated onStartCommand() calls cannot run
- * two concurrent bootstrap/apt/server starts.
+ * two concurrent bootstrap/apt/server starts. Crash recovery is routed
+ * through the same gate (initializeAndStart with recovery = true), so the
+ * health-check loop detects crashes but never starts a server itself.
  */
 class CodeServerService : Service() {
 
@@ -71,6 +73,17 @@ class CodeServerService : Service() {
 
     private var initJob: Job? = null
 
+    /**
+     * Makes the initJob single-flight check atomic with replacing the
+     * pipeline references. The health-check loop performs its recovery
+     * hand-over (initializeAndStart) from an IO thread while ACTION_RESTART /
+     * ACTION_STOP / duplicate starts mutate the same fields on the main
+     * thread; without the lock, a recovery pipeline launched at the same
+     * instant could slip past ACTION_RESTART's cancel pass (silently dropping
+     * the user's restart). Never held across a suspension.
+     */
+    private val pipelineLock = Any()
+
     @Volatile
     private var healthCheckJob: Job? = null
 
@@ -106,14 +119,20 @@ class CodeServerService : Service() {
                 )
                 // Cancel the current pipeline and wait for it to unwind before
                 // a new one starts, otherwise two servers could be spawned.
-                // The health-check loop may equally be blocked in an HTTP call
-                // inside the old pipeline; join both.
-                val previous = initJob
-                previous?.cancel()
-                initJob = null
-                val previousHealth = healthCheckJob
-                previousHealth?.cancel()
-                healthCheckJob = null
+                // The pipeline being cancelled may itself be a health-recovery
+                // pipeline (initializeAndStart with recovery = true); doing
+                // the cancel pass under pipelineLock keeps it atomic with the
+                // health loop's hand-over, so this restart can never be
+                // dropped by a concurrently launched recovery pipeline.
+                val (previous, previousHealth) = synchronized(pipelineLock) {
+                    val p = initJob
+                    p?.cancel()
+                    initJob = null
+                    val h = healthCheckJob
+                    h?.cancel()
+                    healthCheckJob = null
+                    Pair(p, h)
+                }
                 restartCount = 0
                 CodeServerLauncher.stop()
                 initializeAndStart(waitFor = previous, waitForHealth = previousHealth)
@@ -161,10 +180,12 @@ class CodeServerService : Service() {
 
     override fun onDestroy() {
         Log.i(TAG, "Service destroying")
-        initJob?.cancel()
-        initJob = null
-        healthCheckJob?.cancel()
-        healthCheckJob = null
+        synchronized(pipelineLock) {
+            initJob?.cancel()
+            initJob = null
+            healthCheckJob?.cancel()
+            healthCheckJob = null
+        }
         // Non-blocking: the launcher kills the process on its own IO scope even
         // after this service (and its scope) is gone.
         CodeServerLauncher.stop()
@@ -181,13 +202,32 @@ class CodeServerService : Service() {
      *
      * [waitFor] is an already-cancelled previous pipeline (HOME switch); the
      * new pipeline joins it first so two servers can never be spawned.
+     *
+     * [recovery] is the health-check hand-over: the environment is already
+     * installed (a server ran before the crash), so the pipeline skips the
+     * HOME/Termux phases and runs only the bounded process-restart loop
+     * (recoverFromCrash). Routing the crash restart through this same gate
+     * closes the last concurrency gap: prepareAndStart() no longer has any
+     * caller outside a pipeline, so a health restart can never interleave
+     * with an ACTION_RESTART pipeline.
+     *
+     * Expression body on purpose: it keeps guard + health-loop teardown +
+     * initJob assignment inside pipelineLock (see that field) without
+     * re-indenting the pipeline body below.
      */
-    private fun initializeAndStart(waitFor: Job? = null, waitForHealth: Job? = null) {
+    private fun initializeAndStart(
+        waitFor: Job? = null,
+        waitForHealth: Job? = null,
+        recovery: Boolean = false
+    ): Unit = synchronized(pipelineLock) {
         if (initJob?.isActive == true) {
             Log.i(TAG, "initializeAndStart ignored: already active")
             return
         }
         // A previous health-check loop must not race this initialization.
+        // In recovery mode the caller IS that loop: cancelling it here is
+        // safe because it returns immediately after this call, and the new
+        // pipeline joins it (waitForHealth) before touching anything.
         healthCheckJob?.cancel()
         healthCheckJob = null
 
@@ -209,6 +249,16 @@ class CodeServerService : Service() {
                         throw e
                     }
                 }
+
+                if (recovery) {
+                    // Health-check hand-over: only restart the process —
+                    // but inside this same single-flight gate, which is what
+                    // keeps the restart from interleaving with a concurrent
+                    // ACTION_RESTART pipeline.
+                    recoverFromCrash(self)
+                    return@launch
+                }
+
                 _serviceStatus.value = ServiceStatus(
                     ServiceState.INITIALIZING, "Initializing...", 0
                 )
@@ -365,6 +415,14 @@ class CodeServerService : Service() {
 
     private val healthCheckLock = Any()
 
+    /**
+     * Probe-only health loop: detect the crash, then hand the whole restart
+     * over to the single-flight pipeline (initializeAndStart with
+     * recovery = true) and exit. The restart used to run right here, calling
+     * CodeServerLauncher.prepareAndStart() outside the initJob gate — the
+     * last window where two starts (health restart × ACTION_RESTART) could
+     * overlap.
+     */
     private fun startHealthChecks() {
         synchronized(healthCheckLock) {
             if (healthCheckJob?.isActive == true) {
@@ -389,59 +447,110 @@ class CodeServerService : Service() {
                         continue
                     }
 
-                    restartCount++
-                    Log.w(TAG, "Health check failed; restart attempt $restartCount/$MAX_RESTARTS")
-                    if (restartCount > MAX_RESTARTS) {
-                        Log.e(TAG, "Too many restarts, giving up")
-                        _serviceStatus.value = ServiceStatus(
-                            ServiceState.ERROR, "VS Code crashed too many times", 0
-                        )
-                        updateNotification("VS Code failed", "Too many restarts")
-                        CodeServerLauncher.stop()
-                        stopForeground(STOP_FOREGROUND_REMOVE)
-                        stopSelf()
-                        return@launch
-                    }
-
-                    _serviceStatus.value = ServiceStatus(
-                        ServiceState.STARTING_SERVER,
-                        "Restarting VS Code...",
-                        80,
-                        CodeServerLauncher.status.value.url
+                    Log.w(TAG, "Health check failed; handing restart to the pipeline")
+                    // initializeAndStart cancels this very job during the
+                    // hand-over (healthCheckJob is us); that is fine because
+                    // nothing suspends between this call and the return, and
+                    // the new pipeline joins this job before doing anything.
+                    initializeAndStart(
+                        waitForHealth = coroutineContext[Job],
+                        recovery = true
                     )
-                    updateNotification("Restarting VS Code...", "Recovering from crash")
-
-                    CodeServerLauncher.stop()
-                    delay(RESTART_DELAY_MS)
-
-                    var restarted = false
-                    try {
-                        restarted = CodeServerLauncher.prepareAndStart().isSuccess
-                    } catch (e: CancellationException) {
-                        throw e
-                    } catch (e: Exception) {
-                        Log.e(TAG, "Restart threw", e)
-                    }
-
-                    if (restarted) {
-                        // Reset only after a successful restart.
-                        restartCount = 0
-                        _serviceStatus.value = ServiceStatus(
-                            ServiceState.RUNNING,
-                            "VS Code restarted",
-                            100,
-                            CodeServerLauncher.status.value.url
-                        )
-                        updateNotification("VS Code restarted", "Recovered from crash")
-                    } else {
-                        Log.e(TAG, "Restart failed")
-                        _serviceStatus.value = ServiceStatus(
-                            ServiceState.ERROR, "Restart failed", 0
-                        )
-                        updateNotification("VS Code failed", "Restart failed")
-                    }
+                    // Accepted: the recovery pipeline now owns
+                    // stop/start/retry and starts a fresh health loop once
+                    // the server is back. Rejected (some other pipeline is
+                    // already active — e.g. an ACTION_RESTART landed between
+                    // the probe and here): that pipeline owns the world and
+                    // starts its own loop. Either way this loop is done.
+                    return@launch
                 }
             }
+        }
+    }
+
+    /**
+     * Bounded crash-recovery loop — the recovery branch of the initJob
+     * pipeline. Runs entirely inside the single-flight gate, so its
+     * stop/start sequence can never interleave with another pipeline.
+     * Cadence and notification texts match the old in-loop restart:
+     * 2 s between stop and start, 10 s between attempts, at most
+     * [MAX_RESTARTS] attempts before giving up.
+     */
+    private suspend fun CoroutineScope.recoverFromCrash(self: Job?) {
+        while (true) {
+            restartCount++
+            Log.w(TAG, "Health check failed; restart attempt $restartCount/$MAX_RESTARTS")
+            if (restartCount > MAX_RESTARTS) {
+                // Same ownership rule as the pipeline failure handler: a
+                // recovery loop superseded during a non-cancellable section
+                // must not tear down the service its replacement runs in.
+                if (initJob !== self || !isActive) {
+                    Log.w(TAG, "Superseded recovery loop hit its limit; leaving the service to its owner")
+                    return
+                }
+                Log.e(TAG, "Too many restarts, giving up")
+                _serviceStatus.value = ServiceStatus(
+                    ServiceState.ERROR, "VS Code crashed too many times", 0
+                )
+                updateNotification("VS Code failed", "Too many restarts")
+                CodeServerLauncher.stop()
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                stopSelf()
+                return
+            }
+
+            _serviceStatus.value = ServiceStatus(
+                ServiceState.STARTING_SERVER,
+                "Restarting VS Code...",
+                80,
+                CodeServerLauncher.status.value.url
+            )
+            updateNotification("Restarting VS Code...", "Recovering from crash")
+
+            CodeServerLauncher.stop()
+            delay(RESTART_DELAY_MS)
+
+            var restarted = false
+            try {
+                restarted = CodeServerLauncher.prepareAndStart().isSuccess
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.e(TAG, "Restart threw", e)
+            }
+
+            // The attempt may have unwound from a non-cancellable section of
+            // a start that was already superseded (such a start reports
+            // failure, or a hollow "success" without a live server). Do not
+            // publish anything unless this loop still owns the pipeline: the
+            // replacement's UI state must win.
+            if (initJob !== self || !isActive) {
+                Log.w(TAG, "Recovery loop superseded during restart attempt; exiting")
+                return
+            }
+
+            if (restarted) {
+                // Reset only after a successful restart.
+                restartCount = 0
+                _serviceStatus.value = ServiceStatus(
+                    ServiceState.RUNNING,
+                    "VS Code restarted",
+                    100,
+                    CodeServerLauncher.status.value.url
+                )
+                updateNotification("VS Code restarted", "Recovered from crash")
+                startHealthChecks()
+                Log.i(TAG, "code-server recovered; service running again")
+                return
+            }
+
+            Log.e(TAG, "Restart failed")
+            _serviceStatus.value = ServiceStatus(
+                ServiceState.ERROR, "Restart failed", 0
+            )
+            updateNotification("VS Code failed", "Restart failed")
+            // Pace retries like the old loop-top probe delay did.
+            delay(HEALTH_INTERVAL_MS)
         }
     }
 
@@ -451,10 +560,14 @@ class CodeServerService : Service() {
      */
     private fun stopEverything() {
         Log.i(TAG, "Stopping service")
-        initJob?.cancel()
-        initJob = null
-        healthCheckJob?.cancel()
-        healthCheckJob = null
+        // pipelineLock: a recovery hand-over racing this stop must not be
+        // able to launch a new pipeline interleaved with the teardown.
+        synchronized(pipelineLock) {
+            initJob?.cancel()
+            initJob = null
+            healthCheckJob?.cancel()
+            healthCheckJob = null
+        }
         restartCount = 0
 
         // stop() is asynchronous; no waitFor() on the main thread.
