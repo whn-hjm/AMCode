@@ -351,6 +351,12 @@ curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' http://127.0.0.1:<PORT>
 
 ## 11. 变更记录（每批次一条，倒序；新改动加在最上面）
 
+### 2026-10-25 晚 · 真机修复：剔重丢权限位（T-P 紧急修正）
+- **真机（vivo V2408A / Android 16 / arm64）首启报 error=13 Permission denied**：ant.tar 重打包把所有文件 mode 压成 600/目录 700，`bin/code-server` 丢执行位。模拟器此前全绿是因为它们装的是未剔重的旧包。
+- **修复**：剥离器改为逐条目重写 data.tar（commons-compress 内嵌 1.25 API），原样保留 mode/uid/gid/mtime/linkname，只删异架构条目；xz 解压拆成两阶段（xz→裸 tar→重写→再 xz），规避嵌套 XZ 流提前 EOF。
+- **验证**：本地确认重建 deb 里 code-server=0700；真机卸载重装后 fresh 安装成功、VS Code 正常进入（用户确认）。离线 arm64 debug 125MB / release 109MB 不变。
+- 经验：**凡动包管理产物必须真机验证**——模拟器路径存在系统性盲区（安装源不同）。
+
 ### 2026-10-25 傍晚 · 自建下载源 + 构建期剔重（T-O/T-P）
 - **T-O**：TermuxManager 下载器 URL 重写（TUR 域名→自建镜像优先+回退）；Release `amcode-debs-1` 承载 4 个 pinned deb；在线 fresh 40-75min → **~5min**。
 - **T-P**：构建期 deb 剔重（arm64 -45MB 死重）；期间踩坑：Gradle 遮蔽 commons-compress（compile/runtime 版本错配 NoSuchMethodError）→ 改手工 ar 容器 + tarTree/ant.tar + tukaani 直连 XZ；ar 头 fmag 须为 `` ` ``+换行（0x60 0x0A）；control 成员名/内容后缀必须一致；sidecar 加剥离器版本号防坏缓存。
