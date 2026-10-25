@@ -265,6 +265,8 @@ curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' http://127.0.0.1:<PORT>
 
 ### P2
 
+- [x] **[T-O] 自建下载源**：4 个 pinned TUR deb 镜像到本仓库 Release `amcode-debs-1`，在线下载优先自家用、TUR 兜底；API28 实测 fresh 全程 **~5 分钟**（TUR 时代 40-75 分钟）
+- [x] **[T-P] 构建期剔重**：offline bundle 打包时从 deb 剔除异架构死重（arm64 code-server deb 97→52MB），**offline arm64 release 161.8→114.5MB（-29%）**；实现：手工 ar + Gradle tarTree/ant.tar + tukaani xz（绕开 Gradle 遮蔽的 commons-compress 版本冲突）；5560 fresh 实测 dpkg clean
 - [x] **git 进离线包**：offline bundle 的 aptDependencies 加 git，首启从快镜像拉取（APK 不变大、不碰 TUR）；5560 fresh 实测 git 2.56.0 可执行（a57b3c9）
 - [x] **[T-B]** Range 下载 part 文件按区间起点命名（.part.<start>-<end>），消除断点续传布局漂移（`558efcf`；offline 路径不走 Range，编译+逻辑验证）
 - [x] **[T-C]** 健康检查重启统一走 initJob 单飞通道：恢复循环搬进管线 recovery 分支 + pipelineLock 线性化；launcher 失败不再全局 stop、auth config 写入前查 generation（`3c89736`）
@@ -348,6 +350,11 @@ curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' http://127.0.0.1:<PORT>
 ---
 
 ## 11. 变更记录（每批次一条，倒序；新改动加在最上面）
+
+### 2026-10-25 傍晚 · 自建下载源 + 构建期剔重（T-O/T-P）
+- **T-O**：TermuxManager 下载器 URL 重写（TUR 域名→自建镜像优先+回退）；Release `amcode-debs-1` 承载 4 个 pinned deb；在线 fresh 40-75min → **~5min**。
+- **T-P**：构建期 deb 剔重（arm64 -45MB 死重）；期间踩坑：Gradle 遮蔽 commons-compress（compile/runtime 版本错配 NoSuchMethodError）→ 改手工 ar 容器 + tarTree/ant.tar + tukaani 直连 XZ；ar 头 fmag 须为 `` ` ``+换行（0x60 0x0A）；control 成员名/内容后缀必须一致；sidecar 加剥离器版本号防坏缓存。
+- **产物**：offline arm64 release **114.5MB**（原 161.8），SHA 4c27db18…；v1.1.0 Release 资产同步更新。
 
 ### 2026-10-25 下午（四）· 粘滞键 + 一键组合行（T-K2）
 - **Ctrl/Alt 粘滞**：点按武装（蓝）/长按锁定（绿）/再点取消；armed 时对工具栏键与外接键盘硬件键注入 META（dispatchKeyEvent 拦截重发，one-shot 后复位）——实测全状态循环+一次性消耗。
