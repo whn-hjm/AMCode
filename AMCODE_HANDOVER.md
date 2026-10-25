@@ -281,7 +281,10 @@ curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' http://127.0.0.1:<PORT>
 
 ### P3（体验/工程）
 
-- [ ] **[T-K] extra-keys 按键行**（§13 P1-8 轻量版，选型备忘 2026-10-25）：
+- [x] **[T-K] extra-keys 方案A子集（Esc/Tab/↑↓←→）**：native 工具栏，dispatchKeyEvent 标准硬件键路径；验证：渲染/布局✓、按钮不抢焦点（点按钮后 mServedView 仍为 WebView）✓、IME 打开时自动隐藏✓；**网页内效果无法用 uiautomator 观察（VS Code a11y 不暴露）**——终端 ↑ 历史回溯请人工确认一次。Ctrl/Alt 粘滞仍留待后续（021cda3 之后的批次）
+- [ ] **[T-K2]** extra-keys Ctrl/Alt 粘滞修饰键（键盘自身工具行可临时顶替；实现注意与 IME/focus 修复联动）
+- [ ] **[T-M] 剔除 TUR deb 的错架构死重**：code-server 包内 154.3MB x86_64/arm32 预编译（argon2/copilot-sdk/koffi/watcher-x64 等）可在安装时剔除，减解包体积约 30%，不损失 arm64 功能（16KB 审计副产品）；注意 dpkg .list 一致性
+- [ ] **[T-N]** 核验系统 `rg`（ripgrep 包）16KB 对齐（本轮审计未覆盖，下次审计并入）
   - 方案A（native toolbar）：App 层 WebView 下方加一排按钮，把 Esc/Ctrl/Tab/方向键翻译成 `dispatchKeyEvent` 注入 WebView —— 优点：不依赖页面结构、横竖屏布局可控；缺点：Ctrl 组合键状态管理复杂（要自己维护 modifier 粘滞），与 IME 抬起时的 inset 联动要重测（focus 修复同款敏感区）。
   - 方案B（JS 注入）：页面里注入 fixed 定位的按键条，向 xterm textarea 发 KeyboardEvent —— 优点：xterm 原生路径、Ctrl 组合简单；缺点：依赖 code-server DOM 结构（升级可能破）、滚动/全屏布局冲突。
   - 建议：先做 A 的 Esc/Tab/方向键子集（无 modifier 粘滞），验证布局与 IME 共存后，再决定 Ctrl 的实现（A 粘滞 or B 注入）。回归点：ensureWebViewFocus、IME inset margin、Trust 提示对话框不被遮挡。
@@ -345,6 +348,12 @@ curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' http://127.0.0.1:<PORT>
 ---
 
 ## 11. 变更记录（每批次一条，倒序；新改动加在最上面）
+
+### 2026-10-25 下午（续）· 16KB 审计关账 + extra-keys 子集 + README 双语
+- **16KB 审计（只读代理）**：code-server/nodejs-24 全量 ELF 扫描（python 解析+llvm-readelf 抽样交叉验证 0 分歧）——**核心链路全部达标，P1-3 关账**；不达标 15 个均为错架构死重；衍生 [T-M]（剔除死重减体积）、[T-N]（rg 补审）。原始数据在代理临时目录（可复核后删）。
+- **extra-keys 方案A子集**：底栏 Esc/Tab/四方向键（无 Ctrl 粘滞）；IME 打开自动隐藏、ready 才显示；焦点零抢占实测。终端实际效果待人工确认一次。
+- **README**：恢复中文版 README_zh.md（双语切换链接），并同步 git 随离线包、Open VSX 搜索限制等新事实。
+- ③ 完整版（Ctrl 粘滞、virtual mouse）继续留在 P3 池。
 
 ### 2026-10-25 下午 · `a57b3c9` 离线包带 git + 磁盘预检 + 服务文案中文化
 - **git 进离线包**：manifest aptDependencies 加 `git`（走快镜像，不 pin 不增 APK）；5560 fresh 实测 30s 装完 20 包、git 2.56.0 可执行、dpkg clean、零 TUR 访问。

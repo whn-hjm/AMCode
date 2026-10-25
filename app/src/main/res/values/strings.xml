@@ -136,4 +136,11 @@
     <string name="notification_recovered">Recovered from crash</string>
     <string name="ui_crashed_too_many">VS Code crashed too many times</string>
     <string name="ui_failed_with_reason">Failed: %1$s</string>
+    <!-- Extra-keys toolbar accessibility labels -->
+    <string name="cd_key_esc">Escape key</string>
+    <string name="cd_key_tab">Tab key</string>
+    <string name="cd_key_up">Arrow up</string>
+    <string name="cd_key_down">Arrow down</string>
+    <string name="cd_key_left">Arrow left</string>
+    <string name="cd_key_right">Arrow right</string>
 </resources>

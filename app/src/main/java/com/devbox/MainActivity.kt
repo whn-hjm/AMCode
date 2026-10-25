@@ -16,6 +16,7 @@ import android.os.Bundle
 import android.os.IBinder
 import android.provider.Settings
 import android.util.Log
+import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
@@ -79,6 +80,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var progressText: TextView
     private lateinit var terminalOutput: TextView
     private lateinit var terminalScroll: android.widget.ScrollView
+    private lateinit var keyToolbar: android.view.View
+    private var imeBottomPx = 0
 
     private var codeServerService: CodeServerService? = null
     private var serviceBound = false
@@ -311,6 +314,8 @@ class MainActivity : AppCompatActivity() {
             terminalScroll.isFocusableInTouchMode = false
             terminalOutput.isFocusable = false
             terminalOutput.isFocusableInTouchMode = false
+
+            setupExtraKeys()
 
             // Observe terminal output from TermuxManager
             lifecycleScope.launch {
@@ -878,6 +883,7 @@ class MainActivity : AppCompatActivity() {
                 progressBar.visibility = View.VISIBLE
                 progressText.text = ""
                 loadingOverlay.visibility = View.GONE
+                updateKeyToolbarVisibility()
                 Log.i(TAG, "WebView page loaded: $url (wasReady=$wasReady)")
 
                 // The overlay is gone: the WebView must be the Android-focused
@@ -1017,6 +1023,52 @@ class MainActivity : AppCompatActivity() {
      * viewport to code-server, so the editor/terminal reflows above the
      * keyboard instead of being covered by it.
      */
+    /**
+     * Extra-keys row (Esc/Tab/arrows): on-screen keyboards lack the keys a
+     * terminal needs. Buttons dispatch hardware key events straight into the
+     * WebView, never take focus themselves (the WebView must keep the IME),
+     * and the row is only visible once the VS Code page is ready and the IME
+     * is closed. Ctrl/Alt sticky modifiers are deliberately NOT in this
+     * subset (state management is a separate, riskier step — see the task
+     * board memo); the keyboard's own utility row covers those for now.
+     */
+    private fun setupExtraKeys() {
+        keyToolbar = findViewById(R.id.key_toolbar)
+        val keys = mapOf(
+            R.id.key_esc to KeyEvent.KEYCODE_ESCAPE,
+            R.id.key_tab to KeyEvent.KEYCODE_TAB,
+            R.id.key_up to KeyEvent.KEYCODE_DPAD_UP,
+            R.id.key_down to KeyEvent.KEYCODE_DPAD_DOWN,
+            R.id.key_left to KeyEvent.KEYCODE_DPAD_LEFT,
+            R.id.key_right to KeyEvent.KEYCODE_DPAD_RIGHT
+        )
+        for ((id, keyCode) in keys) {
+            val button = findViewById<View>(id)
+            button.isFocusable = false
+            button.isFocusableInTouchMode = false
+            button.setOnClickListener { dispatchExtraKey(keyCode) }
+        }
+    }
+
+    private fun dispatchExtraKey(keyCode: Int) {
+        if (!::webView.isInitialized || isFinishing || isDestroyed) return
+        try {
+            ensureWebViewFocus()
+            webView.dispatchKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, keyCode))
+            webView.dispatchKeyEvent(KeyEvent(KeyEvent.ACTION_UP, keyCode))
+        } catch (e: Exception) {
+            Log.w(TAG, "Cannot dispatch extra key $keyCode", e)
+        }
+    }
+
+    /** Extra keys live only while VS Code is up and the IME is closed. */
+    private fun updateKeyToolbarVisibility() {
+        if (!::keyToolbar.isInitialized) return
+        val visible = webViewReady && !mainFrameError && imeBottomPx == 0 &&
+            ::loadingOverlay.isInitialized && loadingOverlay.visibility != View.VISIBLE
+        keyToolbar.visibility = if (visible) View.VISIBLE else View.GONE
+    }
+
     private fun setupImeInsets() {
         ViewCompat.setOnApplyWindowInsetsListener(rootLayout) { _, insets ->
             val imeBottom = insets.getInsets(WindowInsetsCompat.Type.ime()).bottom
@@ -1025,6 +1077,12 @@ class MainActivity : AppCompatActivity() {
                 params.bottomMargin = imeBottom
                 webView.layoutParams = params
                 webView.requestLayout()
+            }
+            if (imeBottom != imeBottomPx) {
+                imeBottomPx = imeBottom
+                // The keyboard's own accessory row covers modifiers while it
+                // is open; our row reappears once the keyboard closes.
+                updateKeyToolbarVisibility()
             }
             // On API < 30 WindowInsetsCompat.CONSUMED has no platform
             // WindowInsets object; returning it can break ViewGroup insets

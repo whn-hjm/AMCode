@@ -137,4 +137,11 @@
     <string name="notification_recovered">已从崩溃中恢复</string>
     <string name="ui_crashed_too_many">VS Code 崩溃次数过多</string>
     <string name="ui_failed_with_reason">失败：%1$s</string>
+    <!-- 扩展按键行无障碍描述 -->
+    <string name="cd_key_esc">Esc 键</string>
+    <string name="cd_key_tab">Tab 键</string>
+    <string name="cd_key_up">方向键 上</string>
+    <string name="cd_key_down">方向键 下</string>
+    <string name="cd_key_left">方向键 左</string>
+    <string name="cd_key_right">方向键 右</string>
 </resources>

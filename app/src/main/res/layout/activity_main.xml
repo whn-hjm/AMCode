@@ -10,7 +10,9 @@
 
     <!-- WebView: loads code-server (hidden behind overlay until ready).
          It must be the only view that can own focus/IME; see the overlay's
-         descendantFocusability below. -->
+         descendantFocusability below. Its bottom edge sits above the
+         extra-keys toolbar; goneMargin keeps it full-height while the
+         toolbar is hidden. -->
     <WebView
         android:id="@+id/webview"
         android:layout_width="0dp"
@@ -19,9 +21,62 @@
         android:focusable="true"
         android:focusableInTouchMode="true"
         app:layout_constraintTop_toTopOf="parent"
-        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintBottom_toTopOf="@+id/key_toolbar"
+        app:layout_goneMarginBottom="0dp"
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toEndOf="parent" />
+
+    <!-- Extra-keys row: terminal/editor keys that on-screen keyboards lack
+         (Esc/Tab/arrows). Shown only once the VS Code page is ready and the
+         IME is closed; buttons never take focus (the WebView keeps the IME).
+         See MainActivity for the key dispatch. -->
+    <LinearLayout
+        android:id="@+id/key_toolbar"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:background="@color/surface_dark"
+        android:orientation="horizontal"
+        android:visibility="gone"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent">
+
+        <Button
+            android:id="@+id/key_esc"
+            style="@style/ExtraKeyButton"
+            android:contentDescription="@string/cd_key_esc"
+            android:text="Esc" />
+
+        <Button
+            android:id="@+id/key_tab"
+            style="@style/ExtraKeyButton"
+            android:contentDescription="@string/cd_key_tab"
+            android:text="Tab" />
+
+        <Button
+            android:id="@+id/key_up"
+            style="@style/ExtraKeyButton"
+            android:contentDescription="@string/cd_key_up"
+            android:text="↑" />
+
+        <Button
+            android:id="@+id/key_down"
+            style="@style/ExtraKeyButton"
+            android:contentDescription="@string/cd_key_down"
+            android:text="↓" />
+
+        <Button
+            android:id="@+id/key_left"
+            style="@style/ExtraKeyButton"
+            android:contentDescription="@string/cd_key_left"
+            android:text="←" />
+
+        <Button
+            android:id="@+id/key_right"
+            style="@style/ExtraKeyButton"
+            android:contentDescription="@string/cd_key_right"
+            android:text="→" />
+    </LinearLayout>
 
     <!-- Loading overlay. It is only a progress/log surface: never let it (or
          its selectable log TextView) take Android focus or the IME away from
