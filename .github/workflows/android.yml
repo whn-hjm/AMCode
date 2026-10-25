@@ -18,8 +18,9 @@ jobs:
           distribution: temurin
           java-version: '21'
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+      # ubuntu-latest runners ship a preinstalled Android SDK (recent
+      # build-tools/platforms, licenses accepted); setup-android@v3 currently
+      # fails installing the removed 'tools' package on top of it.
 
       - name: Validate Gradle wrapper
         uses: gradle/actions/wrapper-validation@v3

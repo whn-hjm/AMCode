@@ -202,6 +202,31 @@ if [ -s "$PREFIX/etc/apt/trusted.gpg.d/termux-autobuilds.gpg" ] &&
 fi
 
 # ---------------------------------------------------------- 6. dpkg database
+# The database edits below race a leftover terminal session running apt/dpkg
+# from the previous app launch (same uid). Wait for such processes to finish
+# (bounded); a concurrent dpkg would otherwise keep writing through the old
+# inode after our sed -i replacement.
+db_wait=0
+while [ "$db_wait" -lt 30 ]; do
+    db_busy=0
+    for p in /proc/[0-9]*/cmdline; do
+        cmd="$(tr '\000' ' ' < "$p" 2>/dev/null)"
+        case "$cmd" in
+            *"$PREFIX/bin/apt"*|*"$PREFIX/bin/dpkg"*|*"$PREFIX/bin/pkg"*)
+                # Our own bash/python parent chain never matches these paths.
+                db_busy=1
+                break
+                ;;
+        esac
+    done
+    [ "$db_busy" -eq 0 ] && break
+    db_wait=$((db_wait + 1))
+    sleep 2
+done
+if [ "$db_busy" -eq 1 ]; then
+    say "WARN apt/dpkg still running after 60s; editing dpkg database anyway"
+fi
+
 # The initial bootstrap install used "dpkg --root=$PREFIX" and then moved
 # $PREFIX/data/data/com.termux/files/usr/* up one level. The dpkg database
 # still lists those old com.termux paths, so upgrades/removals would look at
