@@ -1054,7 +1054,13 @@ class MainActivity : AppCompatActivity() {
             val button = findViewById<View>(id)
             button.isFocusable = false
             button.isFocusableInTouchMode = false
-            button.setOnClickListener { dispatchExtraKey(keyCode) }
+            // Arrows auto-repeat while held (cursor/history movement); Esc and
+            // Tab stay single-shot.
+            if (keyCode == KeyEvent.KEYCODE_ESCAPE || keyCode == KeyEvent.KEYCODE_TAB) {
+                button.setOnClickListener { dispatchExtraKey(keyCode) }
+            } else {
+                setupRepeatingKey(button, keyCode)
+            }
         }
         val ctrlButton = findViewById<View>(R.id.key_ctrl)
         ctrlButton.isFocusable = false
@@ -1104,6 +1110,47 @@ class MainActivity : AppCompatActivity() {
             HomePrefs.setExtraKeysEnabled(this, true)
             updateKeyToolbarVisibility()
         }
+    }
+
+    private val repeatHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private var repeatRunnable: Runnable? = null
+
+    /**
+     * Auto-repeat for the arrow keys: initial fire on ACTION_DOWN, then
+     * (after 350 ms) a stream of repeats every 60 ms until ACTION_UP/CANCEL.
+     * The view keeps focusable=false, so the WebView never loses the IME.
+     */
+    private fun setupRepeatingKey(button: View, keyCode: Int) {
+        button.isFocusable = false
+        button.isFocusableInTouchMode = false
+        button.setOnTouchListener { view, event ->
+            when (event.actionMasked) {
+                android.view.MotionEvent.ACTION_DOWN -> {
+                    dispatchExtraKey(keyCode)
+                    stopKeyRepeat()
+                    repeatRunnable = object : Runnable {
+                        override fun run() {
+                            dispatchExtraKey(keyCode)
+                            repeatHandler.postDelayed(this, 60)
+                        }
+                    }
+                    repeatHandler.postDelayed(repeatRunnable!!, 350)
+                    true
+                }
+                android.view.MotionEvent.ACTION_UP,
+                android.view.MotionEvent.ACTION_CANCEL -> {
+                    stopKeyRepeat()
+                    view.performClick()
+                    true
+                }
+                else -> false
+            }
+        }
+    }
+
+    private fun stopKeyRepeat() {
+        repeatRunnable?.let { repeatHandler.removeCallbacks(it) }
+        repeatRunnable = null
     }
 
     private fun dispatchExtraKey(keyCode: Int) {
@@ -2164,6 +2211,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        stopKeyRepeat()
         statusJob?.cancel()
         statusJob = null
         webViewRetryJob?.cancel()

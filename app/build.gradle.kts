@@ -48,8 +48,8 @@ android {
         applicationId = "com.devbox"
         minSdk = 26
         targetSdk = 28  // API 28 to bypass W^X restriction (apps targeting 29+ cannot exec from app data dir)
-        versionCode = 2
-        versionName = "1.1.0"
+        versionCode = 3
+        versionName = "1.1.1"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -475,23 +475,13 @@ fun stripForeignArchFromDeb(project: Project, original: File, dest: File, arch: 
                                 dropped++
                                 continue
                             }
-                            // Re-emit the entry with its original metadata.
-                            val copy = TarArchiveEntry(te.name)
-                            copy.setSize(te.size)
-                            copy.mode = te.mode
-                            copy.userId = te.userId
-                            copy.userName = te.userName
-                            copy.groupId = te.groupId
-                            copy.groupName = te.groupName
-                            copy.modTime = te.modTime
-                            copy.linkName = te.linkName
-                            if (te.isDirectory) copy.size = 0
-                            tarOut.putArchiveEntry(copy)
+                            // Re-emit the ORIGINAL entry object: its mode/
+                            // uid/gid/mtime/linkname travel with it (rebuilding
+                            // the entry field-by-field was how modes got lost).
+                            tarOut.putArchiveEntry(te)
                             if (te.isFile && te.size > 0) {
-                                // Reading through tarIn itself keeps the entry
-                                // boundary (its read() never crosses entries);
-                                // mixing a separate exact-size copy was what
-                                // desynced the stream.
+                                // Read through tarIn itself: its read() never
+                                // crosses the entry boundary.
                                 val buf = ByteArray(64 * 1024)
                                 var left = te.size
                                 while (left > 0) {
@@ -517,17 +507,22 @@ fun stripForeignArchFromDeb(project: Project, original: File, dest: File, arch: 
         }
         println("  stripped $dropped foreign-arch file(s) from ${dest.name}")
 
-        // 6. Self-check: the main code-server entry point MUST keep its
-        // execute bit — a stripped deb that lost Unix modes produces an app
-        // that fails with error=13 on real devices only (found the hard way).
+        // 6. Self-check (code-server deb only): the main entry point MUST
+        // keep its execute bit — a stripped deb that lost Unix modes produces
+        // an app that fails with error=13 on real devices only (found the
+        // hard way). The nodejs deb has no such entry and is skipped.
+        if (!original.name.startsWith("code-server")) {
+            return
+        }
         val csEntry = "data/data/com.termux/files/usr/bin/code-server"
         var modeOk = false
         val dataMember = File(work, "data.tar.xz")
-        GZIPInputStream(dataMember.inputStream().buffered()).use { gz ->
-            TarArchiveInputStream(gz).use { tarIn ->
+        XZInputStream(dataMember.inputStream().buffered()).use { xz ->
+            TarArchiveInputStream(xz).use { tarIn ->
                 while (true) {
                     val te = tarIn.nextTarEntry ?: break
                     if (te.name.removePrefix("./") == csEntry) {
+                        println("  [diag] self-check sees ${te.name} mode=${Integer.toOctalString(te.mode)} size=${te.size}")
                         modeOk = te.isFile && (te.mode and 0b001000000) != 0 // owner-execute
                         break
                     }

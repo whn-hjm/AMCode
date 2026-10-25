@@ -2,8 +2,8 @@
 
 > **本文档双重用途：① 项目交接；② 日常运维与开发手册。每次改动项目后必须更新本文档（尤其是 §11 变更记录与 §6/§7）。**
 >
-> 最近更新：2026-10-25 上午（Asia/Shanghai）
-> 代码基线：`c229683`（本地 `main`，领先 origin 9 个 commit；v1.1.0 / versionCode 2）
+> 最近更新：2026-10-25 晚（Asia/Shanghai）
+> 代码基线：main 最新（v1.1.1 / versionCode 3；最新发布 https://github.com/whn-hjm/AMCode/releases/tag/v1.1.1 ）
 > 工作区：`D:\Code\code-server\vsboxed`
 > 远程：`https://github.com/whn-hjm/AMCode.git`
 > 适用对象：zcode / 后续维护者
@@ -41,7 +41,7 @@ AMCode（包名 `com.devbox`，仓库目录名 `vsboxed`）把 **Termux 原生�
 - `minSdk=26`，`targetSdk=28`（刻意保留，targetSdk 29+ 会触发 W^X，不能从 app data 执行二进制）。
 - `compileSdk=34`，AGP 8.4.0，Gradle 8.7（wrapper 带 distributionSha256Sum），JDK 21。
 - code-server **4.143.1**（TUR），Node **24.18.0**，bootstrap 来自 Termux `bootstrap-2026.08.02-r1+apt.android-7`（双 ABI，构建期下载并 SHA-256 校验）。
-- 版本：`versionName=1.1.0`，`versionCode=2`。
+- 版本：`versionName=1.1.1`，`versionCode=3`（发布不可变原则：v1.1.0 因 arm64 离线包权限缺陷被 v1.1.1 取代并标注，资产不再覆盖）。
 - 仅支持 64 位（arm64-v8a 真机 / x86_64 模拟器）；32 位 ARM 会拿到无法执行的 aarch64 bootstrap（§6.7）。
 
 ---
@@ -350,6 +350,12 @@ curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' http://127.0.0.1:<PORT>
 ---
 
 ## 11. 变更记录（每批次一条，倒序；新改动加在最上面）
+
+### 2026-10-25 晚（二）· v1.1.1 发布 + 按键连发 + 配置变更回归
+- **v1.1.1 发布**（versionCode 3）：发布不可变原则落地——v1.1.0 标注 superseded 不再覆盖资产；arm64 offline 108.6MB（SHA d1042229…）、online 63.8MB；手机覆盖升级 25s READY 保数据。
+- **按键长按连发**：方向键按住 350ms 后 60ms 连发（Esc/Tab 单发不变）；Handler 调度，onDestroy 清理。
+- **配置变更回归**：深色模式切换、字体 1.3x 放大均零崩溃（configChanges uiMode/density/fontScale 生效验证）。
+- **构建自检乌龙修正**：自检曾对 nodejs 包误报（无 code-server 条目）——限定仅 code-server deb 执行；日志确认 mode=700 通过。
 
 ### 2026-10-25 晚 · 真机修复：剔重丢权限位（T-P 紧急修正）
 - **真机（vivo V2408A / Android 16 / arm64）首启报 error=13 Permission denied**：ant.tar 重打包把所有文件 mode 压成 600/目录 700，`bin/code-server` 丢执行位。模拟器此前全绿是因为它们装的是未剔重的旧包。
