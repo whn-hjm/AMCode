@@ -265,6 +265,7 @@ curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' http://127.0.0.1:<PORT>
 
 ### P2
 
+- [x] **git 进离线包**：offline bundle 的 aptDependencies 加 git，首启从快镜像拉取（APK 不变大、不碰 TUR）；5560 fresh 实测 git 2.56.0 可执行（a57b3c9）
 - [x] **[T-B]** Range 下载 part 文件按区间起点命名（.part.<start>-<end>），消除断点续传布局漂移（`558efcf`；offline 路径不走 Range，编译+逻辑验证）
 - [x] **[T-C]** 健康检查重启统一走 initJob 单飞通道：恢复循环搬进管线 recovery 分支 + pipelineLock 线性化；launcher 失败不再全局 stop、auth config 写入前查 generation（`3c89736`）
 - [x] **[T-D1]** 旧安装 dpkg DB 补登记：status 缺条目时一次性写入 stanza+info list（`558efcf`；5558 模拟旧装实测：删条目→重启→自动补回 2 包）
@@ -275,8 +276,8 @@ curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' http://127.0.0.1:<PORT>
 - [x] **[T-G3]** terminal 输出持久化到 files/logs/setup.log（1MB 轮转）（`558efcf`）
 - [x] **[T-E1]** i18n 迁移 values-zh：72 键全量迁移、isChinese() 删除、zh-CN per-app locale 实测（021cda3；CodeServerService 通知文案留英文，见 §6.9）
 - [x] **[T-E2]** WebView 版本门槛：provider major < 70 弹非阻塞过旧警告（021cda3；模拟器 WebView 均 ≥70，逻辑评审验证）
-- [ ] `~/storage/shared` 无 MANAGE 时的按需授权/拒绝/重试 UI 全回归（已部分覆盖）
-- [ ] **[T-H]** dpkg wrapper 对大 deb 的 ~6 倍磁盘峰值：空间预检或流式评估（tmp 残留已清，见 §6.2 相邻风险）
+- [x] `~/storage/shared` 按需授权全回归：deny（back 退出→false+Toast）/re-grant（→true+自动重载）（a57b3c9）
+- [x] **[T-H]** dpkg wrapper 磁盘峰值预检：$PREFIX/tmp 可用空间 < 6×deb+100MB 时拒改写并明确报错（a57b3c9）
 
 ### P3（体验/工程）
 
@@ -341,6 +342,12 @@ curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' http://127.0.0.1:<PORT>
 ---
 
 ## 11. 变更记录（每批次一条，倒序；新改动加在最上面）
+
+### 2026-10-25 下午 · `a57b3c9` 离线包带 git + 磁盘预检 + 服务文案中文化
+- **git 进离线包**：manifest aptDependencies 加 `git`（走快镜像，不 pin 不增 APK）；5560 fresh 实测 30s 装完 20 包、git 2.56.0 可执行、dpkg clean、零 TUR 访问。
+- **T-H**：dpkg wrapper 改写前检查 $PREFIX/tmp 空间（<6×deb+100MB 拒绝并明确报错）。
+- **i18n**：Service 通知/状态 24 键全量中英双语（36 处替换）。
+- **回归**：5558 冒烟 + shared 授权 deny/grant 双路径实测；5560 offline fresh 全绿。16KB 审计（只读代理）进行中。
 
 ### 2026-10-25 下午 · 产品口径：主线不做 proot
 - （运维补充）Open VSX 搜索对中文关键词无效：语言包等搜英文关键词或 VSIX 安装（§9 已记）。
